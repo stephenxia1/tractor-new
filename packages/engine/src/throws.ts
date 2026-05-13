@@ -186,3 +186,62 @@ export function throwTotalCards(decomp: ThrowDecomposition): number {
   for (const c of decomp.components) n += componentCardCount(c);
   return n;
 }
+
+// Decompose any play (single combo OR throw) into its component list.
+// Returns null if the cards can be neither classified as a single combo
+// nor decomposed as a throw (e.g. spans multiple effective suits).
+export function decomposePlay(
+  cards: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  n: number,
+): ThrowDecomposition | null {
+  const cls = classifyCombo(cards, ctx, n);
+  if (cls.ok) {
+    return {
+      components: [cls.combo],
+      effectiveSuit: cls.combo.effectiveSuit,
+    };
+  }
+  const d = decomposeThrow(cards, ctx, n);
+  if (d.ok) return d.throw;
+  return null;
+}
+
+function componentShapeKey(c: ClassifiedCombo): string {
+  if (c.kind === 'single') return 's';
+  if (c.kind === 'nkind') return `n${c.n}`;
+  return `t${c.n}x${c.length}`;
+}
+
+// True iff `candidate` beats `incumbent` as competing trick plays:
+// same component count, same shape multiset, and every candidate
+// component out-ranks a distinct incumbent component (1:1 matching).
+// For single-component plays this collapses to `comboBeats(...) > 0`.
+export function decomposedBeats(
+  candidate: ThrowDecomposition,
+  incumbent: ThrowDecomposition,
+): boolean {
+  if (candidate.components.length !== incumbent.components.length) return false;
+  const buckets = new Map<string, ClassifiedCombo[]>();
+  for (const c of incumbent.components) {
+    const k = componentShapeKey(c);
+    const arr = buckets.get(k) ?? [];
+    arr.push(c);
+    buckets.set(k, arr);
+  }
+  for (const cand of candidate.components) {
+    const k = componentShapeKey(cand);
+    const bucket = buckets.get(k);
+    if (!bucket || bucket.length === 0) return false;
+    let matched = -1;
+    for (let i = 0; i < bucket.length; i++) {
+      if (comboBeats(cand, bucket[i]!) > 0) {
+        matched = i;
+        break;
+      }
+    }
+    if (matched < 0) return false;
+    bucket.splice(matched, 1);
+  }
+  return true;
+}

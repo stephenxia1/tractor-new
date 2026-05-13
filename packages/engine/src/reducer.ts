@@ -1,10 +1,12 @@
-import { classifyCombo, comboBeats, type ClassifiedCombo } from './classifier';
+import { classifyCombo, type ClassifiedCombo } from './classifier';
 import { buildDeck } from './deck';
 import type { GameEvent } from './events';
 import { validateFollow, validateFollowThrow } from './follow';
 import { mulberry32, shuffle } from './prng';
 import {
+  decomposePlay,
   decomposeThrow,
+  decomposedBeats,
   isThrowSafe,
   throwTotalCards,
   type ThrowDecomposition,
@@ -601,45 +603,52 @@ function advanceTrick(state: GameState): ApplyResult {
 }
 
 // Determines the winner and points of a fully-played trick.
-// If the lead is a throw (multi-component), it auto-wins (its safety was
-// verified at play-time). Otherwise, normal trick resolution applies.
+// Decomposes every play (single combo or multi-component throw) and
+// compares structurally: a follower beats the current winner only if
+// their play has the same component shape multiset and each component
+// out-ranks a distinct one in the current winner.
 function resolveTrick(
   trick: ActiveTrick,
   ctx: TrumpContext,
   n: number,
 ): { winner: Seat; winningCombo: ClassifiedCombo | null; throwCardCount: number } {
   const lead = trick.plays[0]!;
-  const leadClass = classifyCombo(lead.cards, ctx, n);
+  const leadDecomp = decomposePlay(lead.cards, ctx, n);
 
-  if (!leadClass.ok) {
-    // Maybe a throw lead — auto-wins.
-    const decomp = decomposeThrow(lead.cards, ctx, n);
-    if (decomp.ok) {
-      return {
-        winner: lead.seat,
-        winningCombo: null,
-        throwCardCount: throwTotalCards(decomp.throw),
-      };
-    }
-    // Truly malformed — defensive default.
-    return { winner: lead.seat, winningCombo: null, throwCardCount: lead.cards.length };
+  if (leadDecomp === null) {
+    // Truly malformed lead — defensive default.
+    return {
+      winner: lead.seat,
+      winningCombo: null,
+      throwCardCount: lead.cards.length,
+    };
   }
 
   let winnerSeat: Seat = lead.seat;
-  let winningCombo: ClassifiedCombo = leadClass.combo;
+  let winningDecomp: ThrowDecomposition = leadDecomp;
 
   for (let i = 1; i < trick.plays.length; i++) {
     const play = trick.plays[i]!;
-    const cls = classifyCombo(play.cards, ctx, n);
-    if (!cls.ok) continue;
-    const cmp = comboBeats(cls.combo, winningCombo);
-    if (cmp > 0) {
+    const playDecomp = decomposePlay(play.cards, ctx, n);
+    if (playDecomp === null) continue;
+    if (decomposedBeats(playDecomp, winningDecomp)) {
       winnerSeat = play.seat;
-      winningCombo = cls.combo;
+      winningDecomp = playDecomp;
     }
   }
 
-  return { winner: winnerSeat, winningCombo, throwCardCount: 0 };
+  if (winningDecomp.components.length === 1) {
+    return {
+      winner: winnerSeat,
+      winningCombo: winningDecomp.components[0]!,
+      throwCardCount: 0,
+    };
+  }
+  return {
+    winner: winnerSeat,
+    winningCombo: null,
+    throwCardCount: throwTotalCards(winningDecomp),
+  };
 }
 
 function collectOpponentSeats(state: GameState, leaderSeat: Seat): Seat[] {

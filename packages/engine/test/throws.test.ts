@@ -9,6 +9,7 @@ import {
   type Suit,
   type TrumpContext,
 } from '../src';
+import { decomposePlay, decomposedBeats } from '../src/throws';
 
 const std = (suit: Suit, rank: NaturalRank, deckId: number): Card => ({
   kind: 'standard',
@@ -126,5 +127,43 @@ describe('isThrowSafe', () => {
     const opp2: Card[] = [std('diamonds', '4', 0)];
     const r = isThrowSafe(decomp.throw, [opp1, opp2], ctx, 2);
     expect(r.safe).toBe(true);
+  });
+});
+
+describe('decomposedBeats', () => {
+  const ctx = CTX; // trump = hearts, rank 5
+
+  it('two trump singles beat a throw of two off-suit singles', () => {
+    const lead = [std('clubs', 'A', 0), std('clubs', 'K', 0)];
+    const resp = [std('hearts', '3', 0), std('hearts', '4', 0)];
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(leadD).not.toBeNull();
+    expect(respD).not.toBeNull();
+    expect(decomposedBeats(respD!, leadD!)).toBe(true);
+  });
+
+  it('lower throw in same suit does not beat the lead', () => {
+    const lead = [std('clubs', 'A', 0), std('clubs', 'K', 0)];
+    const resp = [std('clubs', 'Q', 0), std('clubs', 'J', 0)];
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(decomposedBeats(respD!, leadD!)).toBe(false);
+  });
+
+  it('a pair does not beat a throw of two singles (shape mismatch)', () => {
+    const lead = [std('clubs', 'A', 0), std('clubs', 'K', 0)];
+    const resp = pair('hearts', '3'); // pair of trump 3
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(decomposedBeats(respD!, leadD!)).toBe(false);
+  });
+
+  it('off-suit non-trump response cannot beat throw', () => {
+    const lead = [std('clubs', 'A', 0), std('clubs', 'K', 0)];
+    const resp = [std('spades', '2', 0), std('spades', '3', 0)];
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(decomposedBeats(respD!, leadD!)).toBe(false);
   });
 });
