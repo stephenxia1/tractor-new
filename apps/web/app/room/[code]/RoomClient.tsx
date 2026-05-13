@@ -191,17 +191,17 @@ export default function RoomClient({ code }: { code: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rawCards, dealtTotal, mySeat, cardsPerPlayer]);
 
-  // While the deal animation is running (dealtTotal finite), preserve the
-  // server's random deal order so cards visibly arrive one-by-one in the
-  // order they were dealt. Once dealing finishes, sort for display.
-  const dealingInProgress = isFinite(dealtTotal);
+  // Keep the hand sorted at all times. The engine deals random cards
+  // (round-robin from a shuffled deck), so each new card arriving during
+  // the deal animation is a random pick — but it slots into its sorted
+  // position on insertion. End result: the player sees a sorted hand
+  // growing card-by-card.
   const myCards = useMemo(() => {
-    if (dealingInProgress) return visibleRaw;
     const trumpRank: NaturalRank =
       (ch?.trumpRank as NaturalRank | null) ?? '2';
     const ctx: TrumpContext = { trumpRank, trumpSuit: ch?.trumpSuit ?? null };
     return [...visibleRaw].sort((a, b) => compareCardsForDisplay(a, b, ctx));
-  }, [visibleRaw, ch?.trumpRank, ch?.trumpSuit, dealingInProgress]);
+  }, [visibleRaw, ch?.trumpRank, ch?.trumpSuit]);
 
   // The active trump context, or null until trump has been finalized for
   // this hand. Used to mark cards in the UI with a crown.
