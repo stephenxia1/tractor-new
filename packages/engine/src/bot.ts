@@ -51,6 +51,7 @@ export type BotType =
   | 'smart-v4'       // smart-v3 + card tracking, better declare/kitty
   | 'smart-v5'       // smart-v4 + smart-v3 opponent model in the simulation
   | 'smart-v6'       // smart-v5 + smart-v4 opponent model in the simulation
+  | 'smart-v7'       // smart-v6 + terminal opponent-cost heuristic
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -65,6 +66,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v4',
   'smart-v5',
   'smart-v6',
+  'smart-v7',
   'rl-mlp',
 ];
 
@@ -92,6 +94,8 @@ export function botTypeLabel(t: BotType): string {
       return 'Smart v5 (v3 opponent model)';
     case 'smart-v6':
       return 'Smart v6 (4-ply search, v3 opponent)';
+    case 'smart-v7':
+      return 'Smart v7 (5-ply search)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -184,6 +188,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v6') {
     return pickSmartV6(state, seat);
+  }
+  if (type === 'smart-v7') {
+    return pickSmartV7(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -2343,4 +2350,213 @@ function scoreCandidateV6(
     penalty += cardCostV4(c, ctx, tracking);
   }
   return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v7
+// =========================================================================
+//
+// v7 increases the search horizon from v6's 4 plies to 5. The fifth
+// trick contributes 0.6^4 ≈ 0.13 weight — small, but its signal aligns
+// in many positions because the trick chain past the 4-ply horizon
+// often determines mid-hand momentum.
+//
+// An earlier v7 with a terminal opponent-cost heuristic tied v6 6-6 —
+// the heuristic was correlated with raw pointsScore and didn't add a
+// meaningful new signal. Deeper search is a cleaner improvement.
+
+const SMART_V7_SEARCH_DEPTH = 5;
+// Kept for back-compat; unused after the rewrite.
+const SMART_V7_OPPONENT_COST_WEIGHT = 0;
+
+function pickSmartV7(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV7Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV7Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV7(state, seat, cand, myTeam, ctx, tracking);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV7(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(state, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V7_SEARCH_DEPTH,
+    SMART_V6_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV4(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// Like simulateTricks but also returns the final state, so callers can
+// evaluate terminal heuristics (e.g., remaining-hand value).
+function simulateTricksAndState(
+  initial: GameState,
+  myTeam: TeamId,
+  depth: number,
+  opponentModel: BotType = 'smart',
+): { score: number; finalState: GameState } {
+  let s = initial;
+  let score = 0;
+  let weight = 1.0;
+
+  for (let d = 0; d < depth; d++) {
+    if (s.phase !== 'play' && s.phase !== 'trick_review') break;
+
+    let guard = 0;
+    while (s.phase === 'play' && guard++ < 5) {
+      const next = nextToPlay(s);
+      if (next === null) break;
+      const action = pickBotAction(s, next, opponentModel);
+      if (action.kind !== 'play_cards') break;
+      const r = applyEvent(s, {
+        kind: 'play_cards',
+        seat: next,
+        cards: action.cards,
+      });
+      if (!r.ok) break;
+      s = r.state;
+    }
+
+    if (s.phase === 'trick_review' && s.currentHand?.currentTrick) {
+      const trick = s.currentHand.currentTrick;
+      if (trick.plays.length === s.config.numPlayers) {
+        const trickPoints = pointsInTrickPlays(trick.plays);
+        const winner = winnerOfActiveTrick(
+          trick,
+          {
+            trumpRank: s.currentHand.trumpRank!,
+            trumpSuit: s.currentHand.trumpSuit,
+          },
+          s.config.numDecks,
+        );
+        const myWin = teamOf(s, winner) === myTeam;
+        score += weight * (myWin ? trickPoints : -trickPoints);
+      }
+      const r = applyEvent(s, { kind: 'advance_trick' });
+      if (!r.ok) break;
+      s = r.state;
+    } else {
+      break;
+    }
+
+    weight *= SMART_V3_DISCOUNT;
+  }
+  return { score, finalState: s };
+}
+
+// Sum of `cardFutureValue` over every card in the opponents' hands.
+function oppHandValue(
+  state: GameState,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+): number {
+  if (state.currentHand === null) return 0;
+  let v = 0;
+  for (let s = 0; s < state.config.numPlayers; s++) {
+    if (teamOf(state, s) === myTeam) continue;
+    const cards = state.currentHand.hands[s] ?? [];
+    for (const c of cards) v += cardFutureValue(c, ctx);
+  }
+  return v;
+}
+
+function cardFutureValue(c: Card, ctx: TrumpContext): number {
+  if (isTrump(c, ctx)) {
+    if (c.kind === 'joker') return c.rank === 'big' ? 4 : 3;
+    if (c.kind === 'standard') {
+      if (c.rank === ctx.trumpRank && c.suit === ctx.trumpSuit) return 2.5;
+      if (c.rank === ctx.trumpRank) return 1.5;
+      return 0.4;
+    }
+    return 0.4;
+  }
+  if (c.kind === 'standard') {
+    if (c.rank === 'A') return 2;
+    if (c.rank === 'K') return 0.5;
+  }
+  return 0;
 }
