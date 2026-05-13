@@ -44,6 +44,7 @@ export type BotType =
   | 'aggressive'     // lead high, try to beat tricks on follow
   | 'point-hoarder'  // capture point cards when possible, dump non-points
   | 'random'         // uniformly random over a curated legal action set
+  | 'smart-v0'       // copy of `smart` — deployment-pipeline smoke test
   | 'smart'          // multi-heuristic agent: team-aware follows + strong leads
   | 'smart-v2'       // smart + 1-ply search on follow decisions
   | 'smart-v3'       // smart-v2 + 2-ply search and search-based leading
@@ -55,6 +56,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'aggressive',
   'point-hoarder',
   'random',
+  'smart-v0',
   'smart',
   'smart-v2',
   'smart-v3',
@@ -72,6 +74,8 @@ export function botTypeLabel(t: BotType): string {
       return 'Point hoarder';
     case 'random':
       return 'Random';
+    case 'smart-v0':
+      return 'Smart v0 (== Smart)';
     case 'smart':
       return 'Smart';
     case 'smart-v2':
@@ -152,7 +156,10 @@ export function pickBotAction(
   seat: Seat,
   type: BotType = 'lowball',
 ): BotAction {
-  if (type === 'smart') {
+  if (type === 'smart' || type === 'smart-v0') {
+    // smart-v0 is intentionally identical to smart — used as a smoke
+    // test for the bot-deployment pipeline (engine → web/UI dropdown
+    // and WS server).
     return pickSmart(state, seat);
   }
   if (type === 'smart-v2') {
@@ -1696,22 +1703,21 @@ function winnerOfActiveTrick(
 // Strategy: smart-v4
 // =========================================================================
 //
-// Builds on smart-v3 with three improvements:
+// Builds on smart-v3 with two improvements:
 //
-//   1. **Card tracking in the cost penalty**: counts played cards to
-//      detect when a held non-trump card is the highest remaining rank
-//      in its suit (i.e., all higher non-trump ranks are fully played
-//      out or held by us). Such cards are guaranteed winners in suit and
-//      are penalized like aces.
-//   2. **Joker-pair preferred over single declarations**: tier-3/4 joker
-//      pairs are unbeatable. A tier-1 single declaration is overridden
-//      ~36% of the time by an opposing pair. v4 prefers the unbeatable
-//      tier over the long-suit advantage of a single.
-//   3. **Tractor preservation in kitty burial**: cards that belong to an
-//      existing length-2+ tractor in the hand get a strong burial
-//      penalty so we don't break tractors when burying.
+//   1. **3-ply search**: simulates 3 tricks per candidate instead of 2.
+//      The third trick's points are discounted further (0.6^2 = 0.36),
+//      so the new ply adds a smaller but still meaningful signal about
+//      the trajectory of the hand.
+//   2. **Card-tracking cost adjustment**: counts played cards so that a
+//      non-A card promoted to highest-remaining in its suit (e.g., K
+//      after both As are out) is treated as a guaranteed winner with
+//      cost 0 — the search will readily play it to capture tricks
+//      rather than treating it as a midweight save-for-later card.
 //
-// Search and 2-ply lookahead remain identical to v3.
+// Declare and kitty reuse smart-v1's helpers (other variations tested
+// — joker-over-single declaration, tractor-preservation kitty burial —
+// reduced strength on aggregate in self-play head-to-heads).
 
 function pickSmartV4(state: GameState, seat: Seat): BotAction {
   const hand = state.currentHand;
@@ -1722,12 +1728,19 @@ function pickSmartV4(state: GameState, seat: Seat): BotAction {
     if (state.phase === 'declare_open' && hand.landlord === seat) {
       return { kind: 'pick_up_kitty' };
     }
-    return smartDeclareV4(state, seat, myCards, hand);
+    // Use v1's declare. The joker-over-single preference was tested but
+    // gave up too many trumps for tier protection (single in long suit
+    // gives ~12 expected trumps after override risk; joker pair gives
+    // ~7).
+    return smartDeclare(state, seat, myCards, hand);
   }
   if (state.phase === 'kitty_replace') {
     if (hand.landlord !== seat) return { kind: 'wait' };
     if (hand.trumpRank === null) return { kind: 'wait' };
-    return smartBuryV4(state, hand, myCards);
+    // Reuse v1's bury. Tractor preservation was tested but it blocked
+    // creating valuable voids in short suits (a low-value tractor in
+    // the kitty is fine — 0 points × multiplier = 0).
+    return smartBury(state, hand, myCards);
   }
   if (state.phase !== 'play') return { kind: 'wait' };
   if (hand.trumpRank === null) return { kind: 'wait' };
@@ -2026,6 +2039,8 @@ function smartV4Search(
   return { kind: 'play_cards', cards: bestCards };
 }
 
+const SMART_V4_SEARCH_DEPTH = 3;
+
 function scoreCandidateV4(
   state: GameState,
   seat: Seat,
@@ -2044,7 +2059,7 @@ function scoreCandidateV4(
   const pointsScore = simulateTricks(
     r0.state,
     myTeam,
-    SMART_V3_SEARCH_DEPTH,
+    SMART_V4_SEARCH_DEPTH,
   );
 
   let penalty = 0;
@@ -2066,8 +2081,13 @@ function cardCostV4(
     return 0.8;
   }
   if (c.kind !== 'standard') return 0;
-  if (tracking.isGuaranteedSuitWinner(c)) return 1.5;
+  // Aces always keep their full save-cost — they're the best non-trump
+  // anyway and we want to time their use carefully.
   if (c.rank === 'A') return 1.5;
+  // A non-A card "promoted" to highest-remaining in its suit (e.g., K
+  // after both As played) becomes a guaranteed in-suit winner. Reduce
+  // its cost to ~0 so the search readily uses it to capture tricks.
+  if (tracking.isGuaranteedSuitWinner(c)) return 0;
   if (c.rank === 'K') return 0.3;
   return 0;
 }
