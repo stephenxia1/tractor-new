@@ -52,6 +52,7 @@ export type BotType =
   | 'smart-v5'       // smart-v4 + smart-v3 opponent model in the simulation
   | 'smart-v6'       // smart-v5 + smart-v4 opponent model in the simulation
   | 'smart-v7'       // smart-v6 + terminal opponent-cost heuristic
+  | 'smart-v8'       // smart-v7 + adaptive cost penalty
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -67,6 +68,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v5',
   'smart-v6',
   'smart-v7',
+  'smart-v8',
   'rl-mlp',
 ];
 
@@ -96,6 +98,8 @@ export function botTypeLabel(t: BotType): string {
       return 'Smart v6 (4-ply search, v3 opponent)';
     case 'smart-v7':
       return 'Smart v7 (5-ply search)';
+    case 'smart-v8':
+      return 'Smart v8 (5-ply, stronger save-the-aces penalty)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -191,6 +195,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v7') {
     return pickSmartV7(state, seat);
+  }
+  if (type === 'smart-v8') {
+    return pickSmartV8(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -2086,9 +2093,30 @@ function scoreCandidateV4(
 
   let penalty = 0;
   for (const c of candidate) {
-    penalty += cardCostV4(c, ctx, tracking);
+    penalty += cardCostV8(c, ctx, tracking);
   }
   return pointsScore - penalty;
+}
+
+// v8's stronger save-the-resources cost function. Higher costs for the
+// best cards push the search to save them for late-hand / last-trick
+// opportunities where they're worth more.
+function cardCostV8(
+  c: Card,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  if (isTrump(c, ctx)) {
+    if (c.kind === 'joker') return c.rank === 'big' ? 5 : 4; // ↑ from 4/3
+    if (c.rank === ctx.trumpRank && c.suit === ctx.trumpSuit) return 2.5; // ↑ from 2
+    if (c.rank === ctx.trumpRank) return 2; // ↑ from 1.5
+    return 1; // ↑ from 0.8
+  }
+  if (c.kind !== 'standard') return 0;
+  if (c.rank === 'A') return 2; // ↑ from 1.5
+  if (tracking.isGuaranteedSuitWinner(c)) return 0;
+  if (c.rank === 'K') return 0.5; // ↑ from 0.3
+  return 0;
 }
 
 function cardCostV4(
@@ -2559,4 +2587,125 @@ function cardFutureValue(c: Card, ctx: TrumpContext): number {
     if (c.rank === 'K') return 0.5;
   }
   return 0;
+}
+
+// =========================================================================
+// Strategy: smart-v8
+// =========================================================================
+//
+// v8 keeps v7's 5-ply search + v3 opponent model but raises the cost
+// penalty on top cards (jokers, aces, trump-rank cards). The intent is
+// to preserve game-winning resources longer — many tied games in
+// earlier v8 attempts came from the bot spending an ace or trump on a
+// 5-point trick when it could have been saved for the kitty multiplier.
+//
+// Earlier v8 attempts (all failed to beat v7):
+//   - 6-ply, v3 opp: 41.7% (extra ply was noise).
+//   - 5-ply, v3 opp, adaptive cost: 41.7% (scaling cost down at hand
+//     end wasted high cards before the kitty multiplier).
+//   - 5-ply, v4 opp: 50.0% (more accurate opp didn't help).
+
+const SMART_V8_SEARCH_DEPTH = 5;
+const SMART_V8_OPPONENT_MODEL: BotType = 'smart-v3';
+
+function pickSmartV8(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV8Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV8Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV8(state, seat, cand, myTeam, ctx, tracking);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV8(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(state, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V8_SEARCH_DEPTH,
+    SMART_V8_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV4(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
 }
