@@ -652,10 +652,11 @@ function resolveTrick(
 }
 
 function collectOpponentSeats(state: GameState, leaderSeat: Seat): Seat[] {
-  const leaderTeam = teamOf(state, leaderSeat);
+  // Per rules.md §7.6, any single OTHER player — opponent or teammate —
+  // can break a throw. Only the leader themselves is excluded.
   const out: Seat[] = [];
   for (let s = 0; s < state.config.numPlayers; s++) {
-    if (teamOf(state, s) === leaderTeam) continue;
+    if (s === leaderSeat) continue;
     out.push(s);
   }
   return out;

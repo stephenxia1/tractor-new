@@ -252,7 +252,8 @@ A throw resolves in two distinct phases. The first phase (**block**) is the "saf
 
 1. The leader places the throw face-up, declaring the components (e.g., "pair of 9♥, pair of 10♥, single A♥").
 2. **Block check (lead-time safety).** Before others play, the engine asks: "Is the throw safe to lead at all?"
-   - For each component `c` of the throw, check whether **any single opponent** holds a **higher same-structure combo in the led effective suit**. That's it — only the led suit counts here. A throw is led from a single suit, and followers can only be **forced** to follow that suit (they can never be compelled to trump in). So the block check ignores trumps: an opponent's trumps may be sitting in their hand, but the leader cannot be punished at lead time for failing to anticipate a discretionary trump response.
+   - For each component `c` of the throw, check whether **any single other player** (any of the three players other than the leader — **including the leader's teammate**) holds a **higher same-structure combo in the led effective suit**. That's it — only the led suit counts here. A throw is led from a single suit, and followers can only be **forced** to follow that suit (they can never be compelled to trump in). So the block check ignores trumps: a player's trumps may be sitting in their hand, but the leader cannot be punished at lead time for failing to anticipate a discretionary trump response.
+   - **Teammate cards count too.** This is a deliberate variant choice in this rule set: the leader is committing to a claim that *no single other hand* can break any component. The teammate may be a friendly piece on the board, but for the purposes of the throw-safety claim, their unknown cards are treated the same as opponents'. Partnerships are typically hidden information from the leader's perspective at the moment they throw, so the rule treats the four hands symmetrically.
    - If no opponent has a led-suit beater for any component, the throw is **safe** and proceeds.
    - If some opponent has a led-suit beater, see step 4.
 3. **The throw plays out.** All four players play to the throw in turn. Each follower must match the throw's full structure per §7.3 (match in the led suit where possible, then substitute from other suits). Followers may **choose** to trump in if they are void of the led suit (or partially void after exhausting their led-suit holdings).
@@ -262,7 +263,7 @@ A throw resolves in two distinct phases. The first phase (**block**) is the "saf
    - The leader is forced to lead **only that smallest component** (the rest of the throw returns to hand). Play proceeds normally with that lead.
    - This is a significant penalty: opponents now know the leader holds the rest of the throw.
 
-The "no single opponent can beat" rule means the block test is per-opponent. Teammates' cards are irrelevant (they can't break a throw).
+The "no single other player can beat" rule means the block test is per-hand across all three non-leader hands. **Teammate cards are NOT exempt** — this is a variant choice (see §13).
 
 **Practical agent guidance.**
 - **At lead time** (decide whether to throw): only worry about led-suit cards opponents might be holding. A non-trump throw with the top card(s) in its suit is "safe" in the block sense even if opponents hold the Big Joker — the safety check does not care.

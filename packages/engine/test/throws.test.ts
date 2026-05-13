@@ -107,16 +107,30 @@ describe('isThrowSafe', () => {
     expect(r.safe).toBe(true);
   });
 
-  it('safety check is per-opponent — teammates do not count', () => {
+  it('safe when every checked hand has only low/off-suit cards', () => {
     const cards = [...pair('clubs', '7'), std('clubs', '3', 0)];
     const decomp = decomposeThrow(cards, ctx, 2);
     expect(decomp.ok).toBe(true);
     if (!decomp.ok) return;
-    // Both "opponent" hands are low — no beats.
-    const opp1: Card[] = [std('spades', '6', 0)];
-    const opp2: Card[] = [std('diamonds', '6', 0)];
-    const r = isThrowSafe(decomp.throw, [opp1, opp2], ctx, 2);
+    const hand1: Card[] = [std('spades', '6', 0)];
+    const hand2: Card[] = [std('diamonds', '6', 0)];
+    const r = isThrowSafe(decomp.throw, [hand1, hand2], ctx, 2);
     expect(r.safe).toBe(true);
+  });
+
+  it('teammate cards now count (variant change): a teammate beater breaks the throw', () => {
+    // Throw of two non-trump clubs singles. One of the three other hands
+    // (teammate or opponent) holds a higher club. Per the updated v1
+    // rule, that breaks the throw regardless of partnership.
+    const cards = [std('clubs', '4', 0), std('clubs', '6', 0)];
+    const decomp = decomposeThrow(cards, ctx, 2);
+    expect(decomp.ok).toBe(true);
+    if (!decomp.ok) return;
+    const teammate: Card[] = [std('clubs', 'A', 0)];
+    const opp1: Card[] = [std('diamonds', '3', 0)];
+    const opp2: Card[] = [std('diamonds', '4', 0)];
+    const r = isThrowSafe(decomp.throw, [teammate, opp1, opp2], ctx, 2);
+    expect(r.safe).toBe(false);
   });
 
   it('reports smallest beatable component on failure', () => {
