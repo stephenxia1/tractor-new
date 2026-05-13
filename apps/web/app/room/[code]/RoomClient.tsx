@@ -1096,13 +1096,16 @@ function SpectatorHands({
     <div className="spectator-hands">
       {room.seats.map((seat) => {
         const full = hands[seat.seat] ?? [];
-        // Apply the same deal-animation slice used for the local player
-        // so the spectator sees cards arrive into each seat in real time.
+        // Slice in the engine's random deal order FIRST, then sort. If we
+        // sorted first and sliced, the spectator would see the lowest
+        // cards arrive first (visually "ascending"), even though the
+        // engine deals random cards. This now matches the player view:
+        // each new card is a random pick that slots into its sorted
+        // position on arrival.
         const dealt = cardsDealtToSeat(seat.seat, full.length);
-        const sorted = [...full].sort((a, b) =>
+        const cards = [...full.slice(0, dealt)].sort((a, b) =>
           compareCardsForDisplay(a, b, ctxForSort),
         );
-        const cards = sorted.slice(0, dealt);
         const name = seat.occupant?.nickname ?? `Seat ${seat.seat}`;
         return (
           <div className="spectator-row" key={seat.seat}>
