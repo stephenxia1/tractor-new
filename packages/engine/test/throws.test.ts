@@ -194,6 +194,48 @@ describe('decomposedBeats', () => {
     const resp = [std('spades', '2', 0), std('spades', '3', 0)];
     const leadD = decomposePlay(lead, ctx, 2);
     const respD = decomposePlay(resp, ctx, 2);
-    expect(decomposedBeats(respD!, leadD!)).toBe(false);
+    expect(decomposedBeats(respD!, leadD!, ctx, 2)).toBe(false);
+  });
+
+  it('a trump pair beats a throw of two non-trump singles (stronger structure)', () => {
+    // User-reported: lead is 8♦ + J♦ (two non-trump singles, since
+    // diamonds is not trump here). Follower plays BJ + BJ (a trump
+    // pair). The pair "splits" into two trump singletons, each of
+    // which beats one diamond single → pair wins the trick.
+    const lead = [std('diamonds', '8', 0), std('diamonds', 'J', 0)];
+    const resp = [jok('big', 0), jok('big', 1)];
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(leadD).not.toBeNull();
+    expect(respD).not.toBeNull();
+    // Natural decomp of resp is a single-component pair.
+    expect(respD!.components.length).toBe(1);
+    expect(decomposedBeats(respD!, leadD!, ctx, 2)).toBe(true);
+  });
+
+  it('a non-trump pair beats a throw of two lower same-suit singles', () => {
+    // Lead: 4♣ + 7♣ (two non-trump singles — trump rank is 5, suit is
+    // hearts, so neither is trump). Resp: A♣A♣ (a pair). Each A beats
+    // both 4 and 7; pair-as-two-singletons covers throw.
+    const lead = [std('clubs', '4', 0), std('clubs', '7', 0)];
+    const resp = [std('clubs', 'A', 0), std('clubs', 'A', 1)];
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(leadD).not.toBeNull();
+    expect(respD).not.toBeNull();
+    expect(decomposedBeats(respD!, leadD!, ctx, 2)).toBe(true);
+  });
+
+  it('a pair vs. pair-incumbent still requires same-shape match', () => {
+    // A pair LEAD (not a throw) is only beatable by a higher pair, not
+    // by 2 stronger singletons. The leader's pair stays the incumbent
+    // shape; we never re-decompose the incumbent.
+    const lead = [std('clubs', '4', 0), std('clubs', '4', 1)];
+    const resp = [std('clubs', 'A', 0), std('clubs', 'K', 0)];
+    const leadD = decomposePlay(lead, ctx, 2);
+    const respD = decomposePlay(resp, ctx, 2);
+    expect(leadD).not.toBeNull();
+    expect(respD).not.toBeNull();
+    expect(decomposedBeats(respD!, leadD!, ctx, 2)).toBe(false);
   });
 });

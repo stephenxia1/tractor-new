@@ -631,7 +631,7 @@ function resolveTrick(
     const play = trick.plays[i]!;
     const playDecomp = decomposePlay(play.cards, ctx, n);
     if (playDecomp === null) continue;
-    if (decomposedBeats(playDecomp, winningDecomp)) {
+    if (decomposedBeats(playDecomp, winningDecomp, ctx, n)) {
       winnerSeat = play.seat;
       winningDecomp = playDecomp;
     }

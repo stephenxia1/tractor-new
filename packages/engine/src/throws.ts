@@ -216,15 +216,50 @@ function componentShapeKey(c: ClassifiedCombo): string {
   return `t${c.n}x${c.length}`;
 }
 
-// True iff `candidate` beats `incumbent` as competing trick plays:
-// same component count, same shape multiset, and every candidate
-// component out-ranks a distinct incumbent component (1:1 matching).
-// For single-component plays this collapses to `comboBeats(...) > 0`.
+// True iff `candidate` beats `incumbent` as competing trick plays.
+//
+// Two paths to a win:
+//   (a) **Same-shape match.** Candidate's natural components have the
+//       same shape multiset as incumbent's; we 1:1-match shapes and
+//       require every candidate component to out-rank its match.
+//   (b) **Stronger structure covers weaker.** Candidate has a "tighter"
+//       structure than incumbent (e.g., a pair vs. two singles, a
+//       tractor vs. several pairs). We split candidate down to
+//       incumbent's component shapes and check that the resulting
+//       singletons / pieces beat each incumbent component, matched
+//       1:1 via bipartite matching.
+//
+// Both paths use trump-vs-non-trump comparison from `comboBeats`. When
+// `ctx` is not provided, only path (a) is attempted.
 export function decomposedBeats(
   candidate: ThrowDecomposition,
   incumbent: ThrowDecomposition,
+  ctx?: TrumpContext,
+  n?: number,
 ): boolean {
-  if (candidate.components.length !== incumbent.components.length) return false;
+  // Path (a): same shape multiset.
+  if (
+    candidate.components.length === incumbent.components.length &&
+    sameShapeMatchingBeats(candidate, incumbent)
+  ) {
+    return true;
+  }
+  // Path (b): re-decompose candidate to match incumbent's shape. Only
+  // implemented for the common case where incumbent is all singletons.
+  if (
+    ctx !== undefined &&
+    n !== undefined &&
+    incumbent.components.every((c) => c.kind === 'single')
+  ) {
+    return candidateBeatsAllSingles(candidate, incumbent, ctx, n);
+  }
+  return false;
+}
+
+function sameShapeMatchingBeats(
+  candidate: ThrowDecomposition,
+  incumbent: ThrowDecomposition,
+): boolean {
   const buckets = new Map<string, ClassifiedCombo[]>();
   for (const c of incumbent.components) {
     const k = componentShapeKey(c);
@@ -247,4 +282,59 @@ export function decomposedBeats(
     bucket.splice(matched, 1);
   }
   return true;
+}
+
+// Re-decompose the candidate's cards into individual single combos and
+// bipartite-match against the incumbent's single components.
+function candidateBeatsAllSingles(
+  candidate: ThrowDecomposition,
+  incumbent: ThrowDecomposition,
+  ctx: TrumpContext,
+  n: number,
+): boolean {
+  const candCards: Card[] = [];
+  for (const comp of candidate.components) {
+    if (comp.kind === 'single') candCards.push(comp.card);
+    else candCards.push(...comp.cards);
+  }
+  if (candCards.length !== incumbent.components.length) return false;
+  const candSingles: ClassifiedCombo[] = [];
+  for (const c of candCards) {
+    const cls = classifyCombo([c], ctx, n);
+    if (!cls.ok) return false;
+    candSingles.push(cls.combo);
+  }
+  return bipartiteAllBeat(candSingles, incumbent.components);
+}
+
+// Bipartite perfect matching: every incumbent gets a distinct candidate
+// that beats it (per `comboBeats > 0`). Uses augmenting paths.
+function bipartiteAllBeat(
+  candidates: ReadonlyArray<ClassifiedCombo>,
+  incumbents: ReadonlyArray<ClassifiedCombo>,
+): boolean {
+  if (candidates.length !== incumbents.length) return false;
+  const m = incumbents.length;
+  const canBeat: boolean[][] = candidates.map((cand) =>
+    incumbents.map((inc) => comboBeats(cand, inc) > 0),
+  );
+  const matchOfInc = new Array<number>(m).fill(-1);
+  function augment(candIdx: number, visited: boolean[]): boolean {
+    for (let j = 0; j < m; j++) {
+      if (!canBeat[candIdx]![j]) continue;
+      if (visited[j]) continue;
+      visited[j] = true;
+      if (matchOfInc[j] === -1 || augment(matchOfInc[j]!, visited)) {
+        matchOfInc[j] = candIdx;
+        return true;
+      }
+    }
+    return false;
+  }
+  let matched = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const visited = new Array<boolean>(m).fill(false);
+    if (augment(i, visited)) matched++;
+  }
+  return matched === m;
 }
