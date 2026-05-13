@@ -1,0 +1,855 @@
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #18221c;
+  color: #e8efe9;
+  min-height: 100vh;
+  font-size: 16px;
+}
+
+a { color: #9adfb4; }
+
+input, button {
+  font: inherit;
+  font-size: 15px;
+  padding: 10px 16px;
+  border-radius: 6px;
+  border: 1px solid #3c5142;
+  background: #243528;
+  color: inherit;
+}
+button {
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: #2e4332;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.center {
+  max-width: 480px;
+  margin: 64px auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.h1 { font-size: 32px; margin: 0; }
+.h2 { font-size: 22px; margin: 0; }
+.muted { color: #94a89a; font-size: 15px; }
+
+.room {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    'header chat'
+    'main   chat';
+  height: 100vh;
+  padding: 16px 20px;
+  gap: 16px;
+}
+.room .header { grid-area: header; }
+.room .room-main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+.room .chat { grid-area: chat; }
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  background: #15201a;
+  border: 1px solid #2f4233;
+  border-radius: 10px;
+  height: calc(100vh - 32px);
+  overflow: hidden;
+  min-height: 0;
+}
+.chat-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid #2f4233;
+  font-weight: 600;
+  font-size: 14px;
+  color: #b1c4b8;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+}
+.chat-log {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  scrollbar-width: thin;
+  scrollbar-color: #3c5142 transparent;
+}
+.chat-log::-webkit-scrollbar { width: 6px; }
+.chat-log::-webkit-scrollbar-track { background: transparent; }
+.chat-log::-webkit-scrollbar-thumb { background: #3c5142; border-radius: 3px; }
+
+/* Block-flow entries: timestamp inline at the start, then text wraps as
+   one paragraph. No flex squeeze. No background highlight. */
+.chat-entry {
+  margin-bottom: 4px;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  background: none;
+  border: none;
+}
+.chat-entry .ts {
+  color: #5e7263;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-right: 6px;
+}
+.chat-empty {
+  color: #5e7263;
+  font-style: italic;
+  text-align: center;
+  margin-top: 16px;
+}
+
+.chat-entry.system { color: #aabba8; }
+.chat-entry.chat { color: #e8efe9; }
+.chat-from { color: #9adfb4; font-weight: 600; margin-right: 2px; }
+
+.chat-input {
+  border-top: 1px solid #2f4233;
+  padding: 8px;
+  display: flex;
+  gap: 6px;
+}
+.chat-input input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 13px;
+  background: #18241d;
+  border-color: #2f4233;
+}
+.chat-input button {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.table {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.seat {
+  background: #1f2c23;
+  border: 1px solid #2f4233;
+  border-radius: 10px;
+  padding: 14px 18px;
+  min-height: 140px;
+}
+
+.seat.self {
+  border-color: #6db481;
+}
+
+.seat .name { font-weight: 600; font-size: 17px; }
+.seat .meta { color: #94a89a; font-size: 13px; margin-top: 2px; }
+
+/* ----------------------------------------------------------- */
+/* Row-of-boxes table                                           */
+/* ----------------------------------------------------------- */
+.table-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 8px 0 16px;
+}
+.table-center {
+  background: #1a2a22;
+  border: 1px solid #2f4233;
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: #b1c4b8;
+  font-size: 13px;
+  line-height: 1.3;
+}
+.table-center .phase-label {
+  font-weight: 600;
+  font-size: 15px;
+  color: #d6e4d9;
+  letter-spacing: 0.5px;
+}
+
+.player-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.player-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  /* Sized to content + the .play-box min-width, so cells sit flush
+     horizontally instead of stretching across the row. They expand
+     naturally if a player throws extra cards. */
+  flex: 0 0 auto;
+}
+.player-cell.turn .play-box {
+  border-color: #f3c053;
+  box-shadow: inset 0 0 0 1px #f3c053aa;
+}
+
+.bubble {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-height: 90px;
+}
+.bubble-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+.bubble-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: #243528;
+  color: #f3c053;
+  font-size: 13px;
+  font-weight: 700;
+  border: 1px solid #3c5142;
+  font-variant-numeric: tabular-nums;
+}
+.bubble-name {
+  font-size: 13px;
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.4);
+  padding: 2px 8px;
+  border-radius: 4px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+.bubble-meta {
+  font-size: 11px;
+  color: #94a89a;
+}
+.bubble-badges {
+  display: flex;
+  gap: 4px;
+  font-size: 10px;
+}
+.bubble-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+}
+.bubble-controls button {
+  font-size: 12px;
+  padding: 4px 8px;
+}
+.bot-type-select {
+  font-size: 12px;
+  padding: 3px 6px;
+  background: #243528;
+  color: inherit;
+  border: 1px solid #3c5142;
+  border-radius: 4px;
+}
+
+/* Sized to match the proportions of an 84×120 card (10% larger than the
+   default base) with a bit of padding. Single plays fit snugly; multi-card
+   plays expand horizontally via the negative-margin overlap below. */
+.play-box {
+  min-width: 108px;
+  width: fit-content;
+  min-height: 144px;
+  max-width: 100%;
+  background: #1a2a22;
+  border: 1px solid #2f4233;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin: 0 auto;
+}
+.play-box .card-svg {
+  width: 84px;
+  height: 120px;
+}
+.play-box .card-svg + .card-svg {
+  margin-left: -55px; /* same ~34%-visible overlap ratio */
+}
+/* Highest combo so far in the current trick — red border. Specificity
+   tuned to override the gold "turn" highlight on the same element. */
+.player-cell .play-box.winning,
+.player-cell.turn .play-box.winning {
+  border-color: #c44545;
+  box-shadow: inset 0 0 0 1px #c44545;
+}
+.play-box-empty {
+  color: #3a4a3f;
+  font-size: 16px;
+}
+
+.avatar {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 19px;
+  border: 3px solid rgba(0, 0, 0, 0.35);
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+}
+.avatar.self {
+  border-color: #6db481;
+  box-shadow:
+    0 0 0 2px #2a3a30,
+    0 0 0 4px #6db481aa,
+    0 2px 8px rgba(0, 0, 0, 0.5);
+}
+.avatar.turn {
+  box-shadow:
+    0 0 0 2px #2a3a30,
+    0 0 0 5px #f3c053,
+    0 2px 8px rgba(243, 192, 83, 0.4);
+}
+.avatar.disconnected {
+  opacity: 0.4;
+  filter: grayscale(0.7);
+}
+.avatar.empty {
+  background: #243528;
+  border-color: #3c5142;
+  color: #5e7263;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.pod-name {
+  font-size: 13px;
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 2px 8px;
+  border-radius: 4px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+.pod-meta {
+  font-size: 11px;
+  color: #94a89a;
+}
+.pod-badges {
+  display: flex;
+  gap: 4px;
+  font-size: 10px;
+}
+.pod-badge {
+  background: rgba(0, 0, 0, 0.35);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: #d7e3da;
+}
+.pod-badge.landlord {
+  background: #6d4a18;
+  color: #f3c053;
+}
+.pod-badge.bot {
+  background: #20303a;
+  color: #91c3df;
+}
+
+.pod-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.pod-controls button {
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+/* Played cards in front of each player */
+.played-area {
+  position: absolute;
+  display: flex;
+  gap: 3px;
+  min-height: 71px;
+  z-index: 1;
+  pointer-events: none;
+}
+.played-area.bottom {
+  bottom: 110px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.played-area.top {
+  top: 110px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.played-area.left {
+  left: 145px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+.played-area.right {
+  right: 145px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+.played-area .card-svg {
+  margin-right: -28px;
+}
+.played-area .card-svg:last-child {
+  margin-right: 0;
+}
+
+/* Compact hand-back stack near each opponent's pod, showing their card count */
+.pod-backs {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.pod-backs .card-svg {
+  width: 22px;
+  height: 31px;
+  margin-right: -16px;
+}
+.pod-backs .card-svg:last-of-type {
+  margin-right: 0;
+}
+.pod-backs .count {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #aabba8;
+}
+
+.played {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.spectator-hands {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.spectator-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.spectator-label {
+  font-size: 13px;
+  color: #d6e4d9;
+  font-weight: 600;
+}
+
+.auto-play.armed {
+  background: #243528;
+  border-color: #6db481;
+  box-shadow: 0 0 0 2px rgba(109, 180, 129, 0.35);
+  animation: pulse-armed 1.6s ease-in-out infinite;
+}
+@keyframes pulse-armed {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(109, 180, 129, 0.35); }
+  50% { box-shadow: 0 0 0 5px rgba(109, 180, 129, 0.18); }
+}
+
+.auto-advance {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #aabba8;
+  user-select: none;
+  cursor: pointer;
+}
+.auto-advance input { margin: 0; }
+
+.declare-btn {
+  font-weight: 600;
+  padding: 6px 8px;
+  display: inline-flex;
+  align-items: center;
+}
+.declare-cards {
+  display: inline-flex;
+  gap: 0;
+}
+.declare-cards .card-svg + .card-svg {
+  /* 50×71 small base, same ~34%-visible overlap ratio as the hand. */
+  margin-left: -33px;
+}
+.declare-btn.red {
+  color: #f7cbcb;
+  border-color: #6e3838;
+  background: #3a2424;
+}
+.declare-btn.red:hover:not(:disabled) {
+  background: #4a2c2c;
+}
+.declare-btn.black {
+  color: #e5e7e2;
+  border-color: #3c5142;
+  background: #1c2820;
+}
+.declare-btn.jbig {
+  color: #fcd9b3;
+  border-color: #7a4a26;
+  background: #3a261a;
+}
+.declare-btn.jsm {
+  color: #d8d4c4;
+  border-color: #4d4636;
+  background: #2a2620;
+}
+
+.hand {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 12px;
+  background: #1c281f;
+  border: 1px solid #2f4233;
+  border-radius: 8px;
+}
+
+.card-svg {
+  user-select: none;
+  display: inline-block;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.4));
+  transition:
+    transform 0.12s ease,
+    filter 0.12s ease;
+}
+
+.card-svg.clickable {
+  cursor: pointer;
+}
+.card-svg.clickable:hover {
+  transform: translateY(-3px);
+}
+.card-svg.selected {
+  transform: translateY(-12px);
+  filter: drop-shadow(0 4px 6px rgba(109, 180, 129, 0.6))
+    drop-shadow(0 0 1px #6db481);
+}
+.card-svg.disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hand-svg {
+  display: flex;
+  flex-wrap: wrap;
+  padding: 24px 16px 32px;
+  background: #1c281f;
+  border: 1px solid #2f4233;
+  border-radius: 10px;
+  min-height: 128px;
+  align-items: flex-end;
+}
+.hand-svg .card-svg {
+  /* ~26% larger than the default 76×109 base (was 40% / 106×153, now
+     scaled down 10% for a less crowded hand). Overlap kept at the same
+     ~34%-visible ratio. */
+  width: 95px;
+  height: 137px;
+  margin-right: -63px;
+}
+.hand-svg .card-svg:last-child {
+  margin-right: 0;
+}
+
+/* Selected cards are moved to the .playing-box, not lifted in place */
+.card-svg.selected { transform: none; }
+
+.buried-kitty {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #18241d;
+  border: 1px dashed #3c5142;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.buried-kitty-label {
+  font-size: 12px;
+  color: #94a89a;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.buried-kitty-cards {
+  display: flex;
+}
+/* 20% smaller than the 106×153 hand size → ~85×122, with the same
+   visual overlap ratio as hand cards (-78px on 106 ≈ -62 on 85). */
+.buried-kitty-cards .card-svg {
+  width: 85px;
+  height: 122px;
+}
+.buried-kitty-cards .card-svg + .card-svg {
+  margin-left: -56px; /* same ~34%-visible overlap ratio as hand cards */
+}
+
+.playing-box {
+  display: flex;
+  padding: 16px 14px 18px;
+  background: #1a2a20;
+  border: 1px dashed #3c5142;
+  border-radius: 10px;
+  /* Locked to the height of a single hand-card (137px) + padding so the
+     box stays the same size whether it's empty or full. Otherwise the
+     hand layout would shift every time you select / unselect a card. */
+  height: 171px;
+  /* About one card wide by default; expands rightward only as needed
+     when extra cards are added. */
+  width: fit-content;
+  min-width: 125px;
+  max-width: 100%;
+  align-items: flex-end;
+  margin-bottom: 8px;
+}
+.playing-box .card-svg {
+  width: 95px;
+  height: 137px;
+  margin-right: -63px;
+}
+.playing-box .card-svg:last-child {
+  margin-right: 0;
+}
+.playing-box .empty-hint {
+  color: #5e7263;
+  font-style: italic;
+  font-size: 13px;
+  align-self: center;
+  margin-left: 4px;
+}
+
+.played-svg {
+  display: flex;
+  gap: 5px;
+  margin-top: 8px;
+  min-height: 71px;
+  flex-wrap: wrap;
+}
+
+.hand-backs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 6px;
+}
+.hand-backs .card-svg {
+  margin-right: -32px;
+}
+.hand-backs .card-svg:last-of-type {
+  margin-right: 0;
+}
+.hand-backs .muted {
+  margin-left: 8px;
+  font-size: 12px;
+}
+
+.row { display: flex; gap: 8px; align-items: center; }
+
+.hand-row {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+  min-width: 0;
+}
+.hand-col {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.points-panel {
+  flex: 0 0 360px;
+  background: #15201a;
+  border: 1px solid #2f4233;
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+}
+.points-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.points-meter.standalone {
+  background: #15201a;
+  border: 1px solid #2f4233;
+  border-radius: 10px;
+  /* Extra right padding so the trailing number label has room to extend
+     past the end of the bar without being clipped. */
+  padding: 14px 44px 14px 18px;
+  margin: 0;
+}
+.kitty-bonus {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed #3c5142;
+}
+.kitty-bonus-label {
+  font-size: 11px;
+  color: #d4a04a;
+  margin-bottom: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.points-header {
+  font-weight: 600;
+  color: #b1c4b8;
+  font-size: 14px;
+  border-bottom: 1px solid #2f4233;
+  padding-bottom: 6px;
+}
+.points-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.points-name { color: #d6e4d9; font-weight: 600; font-size: 13px; }
+.points-cards {
+  display: flex;
+  align-items: flex-end;
+  min-height: 80px;
+  padding-top: 4px;
+  flex-wrap: wrap;
+}
+/* 76×109 base, same ~34%-visible overlap ratio as the hand. */
+.points-cards .card-svg + .card-svg {
+  margin-left: -50px;
+}
+.points-meter {
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid #2f4233;
+}
+.meter-label {
+  font-size: 11px;
+  color: #aabba8;
+  margin-bottom: 4px;
+}
+.meter-bar {
+  position: relative;
+  height: 16px;
+  /* Gradient lives on the bar itself (anchored to the full bar length)
+     so a node at any position lines up with the bar's color there.
+     red → blue, low → high. */
+  background: linear-gradient(90deg, #c44545, #345fa8);
+  border-radius: 8px;
+  /* Nodes overhang the bar and the trailing label can escape the right
+     edge — don't clip. */
+  overflow: visible;
+}
+.meter-unfilled {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: #243528;
+  border-radius: 8px;
+  transition: left 0.25s ease;
+}
+.meter-fill-label {
+  position: absolute;
+  top: 50%;
+  transform: translate(8px, -50%);
+  font-size: 12px;
+  font-weight: 700;
+  color: #e8efe9;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
+}
+.meter-node {
+  position: absolute;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: #1a2a22;
+  border: 2px solid #3c5142;
+  pointer-events: none;
+  transition: background 0.2s ease, border-color 0.2s ease;
+  z-index: 1;
+}
+.meter-node.reached {
+  /* `background` is supplied inline so it matches the bar gradient at
+     this node's position. */
+  border-color: rgba(0, 0, 0, 0.45);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+.error {
+  background: #4a2020;
+  border: 1px solid #b13030;
+  color: #f7cbcb;
+  padding: 8px 12px;
+  border-radius: 6px;
+}

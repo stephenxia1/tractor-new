@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+**/coverage
+**/.vitest-cache
+**/*.tsbuildinfo
+.git
+.gitignore
+.github
+*.log
+.DS_Store
+apps/web/.next
+plan.md
+rules.md

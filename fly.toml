@@ -1,0 +1,35 @@
+# Fly.io app config for the @tractor/ws server.
+# Replace `app` with your chosen Fly app name (must be globally unique)
+# and `primary_region` with a region close to you (`fly platform regions`).
+
+app = "tractor-ws-stephenxia"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8787"
+  # Comma-separated list of allowed browser origins. Leave unset during
+  # local testing; set to your Vercel domain(s) in production.
+  # ALLOWED_ORIGINS = "https://your-app.vercel.app"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
