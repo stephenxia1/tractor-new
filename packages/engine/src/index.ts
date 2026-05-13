@@ -99,6 +99,7 @@ export {
   pickBotAction,
   botTypeLabel,
   BOT_TYPES,
+  VISIBLE_BOT_TYPES,
   type BotAction,
   type BotType,
 } from './bot';

@@ -55,6 +55,8 @@ export type BotType =
   | 'smart-v8'       // smart-v7 + adaptive cost penalty
   | 'smart-v9'       // smart-v8 + even stronger Ace penalty
   | 'smart-v10'      // smart-v9 with Ace penalty bumped 2.5 -> 3.0
+  | 'smart-v11'      // smart-v9 + differentiated trump natural-rank penalty
+  | 'smart-v12'      // smart-v9 + opponent void / no-pair tracking
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -73,7 +75,30 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v8',
   'smart-v9',
   'smart-v10',
+  'smart-v11',
+  'smart-v12',
   'rl-mlp',
+];
+
+// User-facing subset shown in the lobby dropdown. Keeps the experimental
+// baseline heuristics (lowball / aggressive / point-hoarder) and the
+// not-yet-shipped rl-mlp out of player view; they're still selectable
+// via the protocol and useful for tournaments. `smart-v0` is excluded
+// because it's a duplicate of `smart` (= v1).
+export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
+  'random',
+  'smart',
+  'smart-v2',
+  'smart-v3',
+  'smart-v4',
+  'smart-v5',
+  'smart-v6',
+  'smart-v7',
+  'smart-v8',
+  'smart-v9',
+  'smart-v10',
+  'smart-v11',
+  'smart-v12',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -87,27 +112,31 @@ export function botTypeLabel(t: BotType): string {
     case 'random':
       return 'Random';
     case 'smart-v0':
-      return 'Smart v0 (== Smart)';
+      return 'v0: Pebble';
     case 'smart':
-      return 'Smart';
+      return 'v1: Pebble';
     case 'smart-v2':
-      return 'Smart v2';
+      return 'v2: Ripple';
     case 'smart-v3':
-      return 'Smart v3 (2-ply search)';
+      return 'v3: Wave';
     case 'smart-v4':
-      return 'Smart v4 (tracking + better decl/kitty)';
+      return 'v4: Tide';
     case 'smart-v5':
-      return 'Smart v5 (v3 opponent model)';
+      return 'v5: Current';
     case 'smart-v6':
-      return 'Smart v6 (4-ply search, v3 opponent)';
+      return 'v6: Eddy';
     case 'smart-v7':
-      return 'Smart v7 (5-ply search)';
+      return 'v7: Surge';
     case 'smart-v8':
-      return 'Smart v8 (5-ply, stronger save-the-aces penalty)';
+      return 'v8: Swell';
     case 'smart-v9':
-      return 'Smart v9 (+ even stronger Ace penalty)';
+      return 'v9: Breaker';
     case 'smart-v10':
-      return 'Smart v10 (Ace penalty 3.0)';
+      return 'v10: Crest';
+    case 'smart-v11':
+      return 'v11: Drift';
+    case 'smart-v12':
+      return 'v12: Foam';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -212,6 +241,12 @@ export function pickBotAction(
   }
   if (type === 'smart-v10') {
     return pickSmartV10(state, seat);
+  }
+  if (type === 'smart-v11') {
+    return pickSmartV11(state, seat);
+  }
+  if (type === 'smart-v12') {
+    return pickSmartV12(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -2388,6 +2423,400 @@ function scoreCandidateV10(
   let penalty = 0;
   for (const c of candidate) {
     penalty += cardCostV10(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v11
+// =========================================================================
+//
+// v11 keeps v9's whole architecture (5-ply search, v3 opponent model,
+// Ace penalty 2.5) but differentiates the natural-trump-rank bucket of
+// the cost function. v9 charged a flat 1.0 for every natural trump in
+// the trump suit (a 3-of-trump and the trump A had identical cost),
+// which doesn't reflect that trump A is the top of tier 1 — it beats
+// every other natural trump.
+//
+// Trump card hierarchy (low → high), with new v11 cost:
+//   3,4,6,7,8,9,10,J,Q  in trump suit          0.3
+//   K in trump suit                            0.8
+//   A in trump suit                            1.5
+//   rank-R in non-trump suits (off-suit-R)     2.0  (unchanged)
+//   rank-R in trump suit                       2.5  (unchanged)
+//   small joker                                4.0  (unchanged)
+//   big joker                                  5.0  (unchanged)
+//
+// Non-trump and tracking promotion logic is unchanged from v9.
+
+function cardCostV11(
+  c: Card,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  if (isTrump(c, ctx)) {
+    if (c.kind === 'joker') return c.rank === 'big' ? 5 : 4;
+    if (c.rank === ctx.trumpRank && c.suit === ctx.trumpSuit) return 2.5;
+    if (c.rank === ctx.trumpRank) return 2;
+    // Natural trump-suit rank (tier 1). Scale by rank height.
+    if (c.kind === 'standard') {
+      if (c.rank === 'A') return 1.5;
+      if (c.rank === 'K') return 0.8;
+      return 0.3;
+    }
+    return 1; // unreachable
+  }
+  if (c.kind !== 'standard') return 0;
+  if (c.rank === 'A') return 2.5;
+  if (tracking.isGuaranteedSuitWinner(c)) return 0;
+  if (c.rank === 'K') return 0.5;
+  return 0;
+}
+
+function pickSmartV11(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV11Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV11Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV11(state, seat, cand, myTeam, ctx, tracking);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV11(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(state, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V8_SEARCH_DEPTH,
+    SMART_V8_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV11(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v12
+// =========================================================================
+//
+// v12 keeps v9's whole architecture and adds **deterministic** signals
+// from past play:
+//
+//   1. **Opponent voids** — when a follower plays any non-led-suit card
+//      to a trick led in suit X, they're permanently void in X. Future
+//      tricks led in X will be trumped (or dumped) by that opponent.
+//
+//   2. **Opponent no-pair-in-suit** — when a pair is led in suit X and a
+//      follower doesn't match with a pair (because the engine forces a
+//      pair match if you have one), they confirmedly have NO pair in X.
+//
+// These are exact signals — the engine's follow rules guarantee them.
+// The simulation already uses real opponent hands, but smart-v3 (the
+// opponent model in our simulation) may not always trump optimally. So
+// we layer an explicit score adjustment at lead time:
+//
+//   - Penalty for leading a non-trump combo into a suit where any
+//     opponent is known void.
+//   - Bonus for leading a non-trump pair in a suit where every opponent
+//     is known to have no pair (the pair-trick is guaranteed unless
+//     trumped — and the void penalty already gates the trump risk).
+
+type PlayedTrackingV12 = PlayedTracking & {
+  readonly isOpponentKnownVoid: (seat: Seat, suit: EffectiveSuit) => boolean;
+  readonly isOpponentKnownNoPair: (seat: Seat, suit: EffectiveSuit) => boolean;
+};
+
+function buildPlayedTrackingV12(
+  state: GameState,
+  ctx: TrumpContext,
+  myHand: ReadonlyArray<Card>,
+): PlayedTrackingV12 {
+  const base = buildPlayedTracking(state, ctx, myHand);
+  const voidKeys = new Set<string>();
+  const noPairKeys = new Set<string>();
+
+  const scan = (
+    trick: { plays: ReadonlyArray<{ seat: Seat; cards: ReadonlyArray<Card> }> },
+  ): void => {
+    if (trick.plays.length === 0) return;
+    const lead = trick.plays[0]!;
+    const leadCards = lead.cards;
+    const ledSuit = effectiveSuit(leadCards[0]!, ctx);
+    const leadCls = classifyCombo(leadCards, ctx, state.config.numDecks);
+    const leadIsPair =
+      leadCls.ok && leadCls.combo.kind === 'nkind' && leadCls.combo.n === 2;
+
+    for (let i = 1; i < trick.plays.length; i++) {
+      const p = trick.plays[i]!;
+      const inLedCount = p.cards.filter(
+        (c) => effectiveSuit(c, ctx) === ledSuit,
+      ).length;
+      if (inLedCount < p.cards.length) {
+        // Followed with some off-suit cards → exhausted led suit.
+        voidKeys.add(`${p.seat}:${ledSuit}`);
+      }
+      if (leadIsPair && inLedCount === 2) {
+        // Played 2 led-suit cards to a pair lead — but if those 2 weren't
+        // a pair themselves, the player had no pair in led suit (engine
+        // forces a pair match if held).
+        const cls = classifyCombo(p.cards, ctx, state.config.numDecks);
+        const playedPair =
+          cls.ok &&
+          cls.combo.kind === 'nkind' &&
+          cls.combo.n === 2 &&
+          cls.combo.effectiveSuit === ledSuit;
+        if (!playedPair) {
+          noPairKeys.add(`${p.seat}:${ledSuit}`);
+        }
+      }
+    }
+  };
+
+  const hand = state.currentHand;
+  if (hand !== null) {
+    for (const t of hand.tricks) scan(t);
+    if (hand.currentTrick !== null) scan(hand.currentTrick);
+  }
+
+  return {
+    isGuaranteedSuitWinner: base.isGuaranteedSuitWinner,
+    isOpponentKnownVoid: (seat, suit) => voidKeys.has(`${seat}:${suit}`),
+    isOpponentKnownNoPair: (seat, suit) => noPairKeys.has(`${seat}:${suit}`),
+  };
+}
+
+// Score adjustment applied only when leading. Returns a delta to add to
+// the candidate score.
+const SMART_V12_VOID_PENALTY_PER_OPP = 2.0;
+const SMART_V12_NO_PAIR_BONUS = 5.0;
+
+function leadAdjustmentV12(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  n: number,
+  tracking: PlayedTrackingV12,
+): number {
+  const candSuit = effectiveSuit(candidate[0]!, ctx);
+  // No adjustment for trump leads — void/pair logic targets non-trump.
+  if (candSuit === 'trump') return 0;
+
+  const myTeam = teamOf(state, seat);
+  const opponentSeats: Seat[] = [];
+  for (let s = 0; s < state.config.numPlayers; s++) {
+    if (teamOf(state, s) !== myTeam) opponentSeats.push(s);
+  }
+
+  let voidOpponents = 0;
+  let noPairOpponents = 0;
+  for (const opp of opponentSeats) {
+    if (tracking.isOpponentKnownVoid(opp, candSuit)) voidOpponents++;
+    if (tracking.isOpponentKnownNoPair(opp, candSuit)) noPairOpponents++;
+  }
+
+  let adj = -SMART_V12_VOID_PENALTY_PER_OPP * voidOpponents;
+
+  // Pair-lead bonus if all opponents are confirmed pair-less.
+  const cls = classifyCombo(candidate, ctx, n);
+  if (cls.ok && cls.combo.kind === 'nkind' && cls.combo.n === 2) {
+    if (noPairOpponents === opponentSeats.length) {
+      adj += SMART_V12_NO_PAIR_BONUS;
+    }
+  }
+  return adj;
+}
+
+function pickSmartV12(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV12Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV12Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const tracking = buildPlayedTrackingV12(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const isLeading = trick === null;
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    let score = scoreCandidateV12Base(
+      state,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+    );
+    if (isLeading) {
+      score += leadAdjustmentV12(state, seat, cand, ctx, n, tracking);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+// Same base scoring as v9 — simulation + cardCostV9 (Ace 2.5 etc.).
+function scoreCandidateV12Base(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(state, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V8_SEARCH_DEPTH,
+    SMART_V8_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV9(c, ctx, tracking);
   }
   return pointsScore - penalty;
 }

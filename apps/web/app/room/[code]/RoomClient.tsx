@@ -10,7 +10,7 @@ import {
   pointsForCard,
   validateFollow,
   validateFollowThrow,
-  BOT_TYPES,
+  VISIBLE_BOT_TYPES,
   botTypeLabel,
   type BotType,
   type Card,
@@ -655,7 +655,7 @@ function PlayerCell({
               onChange={(e) => setDefaultBotType(e.target.value as BotType)}
               title="Bot strategy for this seat"
             >
-              {BOT_TYPES.map((t) => (
+              {VISIBLE_BOT_TYPES.map((t) => (
                 <option key={t} value={t}>
                   {botTypeLabel(t)}
                 </option>
