@@ -14,6 +14,8 @@ import {
 import { availableDeclarationsFor } from './declareEnum';
 import { applyEvent, nextToPlay } from './reducer';
 import { legalEvents } from './legalActions';
+import { buildDeck } from './deck';
+import { mulberry32, shuffle } from './prng';
 import {
   NATURAL_RANKS,
   cardEquals,
@@ -57,6 +59,9 @@ export type BotType =
   | 'smart-v10'      // smart-v9 with Ace penalty bumped 2.5 -> 3.0
   | 'smart-v11'      // smart-v9 + differentiated trump natural-rank penalty
   | 'smart-v12'      // smart-v9 + opponent void / no-pair tracking
+  | 'smart-v13'      // smart-v9 with opponent hands masked / determinized
+  | 'smart-v14'      // smart-v13 + v12's void/no-pair public-info signals
+  | 'smart-v15'      // smart-v13 with N=3 determinizations averaged
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -77,6 +82,9 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v10',
   'smart-v11',
   'smart-v12',
+  'smart-v13',
+  'smart-v14',
+  'smart-v15',
   'rl-mlp',
 ];
 
@@ -137,6 +145,12 @@ export function botTypeLabel(t: BotType): string {
       return 'v11: Kelp';
     case 'smart-v12':
       return 'v12: Lagoon';
+    case 'smart-v13':
+      return 'v13: Periscope (hidden info)';
+    case 'smart-v14':
+      return 'v14: Hawkeye (hidden info + public signals)';
+    case 'smart-v15':
+      return 'v15: Mirage (N=3 determinizations)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -247,6 +261,15 @@ export function pickBotAction(
   }
   if (type === 'smart-v12') {
     return pickSmartV12(state, seat);
+  }
+  if (type === 'smart-v13') {
+    return pickSmartV13(state, seat);
+  }
+  if (type === 'smart-v14') {
+    return pickSmartV14(state, seat);
+  }
+  if (type === 'smart-v15') {
+    return pickSmartV15(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -2819,6 +2842,491 @@ function scoreCandidateV12Base(
     penalty += cardCostV9(c, ctx, tracking);
   }
   return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v13
+// =========================================================================
+//
+// v13 fixes a long-standing correctness issue in v3-v12: their search
+// reads opponent hands directly via `state.currentHand.hands[opp]`,
+// which is information no real player has. v13 uses the same v9
+// architecture but **masks** opponent hands before each candidate
+// evaluation: the unknown cards (deck − my hand − played cards − known
+// kitty) are randomly distributed across opponent seats to produce a
+// "determinized" state that's consistent with what the bot can actually
+// observe. The simulation then runs on this determinized state.
+//
+// Single determinization per scoring call (seeded by trick count for
+// stability across candidate comparisons within one decision).
+
+function pickSmartV13(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV13Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV13Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  // Candidate enumeration only uses my own cards + the trick state,
+  // never opponents' hands. We can use the real state here for legal
+  // moves (since legality is observable).
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  // Build the determinized state ONCE for this decision. All candidates
+  // are scored against the same sampled opp hands, so comparisons are
+  // apples-to-apples even if the sample is noisy.
+  const hand = state.currentHand!;
+  const determinizationSeed = deterministicSeed(state, seat);
+  const determinized = maskOpponentHands(state, seat, determinizationSeed);
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV13(determinized, seat, cand, myTeam, ctx, tracking);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV13(
+  determinizedState: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(determinizedState, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V8_SEARCH_DEPTH,
+    SMART_V8_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV9(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// Produce a deterministic seed from the bot's observable state so that
+// candidate scoring within a single decision uses a single, stable
+// determinization. The seed varies across tricks so we don't bias toward
+// a fixed sample.
+function deterministicSeed(state: GameState, seat: Seat): number {
+  const hand = state.currentHand;
+  if (hand === null) return 1;
+  const tricksDone = hand.tricks.length;
+  const playsInCurrent = hand.currentTrick?.plays.length ?? 0;
+  return (
+    1 + seat * 257 + tricksDone * 1009 + playsInCurrent * 17 + hand.handNumber * 7919
+  ) >>> 0;
+}
+
+// Returns a state with opponents' hands and (if I'm not landlord) the
+// kitty replaced by random assignments drawn from cards that aren't
+// known to me. My own hand and the played-trick history are preserved.
+function maskOpponentHands(
+  state: GameState,
+  mySeat: Seat,
+  seed: number,
+): GameState {
+  const hand = state.currentHand;
+  if (hand === null) return state;
+
+  const myCards = hand.hands[mySeat] ?? [];
+  const playedCards: Card[] = [];
+  for (const t of hand.tricks) {
+    for (const p of t.plays) {
+      for (const c of p.cards) playedCards.push(c);
+    }
+  }
+  if (hand.currentTrick !== null) {
+    for (const p of hand.currentTrick.plays) {
+      for (const c of p.cards) playedCards.push(c);
+    }
+  }
+  const iAmLandlord = hand.landlord === mySeat;
+  const knownKitty = iAmLandlord ? hand.kitty : [];
+
+  const knownSet = new Set<string>();
+  const addKnown = (c: Card): void => {
+    knownSet.add(identityKey(c));
+  };
+  for (const c of myCards) addKnown(c);
+  for (const c of playedCards) addKnown(c);
+  for (const c of knownKitty) addKnown(c);
+
+  const fullDeck = buildDeck(state.config.numDecks);
+  const unknown = fullDeck.filter((c) => !knownSet.has(identityKey(c)));
+
+  const rng = mulberry32(seed);
+  const shuffled = shuffle(unknown, rng);
+
+  const newHands: Record<Seat, ReadonlyArray<Card>> = {};
+  let idx = 0;
+  for (let s = 0; s < state.config.numPlayers; s++) {
+    if (s === mySeat) {
+      newHands[s] = myCards;
+      continue;
+    }
+    const size = (hand.hands[s] ?? []).length;
+    newHands[s] = shuffled.slice(idx, idx + size);
+    idx += size;
+  }
+
+  const newKitty: ReadonlyArray<Card> = iAmLandlord
+    ? hand.kitty
+    : shuffled.slice(idx, idx + hand.kitty.length);
+
+  return {
+    ...state,
+    currentHand: {
+      ...hand,
+      hands: newHands,
+      kitty: newKitty,
+    },
+  };
+}
+
+// =========================================================================
+// Strategy: smart-v14
+// =========================================================================
+//
+// v14 combines v13's hidden-information determinization with v12's
+// **deterministic public-info signals**. Both ingredients are needed:
+//   - Determinization (v13) keeps the bot honest — no opponent-hand
+//     reads inside the simulation.
+//   - Public-info signals (v12) provide the bot with reliable knowledge
+//     that the simulation can't reconstruct, e.g.:
+//       * If an opponent played off-suit on a led suit, they're
+//         permanently void in that suit (would trump non-trump leads).
+//       * If a pair was led and an opponent didn't match with a pair,
+//         the engine forces a pair match — so they have no pair in
+//         that suit. Future pair leads in that suit are safer.
+//
+// v13 alone lost 0-12 to v9 (the cheating full-info bot). v14's hope:
+// the deterministic public signals partially compensate for the
+// information loss without re-introducing the cheating.
+
+function pickSmartV14(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV14Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV14Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  // Determinize opponent hands (hidden-info correctness from v13).
+  const determinizationSeed = deterministicSeed(state, seat);
+  const determinized = maskOpponentHands(state, seat, determinizationSeed);
+
+  // Public-info trackings (computed from REAL state — these are facts
+  // any observer at the table would know).
+  const tracking = buildPlayedTrackingV12(state, ctx, myCards);
+
+  const myTeam = teamOf(state, seat);
+  const isLeading = trick === null;
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    let score = scoreCandidateV14(
+      determinized,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+    );
+    if (isLeading) {
+      score += leadAdjustmentV12(state, seat, cand, ctx, n, tracking);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV14(
+  determinizedState: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(determinizedState, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V8_SEARCH_DEPTH,
+    SMART_V8_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV9(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v15
+// =========================================================================
+//
+// v15 is v13's hidden-info bot but averages over N=3 determinizations
+// per candidate. Each sample uses a different random opponent-hand
+// assignment consistent with public info. Averaging reduces the
+// variance from a single noisy determinization — the hope is that
+// candidate ranking becomes more reliable.
+//
+// Cost: ~3× v13 per decision.
+
+const SMART_V15_NUM_SAMPLES = 3;
+
+function pickSmartV15(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV15Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV15Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  // Pre-sample N determinizations. All candidates score against the
+  // same N samples — apples-to-apples comparisons.
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V15_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV15(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV15(
+  determinizations: ReadonlyArray<GameState>,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  let totalPointsScore = 0;
+  let validSamples = 0;
+  for (const det of determinizations) {
+    const r0 = applyEvent(det, {
+      kind: 'play_cards',
+      seat,
+      cards: candidate,
+    });
+    if (!r0.ok) continue;
+    totalPointsScore += simulateTricks(
+      r0.state,
+      myTeam,
+      SMART_V8_SEARCH_DEPTH,
+      SMART_V8_OPPONENT_MODEL,
+    );
+    validSamples++;
+  }
+  if (validSamples === 0) return -1e9;
+  const avgPointsScore = totalPointsScore / validSamples;
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV9(c, ctx, tracking);
+  }
+  return avgPointsScore - penalty;
 }
 
 function cardCostV4(
