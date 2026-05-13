@@ -54,6 +54,7 @@ export type BotType =
   | 'smart-v7'       // smart-v6 + terminal opponent-cost heuristic
   | 'smart-v8'       // smart-v7 + adaptive cost penalty
   | 'smart-v9'       // smart-v8 + even stronger Ace penalty
+  | 'smart-v10'      // smart-v9 with Ace penalty bumped 2.5 -> 3.0
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -71,6 +72,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v7',
   'smart-v8',
   'smart-v9',
+  'smart-v10',
   'rl-mlp',
 ];
 
@@ -104,6 +106,8 @@ export function botTypeLabel(t: BotType): string {
       return 'Smart v8 (5-ply, stronger save-the-aces penalty)';
     case 'smart-v9':
       return 'Smart v9 (+ even stronger Ace penalty)';
+    case 'smart-v10':
+      return 'Smart v10 (Ace penalty 3.0)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -205,6 +209,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v9') {
     return pickSmartV9(state, seat);
+  }
+  if (type === 'smart-v10') {
+    return pickSmartV10(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -2254,6 +2261,133 @@ function scoreCandidateV9(
   let penalty = 0;
   for (const c of candidate) {
     penalty += cardCostV9(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v10
+// =========================================================================
+//
+// v10 continues the save-the-aces axis: Ace penalty 2.5 → 3.0. Tests
+// whether further preservation of aces helps after v9's gain.
+
+function cardCostV10(
+  c: Card,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  if (isTrump(c, ctx)) {
+    if (c.kind === 'joker') return c.rank === 'big' ? 5 : 4;
+    if (c.rank === ctx.trumpRank && c.suit === ctx.trumpSuit) return 2.5;
+    if (c.rank === ctx.trumpRank) return 2;
+    return 1;
+  }
+  if (c.kind !== 'standard') return 0;
+  if (c.rank === 'A') return 3; // ↑ from v9's 2.5
+  if (tracking.isGuaranteedSuitWinner(c)) return 0;
+  if (c.rank === 'K') return 0.5;
+  return 0;
+}
+
+function pickSmartV10(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV10Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV10Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV10(state, seat, cand, myTeam, ctx, tracking);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV10(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(state, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V8_SEARCH_DEPTH,
+    SMART_V8_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV10(c, ctx, tracking);
   }
   return pointsScore - penalty;
 }
