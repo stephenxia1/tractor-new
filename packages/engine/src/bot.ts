@@ -50,6 +50,7 @@ export type BotType =
   | 'smart-v3'       // smart-v2 + 2-ply search and search-based leading
   | 'smart-v4'       // smart-v3 + card tracking, better declare/kitty
   | 'smart-v5'       // smart-v4 + smart-v3 opponent model in the simulation
+  | 'smart-v6'       // smart-v5 + smart-v4 opponent model in the simulation
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -63,6 +64,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v3',
   'smart-v4',
   'smart-v5',
+  'smart-v6',
   'rl-mlp',
 ];
 
@@ -88,6 +90,8 @@ export function botTypeLabel(t: BotType): string {
       return 'Smart v4 (tracking + better decl/kitty)';
     case 'smart-v5':
       return 'Smart v5 (v3 opponent model)';
+    case 'smart-v6':
+      return 'Smart v6 (4-ply search, v3 opponent)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -177,6 +181,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v5') {
     return pickSmartV5(state, seat);
+  }
+  if (type === 'smart-v6') {
+    return pickSmartV6(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -2210,6 +2217,125 @@ function scoreCandidateV5(
     myTeam,
     SMART_V4_SEARCH_DEPTH,
     SMART_V5_OPPONENT_MODEL,
+  );
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV4(c, ctx, tracking);
+  }
+  return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v6
+// =========================================================================
+//
+// v6 keeps smart-v5's smart-v3 opponent model but increases the search
+// horizon from 3 plies to 4. The fourth trick is discounted heavily
+// (0.6^3 ≈ 0.216), so its signal is small but informative for trick
+// trajectories where the next-but-one trick matters.
+//
+// An earlier v6 used smart-v4 as the opponent model (instead of deeper
+// search) but tied v5 6-6 over 12 games — a more accurate opponent
+// model didn't help once predictions were already strong enough. The
+// extra ply is a cleaner orthogonal improvement.
+
+const SMART_V6_OPPONENT_MODEL: BotType = 'smart-v3';
+const SMART_V6_SEARCH_DEPTH = 4;
+
+function pickSmartV6(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV6Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV6Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV6(state, seat, cand, myTeam, ctx, tracking);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV6(
+  state: GameState,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  const r0 = applyEvent(state, {
+    kind: 'play_cards',
+    seat,
+    cards: candidate,
+  });
+  if (!r0.ok) return -1e9;
+
+  const pointsScore = simulateTricks(
+    r0.state,
+    myTeam,
+    SMART_V6_SEARCH_DEPTH,
+    SMART_V6_OPPONENT_MODEL,
   );
 
   let penalty = 0;
