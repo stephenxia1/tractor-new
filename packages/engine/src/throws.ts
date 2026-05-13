@@ -132,9 +132,12 @@ function componentCardCount(c: ClassifiedCombo): number {
 }
 
 // True iff `hand` contains a same-structure combo IN THE LED EFFECTIVE
-// SUIT that beats `target`. Trump combos can never block a non-trump
-// throw — followers can't be forced to trump, so the leader is safe
-// from any trump-only response.
+// SUIT that beats `target`. Per rules.md §7.6, the safety check (block)
+// is restricted to the led suit — a follower can only be *forced* to
+// follow led-suit cards, so a trump-only response can never be
+// guaranteed at lead time. (Trumps can still BEAT a throw at trick
+// resolution if the follower chooses to spend them; that is handled in
+// `resolveTrick` via structural comparison.)
 function componentCanBeBeaten(
   target: ClassifiedCombo,
   hand: ReadonlyArray<Card>,

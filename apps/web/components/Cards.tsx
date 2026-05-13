@@ -198,7 +198,7 @@ function JokerSvg(props: CardProps & { rank: JokerRank }): JSX.Element {
       />
       <text
         x={CARD_W / 2}
-        y="34"
+        y="40"
         fontSize="22"
         textAnchor="middle"
         fill={color}
@@ -207,7 +207,7 @@ function JokerSvg(props: CardProps & { rank: JokerRank }): JSX.Element {
       </text>
       <text
         x={CARD_W / 2}
-        y="50"
+        y="56"
         fontSize="8"
         fontWeight="700"
         textAnchor="middle"
@@ -215,17 +215,6 @@ function JokerSvg(props: CardProps & { rank: JokerRank }): JSX.Element {
         letterSpacing="1"
       >
         JOKER
-      </text>
-      <text
-        x={CARD_W / 2}
-        y="62"
-        fontSize="8"
-        fontWeight="500"
-        textAnchor="middle"
-        fill={color}
-        letterSpacing="0.5"
-      >
-        {isBig ? 'BIG' : 'sm'}
       </text>
     </svg>
   );

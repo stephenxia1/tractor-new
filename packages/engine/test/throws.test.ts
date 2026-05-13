@@ -77,15 +77,31 @@ describe('isThrowSafe', () => {
     expect(r.safe).toBe(true);
   });
 
-  it('trump combos cannot block a non-trump throw', () => {
+  it('trump combos do NOT block a non-trump throw at lead time', () => {
+    // Block is led-suit-only (rules.md §7.6). A trump pair the opponent
+    // holds may BEAT the throw at trick time, but the throw is still
+    // allowed to be led — followers can't be forced to trump.
     const cards = [...pair('clubs', '7'), std('clubs', '3', 0)];
     const decomp = decomposeThrow(cards, ctx, 2);
     expect(decomp.ok).toBe(true);
     if (!decomp.ok) return;
-    // Opponent has a pair of hearts (trump) — but per the safety rule,
-    // a trump-only response can never be forced over a non-trump throw,
-    // so this throw is still safe.
     const opp1: Card[] = [...pair('hearts', '3')];
+    const opp2: Card[] = [std('diamonds', '4', 0)];
+    const r = isThrowSafe(decomp.throw, [opp1, opp2], ctx, 2);
+    expect(r.safe).toBe(true);
+  });
+
+  it('big joker does not block a throw but can beat it at trick time', () => {
+    // User-reported case: throw of three non-trump singles. A big joker
+    // in an opponent's hand does NOT make the throw "unsafe" at lead
+    // time (block is led-suit-only), but at trick resolution the
+    // follower may play the joker (plus other cards) and structurally
+    // beat a component. The block check should return safe here.
+    const cards = [std('clubs', '3', 0), std('clubs', '7', 0), std('clubs', '9', 0)];
+    const decomp = decomposeThrow(cards, ctx, 2);
+    expect(decomp.ok).toBe(true);
+    if (!decomp.ok) return;
+    const opp1: Card[] = [jok('big', 0)];
     const opp2: Card[] = [std('diamonds', '4', 0)];
     const r = isThrowSafe(decomp.throw, [opp1, opp2], ctx, 2);
     expect(r.safe).toBe(true);
