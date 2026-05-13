@@ -62,6 +62,7 @@ export type BotType =
   | 'smart-v13'      // smart-v9 with opponent hands masked / determinized
   | 'smart-v14'      // smart-v13 + v12's void/no-pair public-info signals
   | 'smart-v15'      // smart-v13 with N=3 determinizations averaged
+  | 'smart-v16'      // smart-v13 with N=5 determinizations averaged
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -85,6 +86,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v13',
   'smart-v14',
   'smart-v15',
+  'smart-v16',
   'rl-mlp',
 ];
 
@@ -151,6 +153,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v14: Hawkeye (hidden info + public signals)';
     case 'smart-v15':
       return 'v15: Mirage (N=3 determinizations)';
+    case 'smart-v16':
+      return 'v16: Nebula (N=5 determinizations)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -270,6 +274,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v15') {
     return pickSmartV15(state, seat);
+  }
+  if (type === 'smart-v16') {
+    return pickSmartV16(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -3327,6 +3334,102 @@ function scoreCandidateV15(
     penalty += cardCostV9(c, ctx, tracking);
   }
   return avgPointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v16
+// =========================================================================
+//
+// Same as v15 but uses N=5 determinizations per scoring call instead of
+// N=3. More samples → lower variance in candidate score estimates, at
+// the cost of ~5/3 = 1.67× more compute.
+
+const SMART_V16_NUM_SAMPLES = 5;
+
+function pickSmartV16(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV16Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV16Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V16_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV15(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
 }
 
 function cardCostV4(
