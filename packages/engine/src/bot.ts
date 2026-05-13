@@ -112,31 +112,31 @@ export function botTypeLabel(t: BotType): string {
     case 'random':
       return 'Random';
     case 'smart-v0':
-      return 'v0: Pebble';
+      return 'v0: Atlas';
     case 'smart':
-      return 'v1: Pebble';
+      return 'v1: Atlas';
     case 'smart-v2':
-      return 'v2: Ripple';
+      return 'v2: Brook';
     case 'smart-v3':
-      return 'v3: Wave';
+      return 'v3: Cascade';
     case 'smart-v4':
-      return 'v4: Tide';
+      return 'v4: Delta';
     case 'smart-v5':
-      return 'v5: Current';
+      return 'v5: Eddy';
     case 'smart-v6':
-      return 'v6: Eddy';
+      return 'v6: Flow';
     case 'smart-v7':
-      return 'v7: Surge';
+      return 'v7: Gulf';
     case 'smart-v8':
-      return 'v8: Swell';
+      return 'v8: Harbor';
     case 'smart-v9':
-      return 'v9: Breaker';
+      return 'v9: Inlet';
     case 'smart-v10':
-      return 'v10: Crest';
+      return 'v10: Jetty';
     case 'smart-v11':
-      return 'v11: Drift';
+      return 'v11: Kelp';
     case 'smart-v12':
-      return 'v12: Foam';
+      return 'v12: Lagoon';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
