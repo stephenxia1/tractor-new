@@ -66,6 +66,7 @@ export type BotType =
   | 'smart-v16'      // smart-v13 with N=5 determinizations averaged
   | 'smart-v17'      // smart-v13 with N=10 determinizations averaged
   | 'smart-v18'      // v16 + decomposedBeats-aware winner + trump-throw candidate + hand-value lead bonus
+  | 'smart-v19'      // v18 + relative (my-opp) hand-value lead bonus
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -92,6 +93,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v16',
   'smart-v17',
   'smart-v18',
+  'smart-v19',
   'rl-mlp',
 ];
 
@@ -158,6 +160,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v17: Quartz (N=10)';
     case 'smart-v18':
       return 'v18: Riptide (throw-trump aware + lead bonus)';
+    case 'smart-v19':
+      return 'v19: Sirocco (relative lead bonus)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -286,6 +290,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v18') {
     return pickSmartV18(state, seat);
+  }
+  if (type === 'smart-v19') {
+    return pickSmartV19(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -3855,6 +3862,172 @@ function handLeadValue(
     }
   }
   return v;
+}
+
+// =========================================================================
+// Strategy: smart-v19
+// =========================================================================
+//
+// Same as v18 but lead bonus uses (my hand value − opp hand value) per
+// determinization, averaged over samples. Captures the "win when I'd
+// lead better than opp" intuition: if my hand is weaker than opp's,
+// winning the trick is actually less valuable (they'd lead worse).
+
+const SMART_V19_LEAD_BONUS_WEIGHT = 0.15;
+
+function pickSmartV19(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV19Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV19Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  // Trump-fill candidate (from v18).
+  if (trick !== null) {
+    const trumpFill = buildTrumpFillCandidate(myCards, trick, ctx);
+    if (trumpFill !== null) consider(trumpFill);
+  }
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V18_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  // Average opp hand value across determinizations.
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const myHandVal = handLeadValue(myCards, ctx, tracking);
+  let oppHandValSum = 0;
+  for (const det of determinizations) {
+    // Sum opp hand values from det.
+    if (det.currentHand !== null) {
+      for (let s = 0; s < det.config.numPlayers; s++) {
+        if (teamOf(det, s) === myTeam) continue;
+        oppHandValSum += handLeadValue(
+          det.currentHand.hands[s] ?? [],
+          ctx,
+          tracking,
+        );
+      }
+    }
+  }
+  // Average opp hand value (sum of both opp seats per det, averaged
+  // across dets, then divided by 2 for "per opponent seat").
+  const avgOppHandVal = oppHandValSum / (determinizations.length * 2);
+  const netLeadVal = myHandVal - avgOppHandVal;
+
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV19(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+      netLeadVal,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV19(
+  determinizations: ReadonlyArray<GameState>,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+  netLeadVal: number,
+): number {
+  let totalPointsScore = 0;
+  let totalWins = 0;
+  let validSamples = 0;
+  for (const det of determinizations) {
+    const r0 = applyEvent(det, {
+      kind: 'play_cards',
+      seat,
+      cards: candidate,
+    });
+    if (!r0.ok) continue;
+    const { score, wins } = simulateTricksAndWinsV18(
+      r0.state,
+      myTeam,
+      SMART_V8_SEARCH_DEPTH,
+      SMART_V8_OPPONENT_MODEL,
+    );
+    totalPointsScore += score;
+    totalWins += wins;
+    validSamples++;
+  }
+  if (validSamples === 0) return -1e9;
+  const avgPointsScore = totalPointsScore / validSamples;
+  const avgWins = totalWins / validSamples;
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV9(c, ctx, tracking);
+  }
+  const leadBonus = SMART_V19_LEAD_BONUS_WEIGHT * netLeadVal * avgWins;
+  return avgPointsScore - penalty + leadBonus;
 }
 
 function cardCostV4(
