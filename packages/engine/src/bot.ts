@@ -16,6 +16,7 @@ import { applyEvent, nextToPlay } from './reducer';
 import { legalEvents } from './legalActions';
 import { buildDeck } from './deck';
 import { mulberry32, shuffle } from './prng';
+import { decomposePlay, decomposedBeats } from './throws';
 import {
   NATURAL_RANKS,
   cardEquals,
@@ -63,6 +64,8 @@ export type BotType =
   | 'smart-v14'      // smart-v13 + v12's void/no-pair public-info signals
   | 'smart-v15'      // smart-v13 with N=3 determinizations averaged
   | 'smart-v16'      // smart-v13 with N=5 determinizations averaged
+  | 'smart-v17'      // smart-v13 with N=10 determinizations averaged
+  | 'smart-v18'      // v16 + decomposedBeats-aware winner + trump-throw candidate + hand-value lead bonus
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -87,6 +90,8 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v14',
   'smart-v15',
   'smart-v16',
+  'smart-v17',
+  'smart-v18',
   'rl-mlp',
 ];
 
@@ -149,6 +154,10 @@ export function botTypeLabel(t: BotType): string {
       return 'v15: Oasis';
     case 'smart-v16':
       return 'v16: Pier';
+    case 'smart-v17':
+      return 'v17: Quartz (N=10)';
+    case 'smart-v18':
+      return 'v18: Riptide (throw-trump aware + lead bonus)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -271,6 +280,12 @@ export function pickBotAction(
   }
   if (type === 'smart-v16') {
     return pickSmartV16(state, seat);
+  }
+  if (type === 'smart-v17') {
+    return pickSmartV17(state, seat);
+  }
+  if (type === 'smart-v18') {
+    return pickSmartV18(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -3424,6 +3439,422 @@ function smartV16Search(
     }
   }
   return { kind: 'play_cards', cards: bestCards };
+}
+
+// =========================================================================
+// Strategy: smart-v17
+// =========================================================================
+//
+// Same as v15/v16 but with N=10 determinizations per scoring call.
+// Tests whether further variance reduction continues to help past v16.
+
+const SMART_V17_NUM_SAMPLES = 10;
+
+function pickSmartV17(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV17Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV17Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V17_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV15(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+// =========================================================================
+// Strategy: smart-v18
+// =========================================================================
+//
+// Three fixes/additions on top of v16's N=5 determinized search:
+//
+// 1. **Correct winner detection in simulation**: previous versions used
+//    `classifyCombo` + `comboBeats` to resolve the simulated trick
+//    winner. That logic gives the leader an auto-win on throws because
+//    `classifyCombo` returns ok=false for multi-component plays. The
+//    engine now resolves via `decomposePlay` + `decomposedBeats`, which
+//    correctly lets trumping plays beat throws via same-shape matching.
+//    v18 fixes the simulation to match.
+//
+// 2. **Trump-trump candidate for follow positions**: when bot is void
+//    in led suit and has trumps, generate an explicit "lowest N trumps"
+//    candidate. `legalEvents`' 'low' fill prefers non-trump cards, so
+//    this candidate is otherwise never offered to the search.
+//
+// 3. **Hand-state-dependent lead bonus**: each simulated trick my team
+//    wins adds `α × handLeadValue(my_hand)` to the score. A strong
+//    hand (many aces, big trumps, guaranteed winners) values the lead
+//    more; a weak hand values it less.
+
+const SMART_V18_NUM_SAMPLES = 5;
+const SMART_V18_LEAD_BONUS_WEIGHT = 0.15; // small per-card "lead value" multiplier
+
+function pickSmartV18(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV18Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV18Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  // NEW: when following and void in led suit, add a "play lowest N
+  // trumps + fillers" candidate. This is critical for trumping throws.
+  if (trick !== null) {
+    const trumpFillCandidate = buildTrumpFillCandidate(
+      myCards,
+      trick,
+      ctx,
+    );
+    if (trumpFillCandidate !== null) consider(trumpFillCandidate);
+  }
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V18_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const handLeadVal = handLeadValue(myCards, ctx, tracking);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV18(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+      handLeadVal,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+// Build a candidate where the bot plays its lowest available trump
+// cards (filling required count), using non-led-suit non-trump as the
+// rest. Returns null if the bot can't or wouldn't choose this (e.g.,
+// has led-suit cards to follow with).
+function buildTrumpFillCandidate(
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick,
+  ctx: TrumpContext,
+): ReadonlyArray<Card> | null {
+  const lead = trick.plays[0]!;
+  const ledSuit = effectiveSuit(lead.cards[0]!, ctx);
+  const leadCount = lead.cards.length;
+
+  const myInLed = myCards.filter((c) => effectiveSuit(c, ctx) === ledSuit);
+  // If bot has any led-suit cards, the follow rules force playing them.
+  // Skip this candidate — the search will use 'low' / pair-match etc.
+  if (myInLed.length > 0) return null;
+
+  const trumpsAsc = myCards
+    .filter((c) => isTrump(c, ctx))
+    .sort((a, b) => compareCards(a, b, ctx));
+  if (trumpsAsc.length === 0) return null;
+
+  const chosen: Card[] = [];
+  // Use up to `leadCount` trumps, lowest first.
+  for (const t of trumpsAsc) {
+    if (chosen.length >= leadCount) break;
+    chosen.push(t);
+  }
+  // If not enough trumps, fill rest with lowest non-trump non-led cards.
+  if (chosen.length < leadCount) {
+    const fillers = myCards
+      .filter((c) => !isTrump(c, ctx))
+      .sort((a, b) => compareCards(a, b, ctx));
+    for (const f of fillers) {
+      if (chosen.length >= leadCount) break;
+      chosen.push(f);
+    }
+  }
+  if (chosen.length !== leadCount) return null;
+  return chosen;
+}
+
+function scoreCandidateV18(
+  determinizations: ReadonlyArray<GameState>,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+  handLeadVal: number,
+): number {
+  let totalPointsScore = 0;
+  let totalWins = 0;
+  let validSamples = 0;
+  for (const det of determinizations) {
+    const r0 = applyEvent(det, {
+      kind: 'play_cards',
+      seat,
+      cards: candidate,
+    });
+    if (!r0.ok) continue;
+    const { score, wins } = simulateTricksAndWinsV18(
+      r0.state,
+      myTeam,
+      SMART_V8_SEARCH_DEPTH,
+      SMART_V8_OPPONENT_MODEL,
+    );
+    totalPointsScore += score;
+    totalWins += wins;
+    validSamples++;
+  }
+  if (validSamples === 0) return -1e9;
+  const avgPointsScore = totalPointsScore / validSamples;
+  const avgWins = totalWins / validSamples;
+
+  let penalty = 0;
+  for (const c of candidate) {
+    penalty += cardCostV9(c, ctx, tracking);
+  }
+  const leadBonus = SMART_V18_LEAD_BONUS_WEIGHT * handLeadVal * avgWins;
+  return avgPointsScore - penalty + leadBonus;
+}
+
+// Like simulateTricks but ALSO tracks "wins" (number of completed
+// tricks won by myTeam during the simulation). Also uses the correct
+// post-engine-update winner detection via decomposedBeats.
+function simulateTricksAndWinsV18(
+  initial: GameState,
+  myTeam: TeamId,
+  depth: number,
+  opponentModel: BotType = 'smart',
+): { score: number; wins: number } {
+  let s = initial;
+  let score = 0;
+  let wins = 0;
+  let weight = 1.0;
+
+  for (let d = 0; d < depth; d++) {
+    if (s.phase !== 'play' && s.phase !== 'trick_review') break;
+
+    let guard = 0;
+    while (s.phase === 'play' && guard++ < 5) {
+      const next = nextToPlay(s);
+      if (next === null) break;
+      const action = pickBotAction(s, next, opponentModel);
+      if (action.kind !== 'play_cards') break;
+      const r = applyEvent(s, {
+        kind: 'play_cards',
+        seat: next,
+        cards: action.cards,
+      });
+      if (!r.ok) break;
+      s = r.state;
+    }
+
+    if (s.phase === 'trick_review' && s.currentHand?.currentTrick) {
+      const trick = s.currentHand.currentTrick;
+      if (trick.plays.length === s.config.numPlayers) {
+        const trickPoints = pointsInTrickPlays(trick.plays);
+        const ctx: TrumpContext = {
+          trumpRank: s.currentHand.trumpRank!,
+          trumpSuit: s.currentHand.trumpSuit,
+        };
+        // Use decomposedBeats-aware winner.
+        const winner = winnerWithThrows(
+          trick,
+          ctx,
+          s.config.numDecks,
+        );
+        const myWin = teamOf(s, winner) === myTeam;
+        score += weight * (myWin ? trickPoints : -trickPoints);
+        if (myWin) wins += weight;
+      }
+      const r = applyEvent(s, { kind: 'advance_trick' });
+      if (!r.ok) break;
+      s = r.state;
+    } else {
+      break;
+    }
+
+    weight *= SMART_V3_DISCOUNT;
+  }
+  return { score, wins };
+}
+
+// Resolve trick winner using the same decomposedBeats rules as the
+// engine's resolveTrick. This correctly handles trumps beating throws.
+function winnerWithThrows(
+  trick: ActiveTrick,
+  ctx: TrumpContext,
+  n: number,
+): Seat {
+  const lead = trick.plays[0]!;
+  const leadDecomp = decomposePlay(lead.cards, ctx, n);
+  if (leadDecomp === null) return lead.seat;
+  let winner: Seat = lead.seat;
+  let winningDecomp = leadDecomp;
+  for (let i = 1; i < trick.plays.length; i++) {
+    const p = trick.plays[i]!;
+    const pDecomp = decomposePlay(p.cards, ctx, n);
+    if (pDecomp === null) continue;
+    if (decomposedBeats(pDecomp, winningDecomp, ctx, n)) {
+      winner = p.seat;
+      winningDecomp = pDecomp;
+    }
+  }
+  return winner;
+}
+
+// Sum a hand's expected future winning potential for use in the lead
+// bonus. Roughly: aces / jokers / trump-rank cards are worth the most;
+// guaranteed-suit-winners (via card tracking) count as aces.
+function handLeadValue(
+  hand: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+): number {
+  let v = 0;
+  for (const c of hand) {
+    if (isTrump(c, ctx)) {
+      if (c.kind === 'joker') v += c.rank === 'big' ? 2 : 1.5;
+      else if (c.kind === 'standard') {
+        if (c.rank === ctx.trumpRank && c.suit === ctx.trumpSuit) v += 1.5;
+        else if (c.rank === ctx.trumpRank) v += 1.0;
+        else if (c.rank === 'A') v += 0.6;
+      }
+    } else if (c.kind === 'standard') {
+      if (c.rank === 'A') v += 1.5;
+      else if (tracking.isGuaranteedSuitWinner(c)) v += 1.0;
+    }
+  }
+  return v;
 }
 
 function cardCostV4(
