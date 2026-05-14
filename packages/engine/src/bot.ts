@@ -90,25 +90,19 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'rl-mlp',
 ];
 
-// User-facing subset shown in the lobby dropdown. Keeps the experimental
-// baseline heuristics (lowball / aggressive / point-hoarder) and the
-// not-yet-shipped rl-mlp out of player view; they're still selectable
-// via the protocol and useful for tournaments. `smart-v0` is excluded
-// because it's a duplicate of `smart` (= v1).
+// User-facing subset shown in the lobby dropdown. Only the latest
+// smart-bot generation (v13–v16) plus the random baseline. Earlier
+// versions (smart-v0 … smart-v12) and the experimental heuristics
+// (lowball / aggressive / point-hoarder / rl-mlp) remain in
+// BOT_TYPES so they keep working over the protocol — they're useful
+// for offline tournaments and tests — but they no longer surface in
+// the lobby UI.
 export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
-  'smart',
-  'smart-v2',
-  'smart-v3',
-  'smart-v4',
-  'smart-v5',
-  'smart-v6',
-  'smart-v7',
-  'smart-v8',
-  'smart-v9',
-  'smart-v10',
-  'smart-v11',
-  'smart-v12',
+  'smart-v13',
+  'smart-v14',
+  'smart-v15',
+  'smart-v16',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -148,13 +142,13 @@ export function botTypeLabel(t: BotType): string {
     case 'smart-v12':
       return 'v12: Lagoon';
     case 'smart-v13':
-      return 'v13: Periscope (hidden info)';
+      return 'v13: Mirage';
     case 'smart-v14':
-      return 'v14: Hawkeye (hidden info + public signals)';
+      return 'v14: Nebula';
     case 'smart-v15':
-      return 'v15: Mirage (N=3 determinizations)';
+      return 'v15: Oasis';
     case 'smart-v16':
-      return 'v16: Nebula (N=5 determinizations)';
+      return 'v16: Pier';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
