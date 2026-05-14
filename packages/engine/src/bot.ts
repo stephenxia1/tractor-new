@@ -67,6 +67,7 @@ export type BotType =
   | 'smart-v17'      // smart-v13 with N=10 determinizations averaged
   | 'smart-v18'      // v16 + decomposedBeats-aware winner + trump-throw candidate + hand-value lead bonus
   | 'smart-v19'      // v18 + relative (my-opp) hand-value lead bonus
+  | 'smart-v20'      // v18 with constrained determinization (respects opponent voids from public play)
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -94,6 +95,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v17',
   'smart-v18',
   'smart-v19',
+  'smart-v20',
   'rl-mlp',
 ];
 
@@ -106,10 +108,9 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
 // the lobby UI.
 export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
-  'smart-v13',
-  'smart-v14',
-  'smart-v15',
   'smart-v16',
+  'smart-v18',
+  'smart-v20',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -162,6 +163,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v18: Riptide (throw-trump aware + lead bonus)';
     case 'smart-v19':
       return 'v19: Sirocco (relative lead bonus)';
+    case 'smart-v20':
+      return 'v20: Tempest (void-aware determinization)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -293,6 +296,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v19') {
     return pickSmartV19(state, seat);
+  }
+  if (type === 'smart-v20') {
+    return pickSmartV20(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -3075,6 +3081,154 @@ function maskOpponentHands(
   };
 }
 
+// Variant of maskOpponentHands that respects publicly-known voids:
+// if opponent S has previously played off-suit on a led suit X, they've
+// proven they hold no cards of effective suit X, so the sampler never
+// assigns them a card with effectiveSuit === X. Same compute budget as
+// maskOpponentHands; samples are restricted to the consistent slice of
+// the world that any observer at the table could rule in.
+function maskOpponentHandsConstrained(
+  state: GameState,
+  mySeat: Seat,
+  seed: number,
+): GameState {
+  const hand = state.currentHand;
+  if (hand === null) return state;
+  if (hand.trumpRank === null) return maskOpponentHands(state, mySeat, seed);
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+
+  const voidSuits = new Map<Seat, Set<EffectiveSuit>>();
+  const recordVoid = (s: Seat, suit: EffectiveSuit): void => {
+    let set = voidSuits.get(s);
+    if (set === undefined) {
+      set = new Set();
+      voidSuits.set(s, set);
+    }
+    set.add(suit);
+  };
+  const scan = (
+    trick: { plays: ReadonlyArray<{ seat: Seat; cards: ReadonlyArray<Card> }> },
+  ): void => {
+    if (trick.plays.length === 0) return;
+    const lead = trick.plays[0]!;
+    const ledSuit = effectiveSuit(lead.cards[0]!, ctx);
+    for (let i = 1; i < trick.plays.length; i++) {
+      const p = trick.plays[i]!;
+      const inLed = p.cards.filter(
+        (c) => effectiveSuit(c, ctx) === ledSuit,
+      ).length;
+      if (inLed < p.cards.length) recordVoid(p.seat, ledSuit);
+    }
+  };
+  for (const t of hand.tricks) scan(t);
+  if (hand.currentTrick !== null) scan(hand.currentTrick);
+
+  const myCards = hand.hands[mySeat] ?? [];
+  const playedCards: Card[] = [];
+  for (const t of hand.tricks) {
+    for (const p of t.plays) {
+      for (const c of p.cards) playedCards.push(c);
+    }
+  }
+  if (hand.currentTrick !== null) {
+    for (const p of hand.currentTrick.plays) {
+      for (const c of p.cards) playedCards.push(c);
+    }
+  }
+  const iAmLandlord = hand.landlord === mySeat;
+  const knownKitty = iAmLandlord ? hand.kitty : [];
+
+  const knownSet = new Set<string>();
+  for (const c of myCards) knownSet.add(identityKey(c));
+  for (const c of playedCards) knownSet.add(identityKey(c));
+  for (const c of knownKitty) knownSet.add(identityKey(c));
+
+  const fullDeck = buildDeck(state.config.numDecks);
+  const unknown = fullDeck.filter((c) => !knownSet.has(identityKey(c)));
+
+  const rng = mulberry32(seed);
+  const shuffled = shuffle(unknown, rng);
+
+  type Target =
+    | { readonly kind: 'seat'; readonly seat: Seat; capacity: number }
+    | { readonly kind: 'kitty'; capacity: number };
+  const targets: Target[] = [];
+  for (let s = 0; s < state.config.numPlayers; s++) {
+    if (s === mySeat) continue;
+    const size = (hand.hands[s] ?? []).length;
+    targets.push({ kind: 'seat', seat: s as Seat, capacity: size });
+  }
+  if (!iAmLandlord) {
+    targets.push({ kind: 'kitty', capacity: hand.kitty.length });
+  }
+
+  const accepts = (t: Target, c: Card): boolean => {
+    if (t.kind === 'kitty') return true;
+    const set = voidSuits.get(t.seat);
+    if (set === undefined) return true;
+    return !set.has(effectiveSuit(c, ctx));
+  };
+
+  const placed: Card[][] = targets.map(() => []);
+  const unplaced: Card[] = [];
+  // Greedy: each card goes to the accepting target with the most
+  // remaining capacity. Cards that fit nowhere get retried after.
+  for (const c of shuffled) {
+    let bestIdx = -1;
+    let bestCap = -1;
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i]!;
+      if (t.capacity <= 0) continue;
+      if (!accepts(t, c)) continue;
+      if (t.capacity > bestCap) {
+        bestCap = t.capacity;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) {
+      unplaced.push(c);
+      continue;
+    }
+    placed[bestIdx]!.push(c);
+    targets[bestIdx]!.capacity--;
+  }
+  // Fall back to any open slot for cards that couldn't be placed under
+  // constraints (extremely rare; only if voids over-constrain the sample).
+  for (const c of unplaced) {
+    for (let i = 0; i < targets.length; i++) {
+      if (targets[i]!.capacity > 0) {
+        placed[i]!.push(c);
+        targets[i]!.capacity--;
+        break;
+      }
+    }
+  }
+
+  const newHands: Record<Seat, ReadonlyArray<Card>> = {};
+  newHands[mySeat] = myCards;
+  let newKitty: ReadonlyArray<Card> = hand.kitty;
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i]!;
+    if (t.kind === 'seat') {
+      newHands[t.seat] = placed[i]!;
+    } else {
+      newKitty = placed[i]!;
+    }
+  }
+
+  return {
+    ...state,
+    currentHand: {
+      ...hand,
+      hands: newHands,
+      kitty: newKitty,
+    },
+  };
+}
+
 // =========================================================================
 // Strategy: smart-v14
 // =========================================================================
@@ -4028,6 +4182,118 @@ function scoreCandidateV19(
   }
   const leadBonus = SMART_V19_LEAD_BONUS_WEIGHT * netLeadVal * avgWins;
   return avgPointsScore - penalty + leadBonus;
+}
+
+// =========================================================================
+// Strategy: smart-v20
+// =========================================================================
+//
+// v18 with a stronger determinization: opponent-hand samples respect
+// publicly-known voids. If opponent S has ever followed off-suit on a
+// led suit X, the sampler never assigns them a card with effectiveSuit
+// === X. Compute budget is unchanged (N=5 samples, same depth, same
+// opponent model). Every sample is now a feasible reality given the
+// observable history, instead of a uniform random sample over all
+// hand-shaped allocations (most of which contradict prior plays).
+//
+// Hypothesis: late in the hand — when many voids are known — the
+// unconstrained sampler is wasting samples on impossible worlds, and
+// trump/aces are being timed suboptimally in expectation.
+
+function pickSmartV20(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV20Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV20Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (trick !== null) {
+    const trumpFill = buildTrumpFillCandidate(myCards, trick, ctx);
+    if (trumpFill !== null) consider(trumpFill);
+  }
+
+  if (candidates.length === 0) return v1Action;
+
+  // Constrained determinization is the sole difference from v18.
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V18_NUM_SAMPLES; i++) {
+    determinizations.push(
+      maskOpponentHandsConstrained(state, seat, baseSeed + i * 1009),
+    );
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const handLeadVal = handLeadValue(myCards, ctx, tracking);
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV18(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+      handLeadVal,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
 }
 
 function cardCostV4(
