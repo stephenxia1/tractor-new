@@ -45,6 +45,10 @@ const sessions = new Map<string, string>();
 // Map clientId → disconnect-cleanup timer. Cleared on reconnect.
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const DISCONNECT_GRACE_MS = 60_000;
+// Delay before the server auto-advances a completed trick when every
+// seat is a bot. Gives spectators a beat to read the trick before it
+// clears.
+const ALL_BOT_TRICK_REVIEW_MS = 1200;
 
 function nextSeed(): number {
   return Math.floor(Math.random() * 0x7fffffff);
@@ -245,8 +249,30 @@ function scheduleBotActions(room: Room): void {
     );
   }
   // Trick review only advances when a human clicks (or has auto-advance
-  // toggled on). Bots never advance the trick.
-  if (room.game.phase === 'trick_review') return;
+  // toggled on). When every seat is a bot, spectators have no UI to
+  // click — auto-advance after a short delay so all-bot games keep
+  // playing on their own.
+  if (room.game.phase === 'trick_review') {
+    if (!allSeatsAreBots(room)) return;
+    const key = `${room.code}:trick-advance`;
+    if (pendingBots.has(key)) return;
+    pendingBots.add(key);
+    setTimeout(() => {
+      pendingBots.delete(key);
+      const current = rooms.get(room.code);
+      if (current === undefined) return;
+      if (current.game.phase !== 'trick_review') return;
+      if (!allSeatsAreBots(current)) return;
+      const prevGame = current.game;
+      const r = applyToRoom(current, { kind: 'advance_trick' });
+      if (!r.ok) return;
+      r.room.log = current.log;
+      logEventEffect(r.room, prevGame, r.room.game, { kind: 'advance_trick' });
+      rooms.set(current.code, r.room);
+      broadcastRoom(r.room);
+    }, ALL_BOT_TRICK_REVIEW_MS);
+    return;
+  }
   // While the client-side deal animation is still running, suppress bot
   // actions so they don't declare before all cards have been revealed.
   const now = Date.now();
