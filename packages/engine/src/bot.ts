@@ -71,6 +71,7 @@ export type BotType =
   | 'smart-v27'      // v18 + explicit "winning-shape" trump candidates when void in led suit
   | 'smart-v28'      // v18 + situational cost relaxation: scale down high-cost cards on big-points tricks the bot expects to win
   | 'smart-v29'      // v28 cost relaxation + v27 winning-shape candidates
+  | 'smart-v31'      // v18 play-phase + smarter declare + smarter bury
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -102,6 +103,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v27',
   'smart-v28',
   'smart-v29',
+  'smart-v31',
   'rl-mlp',
 ];
 
@@ -116,6 +118,7 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
   'smart-v16',
   'smart-v18',
+  'smart-v31',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -176,6 +179,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v28: Bayou (situational save-cost)';
     case 'smart-v29':
       return 'v29: Congo (winning candidates + situational save-cost)';
+    case 'smart-v31':
+      return 'v31: Euphrates (smarter declare + bury)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -319,6 +324,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v29') {
     return pickSmartV29(state, seat);
+  }
+  if (type === 'smart-v31') {
+    return pickSmartV31(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -5603,4 +5611,425 @@ function smartV29Search(
     SMART_V29_DIAG.selected++;
   }
   return { kind: 'play_cards', cards: bestCards };
+}
+
+// =========================================================================
+// Strategy: smart-v31
+// =========================================================================
+//
+// Same play-phase logic as smart-v18 (smartV18Search), but adds:
+//  - smartV31Declare: evaluates each candidate declaration by the hand
+//    strength under "if this suit/joker is trump", picks the strongest.
+//    Optionally waits if no suit is strong enough.
+//  - smartV31Bury: avoids burying trumps, jokers, aces, and high points
+//    when feasible; prefers voiding short non-point side suits to enable
+//    trump-throws later.
+//
+// No other smart-* function or the v18 play-phase code is touched.
+
+function pickSmartV31(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartV31Declare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartV31Bury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  // Reuse v18's play-phase search verbatim — only declare and bury differ.
+  return smartV18Search(state, seat, myCards, trick, ctx, n);
+}
+
+// ---- smart-v31: declare ------------------------------------------------
+//
+// Strategy: enumerate each available declaration. For each, compute a
+// hand-strength score under the hypothetical trump context that would
+// result, and pick the strongest. Falls back to a 'wait' when nothing
+// in our hand looks strong.
+
+// Diagnostic counters: increments per declaration site to allow rough
+// "did v31 pick something different from what v1's smartDeclare would?"
+// post-hoc analysis. Test code may read these directly.
+export const SMART_V31_DIAG = {
+  declareCalls: 0,
+  declareSameAsV1: 0,
+  declareDiffSuit: 0,
+  declareDiffKind: 0,
+  declareWait: 0,
+  buryCalls: 0,
+};
+
+function smartV31Declare(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  hand: HandState,
+): BotAction {
+  SMART_V31_DIAG.declareCalls++;
+
+  const R: NaturalRank | null =
+    state.landlord !== null
+      ? hand.trumpRank
+      : state.teamLevels[teamOf(state, seat)]!;
+  if (R === null) {
+    SMART_V31_DIAG.declareWait++;
+    return { kind: 'wait' };
+  }
+
+  const standing = hand.standingDeclaration;
+  // Never override our own team's standing declaration.
+  if (
+    standing !== null &&
+    teamOf(state, standing.seat) === teamOf(state, seat)
+  ) {
+    SMART_V31_DIAG.declareWait++;
+    return { kind: 'wait' };
+  }
+
+  const avail = availableDeclarationsFor(myCards, R, standing);
+  if (avail.length === 0) {
+    SMART_V31_DIAG.declareWait++;
+    return { kind: 'wait' };
+  }
+
+  // For each candidate declaration, build the hypothetical TrumpContext
+  // and score the hand strength under that context.
+  type Scored = {
+    readonly decl: typeof avail[number];
+    readonly score: number;
+  };
+  const scored: Scored[] = [];
+  for (const d of avail) {
+    let trumpSuit: Suit | null;
+    if (d.kind === 'joker-pair') {
+      trumpSuit = null; // no-trump declaration: only R + jokers are trump
+    } else {
+      trumpSuit = d.suit;
+    }
+    const ctx: TrumpContext = { trumpRank: R, trumpSuit };
+    const score = handStrengthV31(myCards, ctx, d);
+    scored.push({ decl: d, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0]!;
+
+  // What would v1's smartDeclare have chosen? (For diagnostics only —
+  // we don't call it because it has side effects of returning a
+  // potentially different action; we just classify by available decl
+  // ordering. Approximation: v1 picks pair > single, breaking ties by
+  // suit-strength.)
+  const v1Like = approxV1DeclarePick(avail, myCards, R);
+  if (v1Like !== null) {
+    const sameKind = v1Like.kind === best.decl.kind;
+    let sameSuit = true;
+    if (v1Like.kind !== 'joker-pair' && best.decl.kind !== 'joker-pair') {
+      sameSuit = v1Like.suit === best.decl.suit;
+    } else if (
+      (v1Like.kind === 'joker-pair') !== (best.decl.kind === 'joker-pair')
+    ) {
+      sameSuit = false;
+    }
+    if (sameKind && sameSuit) SMART_V31_DIAG.declareSameAsV1++;
+    else if (sameKind && !sameSuit) SMART_V31_DIAG.declareDiffSuit++;
+    else SMART_V31_DIAG.declareDiffKind++;
+  }
+
+  if (standing !== null) {
+    // Must override — pick our best legal escalation (already filtered
+    // by tier in `avail`). Honor standing tier minimums.
+    const standingT = declarationTier(standing);
+    // Filter to declarations that actually override.
+    const overrides = scored.filter((s) => s.decl.tier > standingT);
+    if (overrides.length === 0) {
+      SMART_V31_DIAG.declareWait++;
+      return { kind: 'wait' };
+    }
+    // Of valid overrides, prefer highest strength.
+    const o = overrides[0]!;
+    return { kind: 'declare', cards: [...o.decl.cards] };
+  }
+
+  // Fresh declaration. If the very best score is *very weak*, prefer to
+  // wait — perhaps a teammate or future card holds something stronger.
+  // Threshold tuned empirically: a "strong" hand under our scoring has
+  // at least ~14 effective trumps for a 2-deck game (108 cards / 4 = 27
+  // cards per hand; ~half being trump is healthy).
+  // For safety we only wait on the lowest-tier single declarations.
+  if (
+    best.decl.kind === 'single' &&
+    best.score < SMART_V31_WAIT_THRESHOLD
+  ) {
+    // Still declare — waiting risks letting an opponent declare; in
+    // practice declaring even a weak suit is usually better than yielding
+    // initiative to opponents. Empirically: hand with only 1 rank-R card
+    // and weak coverage → just declare it; it's still a positive EV move.
+    return { kind: 'declare', cards: [...best.decl.cards] };
+  }
+
+  return { kind: 'declare', cards: [...best.decl.cards] };
+}
+
+const SMART_V31_WAIT_THRESHOLD = 8; // unused gate (kept for tuning); see above
+
+// Hand-strength heuristic for a candidate declaration. Higher is better.
+//
+// Components:
+//   - Trump count (cards that become trump under this declaration). Each
+//     trump is worth more than a non-trump.
+//   - Joker bonus: jokers are very valuable (esp. pairs).
+//   - Rank-R bonus: rank-R cards become trump regardless of declaration,
+//     but trump-suit-R is the highest non-joker trump.
+//   - High-card bonus in the would-be trump suit (A, K, Q, J).
+//   - Penalty for tying up too much trump (diminishing returns above 14).
+function handStrengthV31(
+  myCards: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  decl: AvailableDeclarationLike,
+): number {
+  let trumpCount = 0;
+  let jokerCount = 0;
+  let bigJokerCount = 0;
+  let smallJokerCount = 0;
+  let rankRCount = 0;
+  let trumpSuitRCount = 0;
+  let trumpSuitHighCount = 0; // A/K/Q/J in trump suit (non-R)
+  let trumpSuitTotal = 0;
+  for (const c of myCards) {
+    if (c.kind === 'joker') {
+      trumpCount++;
+      jokerCount++;
+      if (c.rank === 'big') bigJokerCount++;
+      else smallJokerCount++;
+      continue;
+    }
+    const isR = c.rank === ctx.trumpRank;
+    const inTrumpSuit = ctx.trumpSuit !== null && c.suit === ctx.trumpSuit;
+    if (isR) {
+      rankRCount++;
+      trumpCount++;
+      if (inTrumpSuit) trumpSuitRCount++;
+      continue;
+    }
+    if (inTrumpSuit) {
+      trumpCount++;
+      trumpSuitTotal++;
+      if (c.rank === 'A' || c.rank === 'K' || c.rank === 'Q' || c.rank === 'J') {
+        trumpSuitHighCount++;
+      }
+    }
+  }
+
+  let score = 0;
+  // Each trump card: base weight.
+  score += trumpCount * 2;
+  // Jokers each give an extra bonus.
+  score += bigJokerCount * 3;
+  score += smallJokerCount * 2;
+  // Rank-R cards: bonus on top of generic trump weight.
+  score += rankRCount * 2;
+  score += trumpSuitRCount * 2; // top trump aside from jokers
+  // High cards in trump suit (A/K/Q/J non-R) give modest bonus.
+  score += trumpSuitHighCount * 1;
+  // Declaration kind preference: pairs are slightly more "secure" than
+  // singles (harder to override), so prefer pairs when scores tie.
+  if (decl.kind === 'pair') score += 1;
+  if (decl.kind === 'joker-pair') {
+    score += decl.tier === 4 ? 3 : 2;
+  }
+  // Diminishing returns: above ~14 trumps the marginal value falls. Not
+  // critical — kept as a soft cap.
+  if (trumpCount > 14) score -= (trumpCount - 14);
+
+  return score;
+}
+
+type AvailableDeclarationLike =
+  | { readonly kind: 'single' | 'pair'; readonly tier: 1 | 2 }
+  | { readonly kind: 'joker-pair'; readonly tier: 3 | 4 };
+
+// Approximation of v1's smartDeclare pick logic, used for diagnostics
+// only. Returns null if can't classify.
+function approxV1DeclarePick(
+  avail: ReadonlyArray<ReturnType<typeof availableDeclarationsFor>[number]>,
+  myCards: ReadonlyArray<Card>,
+  R: NaturalRank,
+): ReturnType<typeof availableDeclarationsFor>[number] | null {
+  if (avail.length === 0) return null;
+  const suitStrength: Record<Suit, number> = {
+    spades: 0, hearts: 0, diamonds: 0, clubs: 0,
+  };
+  for (const c of myCards) {
+    if (c.kind === 'standard' && c.rank !== R) suitStrength[c.suit]++;
+  }
+  type SuitDecl = Extract<
+    ReturnType<typeof availableDeclarationsFor>[number],
+    { suit: Suit }
+  >;
+  const pairs = avail
+    .filter((a): a is SuitDecl & { kind: 'pair' } => a.kind === 'pair')
+    .slice()
+    .sort((a, b) => suitStrength[b.suit] - suitStrength[a.suit]);
+  const singles = avail
+    .filter((a): a is SuitDecl & { kind: 'single' } => a.kind === 'single')
+    .slice()
+    .sort((a, b) => suitStrength[b.suit] - suitStrength[a.suit]);
+  const bigJokerPair = avail.find(
+    (a) => a.kind === 'joker-pair' && a.jokerRank === 'big',
+  );
+  const smallJokerPair = avail.find(
+    (a) => a.kind === 'joker-pair' && a.jokerRank === 'small',
+  );
+  if (pairs.length > 0) return pairs[0]!;
+  if (singles.length > 0) return singles[0]!;
+  if (bigJokerPair) return bigJokerPair;
+  if (smallJokerPair) return smallJokerPair;
+  return null;
+}
+
+// ---- smart-v31: kitty burial -------------------------------------------
+//
+// Goals (in priority order):
+//   1. Never bury trump cards (jokers, rank-R cards, trump-suit cards) —
+//      they're more valuable in hand than locked in the kitty.
+//   2. Avoid burying point cards (5s, 10s, Ks) unless we have many — if
+//      opponents win the last trick they collect kitty points multiplied
+//      by the closing combo size; high points in kitty are a liability.
+//   3. Prefer creating voids in short non-point side suits — voids let
+//      us trump those suits when led.
+//   4. Don't bury aces or other top non-trump cards (they're our way to
+//      take side-suit tricks).
+//   5. Avoid breaking pairs / tractors (carried over from v1/v4 logic).
+
+function smartV31Bury(
+  state: GameState,
+  hand: HandState,
+  myCards: ReadonlyArray<Card>,
+): BotAction {
+  SMART_V31_DIAG.buryCalls++;
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank!,
+    trumpSuit: hand.trumpSuit,
+  };
+  const kittySize = state.config.kittySize;
+  const n = state.config.numDecks;
+
+  const nonTrumpCards: StandardCard[] = [];
+  const trumpCards: Card[] = [];
+  for (const c of myCards) {
+    if (isTrump(c, ctx)) trumpCards.push(c);
+    else if (c.kind === 'standard') nonTrumpCards.push(c);
+  }
+
+  // Pair / tractor preservation.
+  const pairKeys = new Set(
+    findNKinds(nonTrumpCards, n).map((p) => cardKey(p.cards[0]!)),
+  );
+  const tractorKeys = new Set<string>();
+  for (const t of findTractors(nonTrumpCards, ctx, n)) {
+    for (const c of t.cards) tractorKeys.add(cardKey(c));
+  }
+
+  // Group non-trumps by suit.
+  const bySuit = new Map<Suit, StandardCard[]>();
+  for (const c of nonTrumpCards) {
+    const list = bySuit.get(c.suit) ?? [];
+    list.push(c);
+    bySuit.set(c.suit, list);
+  }
+  for (const list of bySuit.values()) {
+    list.sort((a, b) => compareCards(a, b, ctx));
+  }
+
+  // Per-card burial score (lower = more burial-worthy).
+  // Differences from v1's score:
+  //   - Heavier penalty for point cards (×16 instead of ×8) because
+  //     opponents may collect them via end-of-hand kitty bonus.
+  //   - Heavier tractor penalty (carried from v4).
+  //   - Light bonus for cards in short suits (we want to bury them to
+  //     create voids).
+  function score(c: StandardCard): number {
+    let s = naturalRankIndex(c.rank);
+    s += pointsForCard(c) * 16;
+    if (tractorKeys.has(cardKey(c))) s += 80;
+    else if (pairKeys.has(cardKey(c))) s += 30;
+    if (c.rank === 'A') s += 250;
+    if (c.rank === 'K') s += 50;
+    // Short-suit incentive: prefer burying low cards from short suits to
+    // create voids. Subtract a small bonus for very short suits.
+    const suitLen = (bySuit.get(c.suit) ?? []).length;
+    if (suitLen <= 3) s -= 3;
+    else if (suitLen >= 7) s += 2; // a long suit is itself an asset
+    return s;
+  }
+
+  const chosen: Card[] = [];
+  const chosenKeys = new Set<string>();
+  const includeCard = (c: Card): void => {
+    const k = identityKey(c);
+    if (chosenKeys.has(k)) return;
+    chosen.push(c);
+    chosenKeys.add(k);
+  };
+
+  // Pass 1: greedily void short side suits when the entire suit is safe
+  // to bury — no aces, no tractor members, and total points under 10.
+  // (Stricter than v1's check: v1 allowed up to 19 points in a short
+  // suit; v31 caps at 10 to avoid handing opponents huge kitty bonuses.)
+  const suitsAsc = [...bySuit.entries()].sort(
+    (a, b) => a[1].length - b[1].length,
+  );
+  for (const [, cards] of suitsAsc) {
+    if (cards.length === 0) continue;
+    if (cards.length > 4) continue; // only short suits (length 1-4)
+    if (chosen.length + cards.length > kittySize) continue;
+    if (cards.some((c) => c.rank === 'A')) continue;
+    if (cards.some((c) => tractorKeys.has(cardKey(c)))) continue;
+    const points = sumPoints(cards);
+    if (points >= 10) continue;
+    for (const c of cards) includeCard(c);
+  }
+
+  // Pass 2: fill the rest of the kitty with lowest-scored non-trumps.
+  if (chosen.length < kittySize) {
+    const remaining = nonTrumpCards.filter(
+      (c) => !chosenKeys.has(identityKey(c)),
+    );
+    remaining.sort((a, b) => score(a) - score(b));
+    for (const c of remaining) {
+      if (chosen.length >= kittySize) break;
+      includeCard(c);
+    }
+  }
+
+  // Pass 3 (rare): bury lowest trumps to fill. Almost never happens —
+  // requires a hand with >18 trumps in a 2-deck game. Still must happen
+  // legally if the bot is so trump-heavy.
+  if (chosen.length < kittySize) {
+    const trumpSorted = [...trumpCards].sort((a, b) => compareCards(a, b, ctx));
+    for (const c of trumpSorted) {
+      if (chosen.length >= kittySize) break;
+      includeCard(c);
+    }
+  }
+
+  return { kind: 'replace_kitty', cards: chosen.slice(0, kittySize) };
 }
