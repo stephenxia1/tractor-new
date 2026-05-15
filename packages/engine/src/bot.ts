@@ -70,6 +70,7 @@ export type BotType =
   | 'smart-v20'      // v18 with constrained determinization (respects opponent voids from public play)
   | 'smart-v27'      // v18 + explicit "winning-shape" trump candidates when void in led suit
   | 'smart-v28'      // v18 + situational cost relaxation: scale down high-cost cards on big-points tricks the bot expects to win
+  | 'smart-v29'      // v28 cost relaxation + v27 winning-shape candidates
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -100,6 +101,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v20',
   'smart-v27',
   'smart-v28',
+  'smart-v29',
   'rl-mlp',
 ];
 
@@ -115,6 +117,7 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v16',
   'smart-v18',
   'smart-v28',
+  'smart-v29',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -173,6 +176,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v27: Amazon (winning-shape candidates)';
     case 'smart-v28':
       return 'v28: Bayou (situational save-cost)';
+    case 'smart-v29':
+      return 'v29: Congo (winning candidates + situational save-cost)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -313,6 +318,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v28') {
     return pickSmartV28(state, seat);
+  }
+  if (type === 'smart-v29') {
+    return pickSmartV29(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -5458,4 +5466,143 @@ function scoreCandidateV28(
   }
   const leadBonus = SMART_V18_LEAD_BONUS_WEIGHT * handLeadVal * avgWins;
   return avgPointsScore - penalty + leadBonus;
+}
+
+// =========================================================================
+// Strategy: smart-v29
+// =========================================================================
+//
+// Compound of v27 + v28: enumerate v27's explicit winning-shape trump
+// candidates (jokers, trump-rank pair, trump-suit pair, trump tractor)
+// when void in led suit, AND apply v28's situational save-cost
+// relaxation in the candidate scoring. v27 alone only tied vs v18
+// because cardCostV9 still rejected those high-cost candidates even
+// when capturing a high-points trick — v28's relaxation should now let
+// them actually win the selection step when the stakes are high.
+
+const SMART_V29_DIAG = {
+  offered: 0,   // turns where buildTrumpWinningCandidatesV27 emitted ≥1 candidate
+  selected: 0,  // turns where the chosen play matched a v27 candidate
+};
+export function getSmartV29Diagnostics(): typeof SMART_V29_DIAG {
+  return { ...SMART_V29_DIAG };
+}
+export function resetSmartV29Diagnostics(): void {
+  SMART_V29_DIAG.offered = 0;
+  SMART_V29_DIAG.selected = 0;
+}
+
+function pickSmartV29(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV29Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV29Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  // Candidate generation: identical to v18 + v27's winning-shape adds.
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (trick !== null) {
+    const trumpFillCandidate = buildTrumpFillCandidate(myCards, trick, ctx);
+    if (trumpFillCandidate !== null) consider(trumpFillCandidate);
+  }
+
+  const v27CandidateKeys = new Set<string>();
+  if (trick !== null) {
+    const winningCandidates = buildTrumpWinningCandidatesV27(
+      myCards,
+      trick,
+      ctx,
+      n,
+    );
+    for (const wc of winningCandidates) {
+      v27CandidateKeys.add(candidateKeyByRank(wc.cards));
+      consider(wc.cards);
+    }
+    if (winningCandidates.length > 0) SMART_V29_DIAG.offered++;
+  }
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V18_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const handLeadVal = handLeadValue(myCards, ctx, tracking);
+  const trickPointsOnTable = currentTrickPointsOnTable(trick);
+
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV28(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+      handLeadVal,
+      trickPointsOnTable,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  if (v27CandidateKeys.has(candidateKeyByRank(bestCards))) {
+    SMART_V29_DIAG.selected++;
+  }
+  return { kind: 'play_cards', cards: bestCards };
 }
