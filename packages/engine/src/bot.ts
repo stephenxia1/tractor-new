@@ -68,6 +68,7 @@ export type BotType =
   | 'smart-v18'      // v16 + decomposedBeats-aware winner + trump-throw candidate + hand-value lead bonus
   | 'smart-v19'      // v18 + relative (my-opp) hand-value lead bonus
   | 'smart-v20'      // v18 with constrained determinization (respects opponent voids from public play)
+  | 'smart-v27'      // v18 + explicit "winning-shape" trump candidates when void in led suit
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -96,6 +97,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v18',
   'smart-v19',
   'smart-v20',
+  'smart-v27',
   'rl-mlp',
 ];
 
@@ -165,6 +167,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v19: Sirocco (relative lead bonus)';
     case 'smart-v20':
       return 'v20: Tempest (void-aware determinization)';
+    case 'smart-v27':
+      return 'v27: Amazon (winning-shape candidates)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -299,6 +303,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v20') {
     return pickSmartV20(state, seat);
+  }
+  if (type === 'smart-v27') {
+    return pickSmartV27(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -4885,4 +4892,338 @@ function scoreCandidateV8(
     penalty += cardCostV4(c, ctx, tracking);
   }
   return pointsScore - penalty;
+}
+
+// =========================================================================
+// Strategy: smart-v27
+// =========================================================================
+//
+// Same scoring/determinization as v18, but the candidate-generation stage
+// is enriched. When the bot is following while void in led suit, v18 only
+// considered a single "lowest trumps + fillers" candidate. v27 also
+// enumerates explicit *winning-shape* candidates so the search has a real
+// chance to pick the play that actually beats the lead:
+//
+//  - Lead is a single (length 1): emit candidates that play a joker
+//    (small joker preferred, plus big-joker variant) and a candidate
+//    that plays the lowest trump-rank single.
+//  - Lead is a pair: emit a candidate playing the lowest available
+//    trump-rank pair OR trump-suit pair, plus low fillers.
+//  - Lead is a tractor of length L: emit a candidate playing the lowest
+//    trump tractor of length L, plus low fillers.
+//
+// These augment the candidate set; scoring/penalty (`scoreCandidateV18`)
+// is unchanged, so the search may still prefer cheaper plays. The aim is
+// to make sure the winning shape is at least *considered*.
+
+const SMART_V27_DIAG = {
+  builderCalls: 0,
+  voidCalls: 0,
+  emittedJokerSingle: 0,
+  emittedTrumpRankSingle: 0,
+  emittedTrumpRankPair: 0,
+  emittedTrumpSuitPair: 0,
+  emittedTrumpTractor: 0,
+  selectedJokerSingle: 0,
+  selectedTrumpRankSingle: 0,
+  selectedTrumpRankPair: 0,
+  selectedTrumpSuitPair: 0,
+  selectedTrumpTractor: 0,
+};
+
+export function getSmartV27Diagnostics(): typeof SMART_V27_DIAG {
+  return { ...SMART_V27_DIAG };
+}
+
+export function resetSmartV27Diagnostics(): void {
+  for (const k of Object.keys(SMART_V27_DIAG) as Array<keyof typeof SMART_V27_DIAG>) {
+    SMART_V27_DIAG[k] = 0;
+  }
+}
+
+type WinningShapeKind =
+  | 'joker-single'
+  | 'trump-rank-single'
+  | 'trump-rank-pair'
+  | 'trump-suit-pair'
+  | 'trump-tractor';
+
+type LabeledCandidate = {
+  readonly cards: ReadonlyArray<Card>;
+  readonly kind: WinningShapeKind;
+};
+
+function pickSmartV27(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV27Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV27Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const kindByKey = new Map<string, WinningShapeKind>();
+  const consider = (cards: ReadonlyArray<Card>, kind?: WinningShapeKind): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+    if (kind !== undefined) kindByKey.set(key, kind);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (trick !== null) {
+    const trumpFill = buildTrumpFillCandidate(myCards, trick, ctx);
+    if (trumpFill !== null) consider(trumpFill);
+
+    const winningCandidates = buildTrumpWinningCandidatesV27(
+      myCards,
+      trick,
+      ctx,
+      n,
+    );
+    for (const lc of winningCandidates) {
+      consider(lc.cards, lc.kind);
+    }
+  }
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V18_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const handLeadVal = handLeadValue(myCards, ctx, tracking);
+  let bestCards = candidates[0]!;
+  let bestKey = candidateKeyByRank(bestCards);
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV18(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+      handLeadVal,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+      bestKey = candidateKeyByRank(cand);
+    }
+  }
+  const selectedKind = kindByKey.get(bestKey);
+  if (selectedKind !== undefined) {
+    switch (selectedKind) {
+      case 'joker-single':
+        SMART_V27_DIAG.selectedJokerSingle++;
+        break;
+      case 'trump-rank-single':
+        SMART_V27_DIAG.selectedTrumpRankSingle++;
+        break;
+      case 'trump-rank-pair':
+        SMART_V27_DIAG.selectedTrumpRankPair++;
+        break;
+      case 'trump-suit-pair':
+        SMART_V27_DIAG.selectedTrumpSuitPair++;
+        break;
+      case 'trump-tractor':
+        SMART_V27_DIAG.selectedTrumpTractor++;
+        break;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+// Build an array of "winning-shape" candidates. Only fires when the bot
+// is void in led suit. Returns [] otherwise. Each candidate is a full
+// play (length === lead length).
+function buildTrumpWinningCandidatesV27(
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick,
+  ctx: TrumpContext,
+  n: number,
+): ReadonlyArray<LabeledCandidate> {
+  SMART_V27_DIAG.builderCalls++;
+  const lead = trick.plays[0]!;
+  const ledSuit = effectiveSuit(lead.cards[0]!, ctx);
+  const leadCount = lead.cards.length;
+
+  const myInLed = myCards.filter((c) => effectiveSuit(c, ctx) === ledSuit);
+  if (myInLed.length > 0) return [];
+  SMART_V27_DIAG.voidCalls++;
+
+  const leadClass = classifyCombo(lead.cards, ctx, n);
+  if (!leadClass.ok) return [];
+
+  const out: LabeledCandidate[] = [];
+
+  // Pick lowest fillers from myCards minus usedCards, preferring
+  // non-trump (ascending) then lowest trumps.
+  const pickFillers = (usedCards: ReadonlyArray<Card>, need: number): Card[] => {
+    if (need <= 0) return [];
+    const usedCounts = new Map<string, number>();
+    for (const u of usedCards) {
+      const k = cardKey(u);
+      usedCounts.set(k, (usedCounts.get(k) ?? 0) + 1);
+    }
+    const remaining: Card[] = [];
+    for (const c of myCards) {
+      const k = cardKey(c);
+      const used = usedCounts.get(k) ?? 0;
+      if (used > 0) {
+        usedCounts.set(k, used - 1);
+      } else {
+        remaining.push(c);
+      }
+    }
+    const nonTrumpAsc = remaining
+      .filter((c) => !isTrump(c, ctx))
+      .sort((a, b) => compareCards(a, b, ctx));
+    const trumpAsc = remaining
+      .filter((c) => isTrump(c, ctx))
+      .sort((a, b) => compareCards(a, b, ctx));
+    const fillers: Card[] = [];
+    for (const c of nonTrumpAsc) {
+      if (fillers.length >= need) break;
+      fillers.push(c);
+    }
+    for (const c of trumpAsc) {
+      if (fillers.length >= need) break;
+      fillers.push(c);
+    }
+    return fillers;
+  };
+
+  if (leadClass.combo.kind === 'single' && leadCount === 1) {
+    const jokers = myCards
+      .filter((c) => c.kind === 'joker')
+      .sort((a, b) => compareCards(a, b, ctx));
+    if (jokers.length > 0) {
+      const small = jokers[0]!;
+      out.push({ cards: [small], kind: 'joker-single' });
+      SMART_V27_DIAG.emittedJokerSingle++;
+      const big = jokers[jokers.length - 1]!;
+      if (cardKey(big) !== cardKey(small)) {
+        out.push({ cards: [big], kind: 'joker-single' });
+        SMART_V27_DIAG.emittedJokerSingle++;
+      }
+    }
+    const trumpRankCards = myCards.filter(
+      (c) => c.kind === 'standard' && c.rank === ctx.trumpRank,
+    );
+    if (trumpRankCards.length > 0) {
+      const trumpSuitRank = trumpRankCards.find(
+        (c) => c.kind === 'standard' && c.suit === ctx.trumpSuit,
+      );
+      const chosen = trumpSuitRank ?? trumpRankCards[0]!;
+      out.push({ cards: [chosen], kind: 'trump-rank-single' });
+      SMART_V27_DIAG.emittedTrumpRankSingle++;
+    }
+  } else if (leadClass.combo.kind === 'nkind' && leadClass.combo.n === 2) {
+    const pairs = findNKinds(myCards, 2);
+    const trumpRankPairs = pairs.filter((p) => {
+      const c0 = p.cards[0]!;
+      return c0.kind === 'standard' && c0.rank === ctx.trumpRank;
+    });
+    if (trumpRankPairs.length > 0) {
+      trumpRankPairs.sort((a, b) =>
+        compareCards(a.cards[0]!, b.cards[0]!, ctx),
+      );
+      const pickedCards = trumpRankPairs[0]!.cards;
+      const fillers = pickFillers(pickedCards, leadCount - pickedCards.length);
+      const cards = [...pickedCards, ...fillers];
+      if (cards.length === leadCount) {
+        out.push({ cards, kind: 'trump-rank-pair' });
+        SMART_V27_DIAG.emittedTrumpRankPair++;
+      }
+    }
+    const trumpSuitPairs = pairs.filter((p) => {
+      const c0 = p.cards[0]!;
+      if (c0.kind !== 'standard') return false;
+      if (c0.rank === ctx.trumpRank) return false;
+      return isTrump(c0, ctx) && c0.suit === ctx.trumpSuit;
+    });
+    if (trumpSuitPairs.length > 0) {
+      trumpSuitPairs.sort((a, b) =>
+        compareCards(a.cards[0]!, b.cards[0]!, ctx),
+      );
+      const pickedCards = trumpSuitPairs[0]!.cards;
+      const fillers = pickFillers(pickedCards, leadCount - pickedCards.length);
+      const cards = [...pickedCards, ...fillers];
+      if (cards.length === leadCount) {
+        out.push({ cards, kind: 'trump-suit-pair' });
+        SMART_V27_DIAG.emittedTrumpSuitPair++;
+      }
+    }
+  } else if (leadClass.combo.kind === 'tractor') {
+    const wantLen = leadClass.combo.length;
+    const wantN = leadClass.combo.n;
+    const tractors = findTractors(myCards, ctx, n, 2);
+    const trumpTractors = tractors.filter((t) => {
+      if (t.length !== wantLen) return false;
+      if (t.n !== wantN) return false;
+      const c0 = t.cards[0]!;
+      return isTrump(c0, ctx);
+    });
+    if (trumpTractors.length > 0) {
+      trumpTractors.sort((a, b) =>
+        compareCards(a.cards[0]!, b.cards[0]!, ctx),
+      );
+      const picked = trumpTractors[0]!.cards;
+      const fillers = pickFillers(picked, leadCount - picked.length);
+      const cards = [...picked, ...fillers];
+      if (cards.length === leadCount) {
+        out.push({ cards, kind: 'trump-tractor' });
+        SMART_V27_DIAG.emittedTrumpTractor++;
+      }
+    }
+  }
+
+  return out;
 }
