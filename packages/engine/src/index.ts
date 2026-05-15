@@ -88,6 +88,8 @@ export { validateFollow, validateFollowThrow, type FollowValidation } from './fo
 
 export {
   decomposeThrow,
+  decomposePlay,
+  decomposedBeats,
   isThrowSafe,
   throwTotalCards,
   type ThrowDecomposition,

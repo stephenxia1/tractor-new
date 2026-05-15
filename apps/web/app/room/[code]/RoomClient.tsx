@@ -4,8 +4,9 @@ import { useRouter } from 'next/navigation';
 import {
   classifyCombo,
   compareCardsForDisplay,
-  comboBeats,
+  decomposePlay,
   decomposeThrow,
+  decomposedBeats,
   isTrump,
   pointsForCard,
   validateFollow,
@@ -18,7 +19,6 @@ import {
   type Seat,
   type TrumpContext,
 } from '@tractor/engine';
-import { DEAL_INTERVAL_MS } from '@tractor/protocol';
 import { cardId } from '../../../lib/cards';
 import { getOrCreateSessionToken, useTractorSocket } from '../../../lib/ws';
 import { CardSvg } from '../../../components/Cards';
@@ -119,50 +119,21 @@ export default function RoomClient({ code }: { code: string }) {
     return null;
   }, [room, state.clientId]);
 
-  // Dealing animation, one card per seat per round. The animation effect
-  // only listens to `handNumber` so a phase change mid-deal doesn't
-  // re-trigger and freeze the interval before it finishes.
-  const [dealtTotal, setDealtTotal] = useState<number>(Infinity);
+  // Card-deal progress is now server-driven: during the 'dealing' phase
+  // the server broadcasts a `reveal_card` event for each card, growing
+  // each seat's `handSizes` count over time. The UI simply renders
+  // whatever the server says is visible, so `dealtTotal` stays at
+  // Infinity and `cardsDealtToSeat` returns `handSizes[seat]` directly.
+  // (Kept as a constant — preserves the prop signature for the cell
+  // renderers below.)
+  const dealtTotal: number = Infinity;
   const lastHandRef = useRef<number | null>(null);
   useEffect(() => {
     const handNumber = ch?.handNumber ?? null;
-    const phase = game?.phase;
-    if (handNumber === null) {
-      lastHandRef.current = null;
-      setDealtTotal(Infinity);
-      return;
+    if (handNumber !== lastHandRef.current) {
+      lastHandRef.current = handNumber;
     }
-    if (lastHandRef.current === handNumber) return;
-    lastHandRef.current = handNumber;
-    if (phase !== 'declare_lockout') {
-      setDealtTotal(Infinity);
-      return;
-    }
-    setDealtTotal(0);
-    const cfg = state.room!.gameState.config;
-    const totalCards = cfg.numDecks * 54 - cfg.kittySize;
-    const interval = setInterval(() => {
-      setDealtTotal((c) => {
-        const next = c + 1;
-        if (next >= totalCards) {
-          clearInterval(interval);
-          return Infinity;
-        }
-        return next;
-      });
-    }, DEAL_INTERVAL_MS);
-    return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ch?.handNumber]);
-
-  // Safety: outside the declare_lockout phase, all dealt cards should be
-  // visible. This guarantees that pickup / play / between-hands never see
-  // a stale finite `dealtTotal` (which would cap visible card counts).
-  useEffect(() => {
-    if (game?.phase !== 'declare_lockout') {
-      setDealtTotal(Infinity);
-    }
-  }, [game?.phase]);
 
   const cardsPerPlayer = useMemo(() => {
     const cfg = room?.gameState.config;
@@ -257,20 +228,16 @@ export default function RoomClient({ code }: { code: string }) {
     const plays = ch.currentTrick.plays;
     if (plays.length === 0) return null;
     const n = game?.config.numDecks ?? 1;
-    const leadClass = classifyCombo(plays[0]!.cards, liveTrumpCtx, n);
-    if (!leadClass.ok) {
-      // Throw lead auto-wins (engine skips this trick's beat check on
-      // followers because none can match a throw structurally).
-      return plays[0]!.seat;
-    }
+    const leadDecomp = decomposePlay(plays[0]!.cards, liveTrumpCtx, n);
+    if (leadDecomp === null) return plays[0]!.seat;
     let bestSeat = plays[0]!.seat;
-    let bestCombo = leadClass.combo;
+    let bestDecomp = leadDecomp;
     for (let i = 1; i < plays.length; i++) {
-      const cls = classifyCombo(plays[i]!.cards, liveTrumpCtx, n);
-      if (!cls.ok) continue;
-      if (comboBeats(cls.combo, bestCombo) > 0) {
+      const d = decomposePlay(plays[i]!.cards, liveTrumpCtx, n);
+      if (d === null) continue;
+      if (decomposedBeats(d, bestDecomp, liveTrumpCtx, n)) {
         bestSeat = plays[i]!.seat;
-        bestCombo = cls.combo;
+        bestDecomp = d;
       }
     }
     return bestSeat;
@@ -376,6 +343,7 @@ export default function RoomClient({ code }: { code: string }) {
               mySeat={mySeat}
               cardsDealtToSeat={cardsDealtToSeat}
               isTrumpCard={isTrumpCard}
+              trumpCtx={liveTrumpCtx}
               winningSeat={winningSeat}
               defaultBotType={defaultBotType}
               setDefaultBotType={setDefaultBotType}
@@ -467,6 +435,7 @@ function PokerTable({
   mySeat,
   cardsDealtToSeat,
   isTrumpCard,
+  trumpCtx,
   winningSeat,
   defaultBotType,
   setDefaultBotType,
@@ -477,6 +446,7 @@ function PokerTable({
   mySeat: Seat | null;
   cardsDealtToSeat: (seat: Seat, real: number) => number;
   isTrumpCard: (c: Card) => boolean;
+  trumpCtx: TrumpContext | null;
   winningSeat: Seat | null;
   defaultBotType: BotType;
   setDefaultBotType: (t: BotType) => void;
@@ -504,10 +474,22 @@ function PokerTable({
             decl !== null &&
             decl.seat === seat.seat &&
             (game.phase === 'declare_lockout' ||
-              game.phase === 'declare_open')
+              game.phase === 'declare_open' ||
+              game.phase === 'dealing')
               ? decl.cards
               : null;
-          const displayedPlay = trickPlay ?? (declCards ? { cards: declCards } : null);
+          const rawPlay = trickPlay ?? (declCards ? { cards: declCards } : null);
+          const displayedPlay =
+            rawPlay === null
+              ? null
+              : trumpCtx === null
+                ? rawPlay
+                : {
+                    ...rawPlay,
+                    cards: [...rawPlay.cards].sort((a, b) =>
+                      compareCardsForDisplay(a, b, trumpCtx),
+                    ),
+                  };
           return (
             <PlayerCell
               key={seat.seat}
@@ -1277,7 +1259,11 @@ function ActionsBar({
     );
   }
 
-  if (phase === 'declare_lockout' || phase === 'declare_open') {
+  if (
+    phase === 'dealing' ||
+    phase === 'declare_lockout' ||
+    phase === 'declare_open'
+  ) {
     const myR = trumpRankForSeat(mySeat, game);
     const declarations: AvailableDeclaration[] =
       myR === null

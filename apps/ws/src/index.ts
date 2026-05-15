@@ -100,6 +100,11 @@ function logEventEffect(
     return;
   }
 
+  if (cause.kind === 'finish_dealing') {
+    appendLog(room, `All cards dealt. Declaration window closing soon.`);
+    return;
+  }
+
   if (cause.kind === 'declare' && ch?.standingDeclaration !== null) {
     const d = ch!.standingDeclaration!;
     const seat = d.seat;
@@ -182,6 +187,87 @@ function logEventEffect(
 // double-schedule when multiple broadcasts arrive in quick succession.
 const pendingBots = new Set<string>();
 
+// Track which rooms have an active deal-driver running so we never
+// double-start the loop.
+const dealDriving = new Set<string>();
+
+// Drives the incremental deal for a room. Fires `reveal_card` events
+// round-robin across seats at `DEAL_INTERVAL_MS` intervals, then
+// `finish_dealing`, then schedules `release_lockout`
+// `POST_DEAL_LOCKOUT_MS` later. Each reveal broadcasts state so
+// clients animate the new card and bots get a chance to declare
+// based on their updated revealed slice.
+function driveIncrementalDeal(roomCode: string): void {
+  if (dealDriving.has(roomCode)) return;
+  const initial = rooms.get(roomCode);
+  if (initial === undefined) return;
+  if (initial.game.phase !== 'dealing') return;
+  dealDriving.add(roomCode);
+
+  const totalCards =
+    initial.game.config.numDecks * 54 - initial.game.config.kittySize;
+  let dealt = 0;
+
+  const tick = (): void => {
+    const current = rooms.get(roomCode);
+    if (current === undefined) {
+      dealDriving.delete(roomCode);
+      return;
+    }
+    if (current.game.phase !== 'dealing') {
+      dealDriving.delete(roomCode);
+      return;
+    }
+    if (dealt >= totalCards) {
+      // Finish dealing → declare_lockout.
+      const prevGame = current.game;
+      const r = applyToRoom(current, { kind: 'finish_dealing' });
+      if (!r.ok) {
+        console.error('finish_dealing failed:', r.error);
+        dealDriving.delete(roomCode);
+        return;
+      }
+      logEventEffect(r.room, prevGame, r.room.game, {
+        kind: 'finish_dealing',
+      });
+      rooms.set(roomCode, r.room);
+      broadcastRoom(r.room);
+      // After a brief lockout grace, release.
+      setTimeout(() => {
+        dealDriving.delete(roomCode);
+        const cur2 = rooms.get(roomCode);
+        if (cur2 === undefined) return;
+        if (cur2.game.phase !== 'declare_lockout') return;
+        const prevGame2 = cur2.game;
+        const r2 = applyToRoom(cur2, {
+          kind: 'release_lockout',
+          seed: nextSeed(),
+        });
+        if (!r2.ok) return;
+        logEventEffect(r2.room, prevGame2, r2.room.game, {
+          kind: 'release_lockout',
+        });
+        rooms.set(roomCode, r2.room);
+        broadcastRoom(r2.room);
+      }, POST_DEAL_LOCKOUT_MS);
+      return;
+    }
+    const seat = dealt % current.game.config.numPlayers;
+    dealt++;
+    const r = applyToRoom(current, { kind: 'reveal_card', seat });
+    if (!r.ok) {
+      console.error('reveal_card failed:', r.error);
+      dealDriving.delete(roomCode);
+      return;
+    }
+    rooms.set(roomCode, r.room);
+    broadcastRoom(r.room);
+    setTimeout(tick, DEAL_INTERVAL_MS);
+  };
+
+  setTimeout(tick, DEAL_INTERVAL_MS);
+}
+
 function allSeatsAreBots(room: Room): boolean {
   for (let s = 0; s < room.game.config.numPlayers; s++) {
     const occ = room.seating[s];
@@ -210,29 +296,12 @@ function scheduleBotActions(room: Room): void {
         const r = applyToRoom(current, { kind: 'start_hand', seed });
         if (!r.ok) return;
         r.room.log = current.log;
-        const totalCards =
-          r.room.game.config.numDecks * 54 - r.room.game.config.kittySize;
-        r.room.dealingEndsAt = Date.now() + totalCards * DEAL_INTERVAL_MS;
         logEventEffect(r.room, prevGame, r.room.game, { kind: 'start_hand' });
         rooms.set(current.code, r.room);
         broadcastRoom(r.room);
-        const lockoutMs = totalCards * DEAL_INTERVAL_MS + POST_DEAL_LOCKOUT_MS;
-        setTimeout(() => {
-          const cur2 = rooms.get(room.code);
-          if (cur2 === undefined) return;
-          if (cur2.game.phase !== 'declare_lockout') return;
-          const prevGame2 = cur2.game;
-          const r2 = applyToRoom(cur2, {
-            kind: 'release_lockout',
-            seed: nextSeed(),
-          });
-          if (!r2.ok) return;
-          logEventEffect(r2.room, prevGame2, r2.room.game, {
-            kind: 'release_lockout',
-          });
-          rooms.set(cur2.code, r2.room);
-          broadcastRoom(r2.room);
-        }, lockoutMs);
+        // Drive the incremental deal: round-robin reveal_card events
+        // at DEAL_INTERVAL_MS, then finish_dealing, then release_lockout.
+        driveIncrementalDeal(current.code);
       }, 2000);
     }
     return;
@@ -273,21 +342,10 @@ function scheduleBotActions(room: Room): void {
     }, ALL_BOT_TRICK_REVIEW_MS);
     return;
   }
-  // While the client-side deal animation is still running, suppress bot
-  // actions so they don't declare before all cards have been revealed.
-  const now = Date.now();
-  const dealingEndsAt = room.dealingEndsAt ?? 0;
-  if (now < dealingEndsAt) {
-    const key = `${room.code}:deal-wait`;
-    if (pendingBots.has(key)) return;
-    pendingBots.add(key);
-    setTimeout(() => {
-      pendingBots.delete(key);
-      const current = rooms.get(room.code);
-      if (current !== undefined) scheduleBotActions(current);
-    }, dealingEndsAt - now + 50);
-    return;
-  }
+  // During the 'dealing' phase, bots act on their revealed-prefix
+  // hand — strong shapes declare immediately, singles wait — and the
+  // deal-driver loop emits `reveal_card` events on a timer. No
+  // suppression needed.
   const botSeats = findBotSeats(room);
   for (const s of botSeats) {
     const key = `${room.code}:${s}`;
@@ -525,29 +583,11 @@ function handleClientMessage(clientId: string, msg: ClientMessage): void {
       }
       // Carry log forward to the new room object.
       r.room.log = room.log;
-      // Bots must wait until the client-side deal animation finishes
-      // before declaring or otherwise acting.
-      const totalCards =
-        r.room.game.config.numDecks * 54 - r.room.game.config.kittySize;
-      r.room.dealingEndsAt = Date.now() + totalCards * DEAL_INTERVAL_MS;
       logEventEffect(r.room, prevGame, r.room.game, { kind: 'start_hand' });
       rooms.set(room.code, r.room);
       broadcastRoom(r.room);
-      const lockoutMs = totalCards * DEAL_INTERVAL_MS + POST_DEAL_LOCKOUT_MS;
-      setTimeout(() => {
-        const current = rooms.get(room.code);
-        if (current === undefined) return;
-        if (current.game.phase !== 'declare_lockout') return;
-        const prevGame2 = current.game;
-        const r2 = applyToRoom(current, {
-          kind: 'release_lockout',
-          seed: nextSeed(),
-        });
-        if (!r2.ok) return;
-        logEventEffect(r2.room, prevGame2, r2.room.game, { kind: 'release_lockout' });
-        rooms.set(current.code, r2.room);
-        broadcastRoom(r2.room);
-      }, lockoutMs);
+      // Drive incremental deal → finish_dealing → release_lockout.
+      driveIncrementalDeal(room.code);
       return;
     }
     case 'declare': {
@@ -622,7 +662,11 @@ function handleClientMessage(clientId: string, msg: ClientMessage): void {
     case 'reset_game': {
       const room = mustRoom(client);
       if (room === null) return;
-      const fresh = { ...room, game: createGame(defaultV1Config()), log: room.log };
+      const fresh = {
+        ...room,
+        game: createGame({ ...defaultV1Config(), incrementalDeal: true }),
+        log: room.log,
+      };
       appendLog(fresh, '🔄 Game reset — starting fresh.');
       rooms.set(room.code, fresh);
       broadcastRoom(fresh);

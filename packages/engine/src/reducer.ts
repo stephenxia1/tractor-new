@@ -65,6 +65,10 @@ export function applyEvent(state: GameState, event: GameEvent): ApplyResult {
   switch (event.kind) {
     case 'start_hand':
       return startHand(state, event);
+    case 'reveal_card':
+      return revealCard(state, event);
+    case 'finish_dealing':
+      return finishDealing(state);
     case 'declare':
       return declare(state, event);
     case 'release_lockout':
@@ -110,6 +114,12 @@ function startHand(
   const trumpRank =
     state.landlord !== null ? state.teamLevels[teamOf(state, state.landlord)]! : null;
 
+  const incrementalDeal = config.incrementalDeal === true;
+  const cardsDealtBySeat: Record<Seat, number> = {};
+  for (let s = 0; s < config.numPlayers; s++) {
+    cardsDealtBySeat[s] = incrementalDeal ? 0 : (hands[s] ?? []).length;
+  }
+
   const handState: HandState = {
     handNumber: state.handsCompleted + 1,
     trumpRank,
@@ -117,6 +127,7 @@ function startHand(
     trumpFinalized: false,
     landlord: state.landlord,
     hands,
+    cardsDealtBySeat,
     kitty,
     declarationLog: [],
     standingDeclaration: null,
@@ -127,8 +138,54 @@ function startHand(
 
   return ok({
     ...state,
-    phase: 'declare_lockout',
+    phase: incrementalDeal ? 'dealing' : 'declare_lockout',
     currentHand: handState,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// reveal_card
+// ---------------------------------------------------------------------------
+function revealCard(
+  state: GameState,
+  event: Extract<GameEvent, { kind: 'reveal_card' }>,
+): ApplyResult {
+  if (state.phase !== 'dealing') {
+    return err(state, `cannot reveal_card from phase ${state.phase}`);
+  }
+  const hand = state.currentHand;
+  if (hand === null) return err(state, 'no current hand');
+  const seatHand = hand.hands[event.seat];
+  if (seatHand === undefined) return err(state, `unknown seat: ${event.seat}`);
+  const current = hand.cardsDealtBySeat[event.seat] ?? 0;
+  if (current >= seatHand.length) {
+    return err(state, `seat ${event.seat} already fully dealt`);
+  }
+  const newCounts: Record<Seat, number> = { ...hand.cardsDealtBySeat };
+  newCounts[event.seat] = current + 1;
+  return ok({
+    ...state,
+    currentHand: { ...hand, cardsDealtBySeat: newCounts },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// finish_dealing
+// ---------------------------------------------------------------------------
+function finishDealing(state: GameState): ApplyResult {
+  if (state.phase !== 'dealing') {
+    return err(state, `cannot finish_dealing from phase ${state.phase}`);
+  }
+  const hand = state.currentHand;
+  if (hand === null) return err(state, 'no current hand');
+  const fullCounts: Record<Seat, number> = {};
+  for (let s = 0; s < state.config.numPlayers; s++) {
+    fullCounts[s] = (hand.hands[s] ?? []).length;
+  }
+  return ok({
+    ...state,
+    phase: 'declare_lockout',
+    currentHand: { ...hand, cardsDealtBySeat: fullCounts },
   });
 }
 
@@ -139,7 +196,11 @@ function declare(
   state: GameState,
   event: Extract<GameEvent, { kind: 'declare' }>,
 ): ApplyResult {
-  if (state.phase !== 'declare_lockout' && state.phase !== 'declare_open') {
+  if (
+    state.phase !== 'declare_lockout' &&
+    state.phase !== 'declare_open' &&
+    state.phase !== 'dealing'
+  ) {
     return err(state, `cannot declare in phase ${state.phase}`);
   }
   const hand = state.currentHand;
@@ -148,7 +209,14 @@ function declare(
   const seatHand = hand.hands[event.seat];
   if (seatHand === undefined) return err(state, `unknown seat: ${event.seat}`);
 
-  if (!containsAll(seatHand, event.cards)) {
+  // In the 'dealing' phase, only the revealed prefix of the seat's
+  // hand can be used for declarations. Restrict containsAll to that
+  // slice so a player can't declare cards they haven't been dealt yet.
+  const visibleHand =
+    state.phase === 'dealing'
+      ? seatHand.slice(0, hand.cardsDealtBySeat[event.seat] ?? 0)
+      : seatHand;
+  if (!containsAll(visibleHand, event.cards)) {
     return err(state, 'declared cards not in declarer hand');
   }
 

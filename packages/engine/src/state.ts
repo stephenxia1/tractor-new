@@ -18,6 +18,16 @@ export type GameConfig = {
   // may change per-hand as friend cards are played.
   readonly seatToTeam: Readonly<Record<Seat, TeamId>>;
   readonly startingLevel: NaturalRank;
+  // When true, `start_hand` produces phase 'dealing' with all
+  // `cardsDealtBySeat` counts at 0; the consumer drives `reveal_card`
+  // events (one per card per seat) and finally `finish_dealing` to
+  // transition into `declare_lockout`. Declarations are accepted
+  // during 'dealing' as long as the declared cards fall within the
+  // declarer's revealed slice.
+  // When false (default), `start_hand` goes directly to
+  // `declare_lockout` with all cards revealed — matching legacy
+  // behavior for tests and benchmarks.
+  readonly incrementalDeal?: boolean;
 };
 
 // Standard v1 config: 4 players, 2 decks, 8 kitty, fixed N+S vs E+W partnership.
@@ -86,6 +96,10 @@ export type CompletedTrick = {
 export type GamePhase =
   // No active hand. Initial state and the gap between hands.
   | 'between_hands'
+  // Cards are being dealt incrementally (only when `config.incrementalDeal`).
+  // Declarations are accepted; each declarer can only use cards in their
+  // revealed slice (tracked by `cardsDealtBySeat`).
+  | 'dealing'
   // Declarations open; landlord cannot pick up kitty yet (rules.md §5.3 lockout).
   | 'declare_lockout'
   // Declarations open; landlord may pick up the kitty at any time.
@@ -115,6 +129,12 @@ export type HandState = {
   // declaration) when it was unset at hand start.
   readonly landlord: Seat | null;
   readonly hands: Readonly<Record<Seat, ReadonlyArray<Card>>>;
+  // For each seat, how many cards from `hands[seat]` are currently
+  // visible to that seat (and revealed publicly as having-been-dealt).
+  // Equal to `hands[seat].length` once dealing finishes. Used to
+  // restrict declarations during the 'dealing' phase to the
+  // revealed prefix only.
+  readonly cardsDealtBySeat: Readonly<Record<Seat, number>>;
   readonly kitty: ReadonlyArray<Card>;
   readonly declarationLog: ReadonlyArray<Declaration>;
   readonly standingDeclaration: Declaration | null;

@@ -45,7 +45,7 @@ export type Room = {
 };
 
 export function newRoom(code: string): Room {
-  const game = createGame(defaultV1Config());
+  const game = createGame({ ...defaultV1Config(), incrementalDeal: true });
   const seating: Record<Seat, SeatOccupant> = {};
   for (let s = 0; s < game.config.numPlayers; s++) seating[s] = null;
   return { code, game, seating, log: [] };
@@ -103,9 +103,16 @@ export function redactGameState(game: GameState): GameStateView {
     return { ...game, currentHand: null };
   }
   const ch = game.currentHand;
+  // During the 'dealing' phase, opponents' hand sizes grow as cards are
+  // revealed. Everywhere else, `cardsDealtBySeat` equals `hands[s].length`
+  // and the two are interchangeable.
+  const isDealing = game.phase === 'dealing';
   const handSizes: Record<Seat, number> = {};
   for (const [seatStr, cards] of Object.entries(ch.hands)) {
-    handSizes[Number(seatStr)] = cards.length;
+    const seat = Number(seatStr);
+    handSizes[seat] = isDealing
+      ? (ch.cardsDealtBySeat[seat] ?? 0)
+      : cards.length;
   }
   const view: HandStateView = {
     handNumber: ch.handNumber,
@@ -137,7 +144,13 @@ export function privateStateFor(
     return { seat: client.seat, cards: [] };
   }
   const ch = room.game.currentHand;
-  const cards = ch.hands[client.seat] ?? [];
+  // During the 'dealing' phase, only show the revealed prefix of the
+  // seat's hand. Past dealing, the full hand is the seat's own cards.
+  const isDealing = room.game.phase === 'dealing';
+  const fullCards = ch.hands[client.seat] ?? [];
+  const cards = isDealing
+    ? fullCards.slice(0, ch.cardsDealtBySeat[client.seat] ?? 0)
+    : fullCards;
   const out: PrivateState = { seat: client.seat, cards: [...cards] };
   // Show the buried kitty to the landlord once they've committed the
   // burial — i.e., past kitty_replace, while the hand is still active.

@@ -252,6 +252,16 @@ export function pickBotAction(
   seat: Seat,
   type: BotType = 'lowball',
 ): BotAction {
+  // 'dealing' is a new phase used only when `config.incrementalDeal` is
+  // on (real games via the WS server). Smart bots make a strategic
+  // decision about whether to declare now, given only the cards
+  // revealed to them so far. Non-smart bots wait until dealing is done
+  // — they have no concept of partial-hand strategy.
+  if (state.phase === 'dealing') {
+    const isSmart = type === 'smart' || type.startsWith('smart-v');
+    if (!isSmart) return { kind: 'wait' };
+    return pickDealingPhaseDeclare(state, seat);
+  }
   if (type === 'smart' || type === 'smart-v0') {
     // smart-v0 is intentionally identical to smart — used as a smoke
     // test for the bot-deployment pipeline (engine → web/UI dropdown
@@ -649,6 +659,75 @@ function pickSmart(state: GameState, seat: Seat): BotAction {
 }
 
 // ---- smart: declare -----------------------------------------------------
+
+// Dealing-phase declare logic for any smart bot. Decides whether to
+// declare RIGHT NOW given only the revealed prefix of the bot's own
+// hand. The bot does NOT see un-dealt cards.
+//
+// Timing strategy:
+//   - Strong shapes (joker pair, suit pair of rank-R) get declared
+//     immediately when revealed. Pairs can't be improved upon by waiting
+//     and they prevent opponents from declaring a weaker suit. Joker
+//     pairs (no-trump) are top tier — can never be overridden.
+//   - Single rank-R: wait until at least half the bot's hand is dealt.
+//     With <50% visibility you might still uncover a pair, or have a
+//     better suit to declare in — committing too early locks in your
+//     weakest declaration in a suit that may not be your strongest.
+//     If an opponent has already declared, however, jump in immediately
+//     and pick the best single (smartDeclare may upgrade them).
+function pickDealingPhaseDeclare(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+
+  const fullHand = hand.hands[seat] ?? [];
+  const revealedCount = hand.cardsDealtBySeat[seat] ?? 0;
+  if (revealedCount === 0) return { kind: 'wait' };
+  const visibleHand = fullHand.slice(0, revealedCount);
+
+  const declarerLevel = state.teamLevels[teamOf(state, seat)]!;
+  const R: NaturalRank | null =
+    state.landlord !== null ? hand.trumpRank : declarerLevel;
+  if (R === null) return { kind: 'wait' };
+
+  const standing = hand.standingDeclaration;
+  // Never override our own team's standing declaration.
+  if (
+    standing !== null &&
+    teamOf(state, standing.seat) === teamOf(state, seat)
+  ) {
+    return { kind: 'wait' };
+  }
+
+  const avail = availableDeclarationsFor(visibleHand, R, standing);
+  if (avail.length === 0) return { kind: 'wait' };
+
+  // Strong shapes go immediately.
+  const bigJokerPair = avail.find(
+    (a) => a.kind === 'joker-pair' && a.jokerRank === 'big',
+  );
+  if (bigJokerPair !== undefined) {
+    return { kind: 'declare', cards: [...bigJokerPair.cards] };
+  }
+  const smallJokerPair = avail.find(
+    (a) => a.kind === 'joker-pair' && a.jokerRank === 'small',
+  );
+  if (smallJokerPair !== undefined) {
+    return { kind: 'declare', cards: [...smallJokerPair.cards] };
+  }
+  const pair = avail.find((a) => a.kind === 'pair');
+  if (pair !== undefined) {
+    return { kind: 'declare', cards: [...pair.cards] };
+  }
+
+  // Only singles available. Hold off unless either half the hand has
+  // been dealt OR someone else has already declared (in which case
+  // the situation is forced — claim now or get locked out).
+  const halfDealt = revealedCount * 2 >= fullHand.length;
+  if (!halfDealt && standing === null) {
+    return { kind: 'wait' };
+  }
+  return smartDeclare(state, seat, visibleHand, hand);
+}
 
 function smartDeclare(
   state: GameState,
