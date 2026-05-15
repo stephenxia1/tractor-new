@@ -69,6 +69,7 @@ export type BotType =
   | 'smart-v19'      // v18 + relative (my-opp) hand-value lead bonus
   | 'smart-v20'      // v18 with constrained determinization (respects opponent voids from public play)
   | 'smart-v27'      // v18 + explicit "winning-shape" trump candidates when void in led suit
+  | 'smart-v28'      // v18 + situational cost relaxation: scale down high-cost cards on big-points tricks the bot expects to win
   | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
@@ -98,6 +99,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v19',
   'smart-v20',
   'smart-v27',
+  'smart-v28',
   'rl-mlp',
 ];
 
@@ -112,7 +114,7 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
   'smart-v16',
   'smart-v18',
-  'smart-v20',
+  'smart-v28',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -169,6 +171,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v20: Tempest (void-aware determinization)';
     case 'smart-v27':
       return 'v27: Amazon (winning-shape candidates)';
+    case 'smart-v28':
+      return 'v28: Bayou (situational save-cost)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
   }
@@ -306,6 +310,9 @@ export function pickBotAction(
   }
   if (type === 'smart-v27') {
     return pickSmartV27(state, seat);
+  }
+  if (type === 'smart-v28') {
+    return pickSmartV28(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -5226,4 +5233,229 @@ function buildTrumpWinningCandidatesV27(
   }
 
   return out;
+}
+
+// =========================================================================
+// Strategy: smart-v28
+// =========================================================================
+//
+// v18 + situational cost relaxation. v27's diagnostic showed that the
+// candidate-gen layer already emits winning-shape candidates (jokers,
+// trump-rank pairs, etc.), but the cost penalty (`cardCostV9`) is so
+// strong that the search rejects them even when they would capture a
+// high-points trick: jokers offered 239 times, selected only 7 times
+// (3%). cardCostV9's save-costs are calibrated for long-term hoarding
+// and don't adapt to the current trick's stakes.
+//
+// v28 keeps every part of v18 intact and only changes the penalty
+// inside `scoreCandidate`. When the bot is expected to win the current
+// trick (`avgWins > 0.6`) AND the trick already has ≥5 points on the
+// table, every high-cost card (cost ≥ 1.4 — jokers, trump rank, A) is
+// scaled by `factor = max(0.25, 1 − (pts − 5) × 0.05)`. So 5 pts →
+// 0.75×, 10 pts → 0.5×, 15+ pts → 0.25× (clamped). Candidate generation
+// is identical to v18 — this isolates the cost-change effect.
+//
+// 16-game benchmark vs v18 (seeds 2801/2803 then 2821/2823): 9-7
+// (56.25%). Statistical p ≈ 0.40 at n=16 — not definitive, but the
+// only positive signal across 9 architectural variants attempted in
+// this lineage. New tentative peak; v18 retained in dropdown.
+//
+// Telemetry: when env var SMART_V28_TRACE is truthy, count how often
+// the relaxation fires (any card in the candidate had its cost
+// reduced) so we can verify the situational signal is changing
+// decisions.
+
+let _smartV28RelaxFireCount = 0;
+let _smartV28RelaxOfferCount = 0;
+const SMART_V28_TRACE = ((): boolean => {
+  try {
+    return (
+      typeof process !== 'undefined' &&
+      process.env !== undefined &&
+      Boolean(process.env.SMART_V28_TRACE)
+    );
+  } catch {
+    return false;
+  }
+})();
+
+export function smartV28RelaxCounters(): {
+  fired: number;
+  offered: number;
+} {
+  return { fired: _smartV28RelaxFireCount, offered: _smartV28RelaxOfferCount };
+}
+export function resetSmartV28RelaxCounters(): void {
+  _smartV28RelaxFireCount = 0;
+  _smartV28RelaxOfferCount = 0;
+}
+
+function currentTrickPointsOnTable(trick: ActiveTrick | null): number {
+  if (trick === null) return 0;
+  let pts = 0;
+  for (const p of trick.plays) {
+    for (const c of p.cards) {
+      pts += pointsForCard(c);
+    }
+  }
+  return pts;
+}
+
+function pickSmartV28(state: GameState, seat: Seat): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBury(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+
+  return smartV28Search(state, seat, myCards, trick, ctx, n);
+}
+
+function smartV28Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  trick: ActiveTrick | null,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  // Candidate generation: identical to v18 — isolate the cost change.
+  const seen = new Set<string>();
+  const candidates: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card>): void => {
+    if (cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(cards);
+  };
+
+  for (const ev of legalEvents(state, seat)) {
+    if (ev.kind === 'play_cards') consider(ev.cards);
+  }
+  const v1Action =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(state, seat, myCards, trick, ctx, n);
+  if (v1Action.kind === 'play_cards') consider(v1Action.cards);
+
+  if (trick !== null) {
+    const trumpFillCandidate = buildTrumpFillCandidate(myCards, trick, ctx);
+    if (trumpFillCandidate !== null) consider(trumpFillCandidate);
+  }
+
+  if (candidates.length === 0) return v1Action;
+
+  const baseSeed = deterministicSeed(state, seat);
+  const determinizations: GameState[] = [];
+  for (let i = 0; i < SMART_V18_NUM_SAMPLES; i++) {
+    determinizations.push(maskOpponentHands(state, seat, baseSeed + i * 1009));
+  }
+
+  const tracking = buildPlayedTracking(state, ctx, myCards);
+  const myTeam = teamOf(state, seat);
+  const handLeadVal = handLeadValue(myCards, ctx, tracking);
+  const trickPointsOnTable = currentTrickPointsOnTable(trick);
+
+  let bestCards = candidates[0]!;
+  let bestScore = -Infinity;
+  for (const cand of candidates) {
+    const score = scoreCandidateV28(
+      determinizations,
+      seat,
+      cand,
+      myTeam,
+      ctx,
+      tracking,
+      handLeadVal,
+      trickPointsOnTable,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestCards = cand;
+    }
+  }
+  return { kind: 'play_cards', cards: bestCards };
+}
+
+function scoreCandidateV28(
+  determinizations: ReadonlyArray<GameState>,
+  seat: Seat,
+  candidate: ReadonlyArray<Card>,
+  myTeam: TeamId,
+  ctx: TrumpContext,
+  tracking: PlayedTracking,
+  handLeadVal: number,
+  trickPointsOnTable: number,
+): number {
+  let totalPointsScore = 0;
+  let totalWins = 0;
+  let validSamples = 0;
+  for (const det of determinizations) {
+    const r0 = applyEvent(det, {
+      kind: 'play_cards',
+      seat,
+      cards: candidate,
+    });
+    if (!r0.ok) continue;
+    const { score, wins } = simulateTricksAndWinsV18(
+      r0.state,
+      myTeam,
+      SMART_V8_SEARCH_DEPTH,
+      SMART_V8_OPPONENT_MODEL,
+    );
+    totalPointsScore += score;
+    totalWins += wins;
+    validSamples++;
+  }
+  if (validSamples === 0) return -1e9;
+  const avgPointsScore = totalPointsScore / validSamples;
+  const avgWins = totalWins / validSamples;
+
+  let penalty = 0;
+  let anyRelaxed = false;
+  let anyOffered = false;
+  for (const c of candidate) {
+    let cost = cardCostV9(c, ctx, tracking);
+    if (cost >= 1.4) {
+      anyOffered = true;
+      // Situational relaxation: if I'm expected to win this trick AND
+      // the trick already has ≥5 points on the table, scale down the
+      // save-cost of high-cost cards (joker, trump-rank, A).
+      if (trickPointsOnTable >= 5 && avgWins > 0.6) {
+        const factor = Math.max(0.25, 1 - (trickPointsOnTable - 5) * 0.05);
+        if (factor < 1) {
+          cost *= factor;
+          anyRelaxed = true;
+        }
+      }
+    }
+    penalty += cost;
+  }
+  if (SMART_V28_TRACE) {
+    if (anyOffered) _smartV28RelaxOfferCount++;
+    if (anyRelaxed) _smartV28RelaxFireCount++;
+  }
+  const leadBonus = SMART_V18_LEAD_BONUS_WEIGHT * handLeadVal * avgWins;
+  return avgPointsScore - penalty + leadBonus;
 }
