@@ -116,8 +116,6 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
   'smart-v16',
   'smart-v18',
-  'smart-v28',
-  'smart-v29',
 ];
 
 export function botTypeLabel(t: BotType): string {
