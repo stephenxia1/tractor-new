@@ -359,6 +359,24 @@ Each hand cycles through these phases (the engine should explicitly model each):
 
 Throws within `PLAY` introduce a substate: `THROW_PROPOSED` → `THROW_CHECK` → either `THROW_FORCED_LEAD` (failed) or `THROW_RESOLVED` (succeeded, proceeds as compound lead).
 
+### 10.1 Implementation mapping (engine phases)
+
+The engine in `packages/engine/src/state.ts` collapses or renames a few of the conceptual phases above:
+
+| Conceptual phase (this doc) | Engine phase                                                         |
+| --------------------------- | -------------------------------------------------------------------- |
+| `SETUP`                     | `'between_hands'` (and the entry into `'dealing'` / `'declare_lockout'` from `start_hand`) |
+| `DEAL`                      | `'dealing'` (only when `GameConfig.incrementalDeal === true`)        |
+| `DECLARE_LOCKOUT`           | `'declare_lockout'`                                                  |
+| `DECLARE_OPEN`              | `'declare_open'`                                                     |
+| `KITTY_FLIP`                | inline within the `release_lockout` reducer (no separate phase)      |
+| `KITTY_PICKUP`              | inline within `'declare_open'` (handled by the `pick_up_kitty` event) |
+| `KITTY_REPLACE`             | `'kitty_replace'`                                                    |
+| `PLAY` + per-trick review   | `'play'` and `'trick_review'`                                        |
+| `SCORE` + `LEVEL_UP`        | inline within `advance_trick` at hand end; terminal state `'game_over'` |
+
+The `'dealing'` phase, paired with `reveal_card` events that advance each seat's `cardsDealtBySeat` counter and a final `finish_dealing` event, is what implements the "declarations may occur asynchronously during DEAL" rule from §5.3. When `incrementalDeal === false` (the default for unit tests and offline benchmarks), `start_hand` skips `'dealing'` and goes straight to `'declare_lockout'` with all cards revealed — semantically equivalent for the test suite, just faster to drive.
+
 ---
 
 ## 11. Engine-Visible Edge Cases
