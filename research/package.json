@@ -1,0 +1,14 @@
+{
+  "name": "@tractor/research",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Standalone RL research stack: TS self-play environment + Python (PyTorch) learner.",
+  "scripts": {
+    "selftest": "tsx src/selftest.ts",
+    "bench": "tsx src/bench.ts",
+    "typecheck": "tsc --noEmit",
+    "spec": "tsx src/spec.ts",
+    "worker": "tsx src/worker.ts"
+  }
+}

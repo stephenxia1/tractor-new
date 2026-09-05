@@ -58,6 +58,12 @@ export type EnumerationOptions = {
   // For tractor/throw follows, cap structural enumeration at this many
   // distinct "required core" choices. Default 64.
   readonly maxFollowCores?: number;
+  // When false, skip lead-throw enumeration entirely. Throw enumeration
+  // consults the other seats' hands for the rules.md §7.6 safety check, so
+  // callers that must not touch hidden information (fair-play agents, RL
+  // actors) should pass false and supply their own throw candidates.
+  // Default true.
+  readonly includeThrows?: boolean;
 };
 
 const DEFAULT_OPTIONS: Required<EnumerationOptions> = {
@@ -67,6 +73,7 @@ const DEFAULT_OPTIONS: Required<EnumerationOptions> = {
   maxThrowComponents: 2,
   maxCandidates: 256,
   maxFollowCores: 32,
+  includeThrows: true,
 };
 
 // Top-level entry point. Returns all legal play_cards actions for `seat`
@@ -132,7 +139,9 @@ function enumerateLeads(
     });
   }
   // Throws (multi-component, same effective suit, all components unbeatable).
-  enumerateLeadThrows(state, seat, myCards, ctx, n, opts, out);
+  if (opts.includeThrows) {
+    enumerateLeadThrows(state, seat, myCards, ctx, n, opts, out);
+  }
 }
 
 function enumerateLeadThrows(

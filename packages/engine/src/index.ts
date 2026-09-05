@@ -112,6 +112,12 @@ export {
 } from './declareEnum';
 
 export {
+  allLegalPlayActions,
+  type EnumeratedAction,
+  type EnumerationOptions,
+} from './rl/mlp/actions';
+
+export {
   legalActions,
   legalEvents,
   type LegalActionDescription,

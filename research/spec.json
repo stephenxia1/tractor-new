@@ -1,0 +1,76 @@
+{
+  "version": 2,
+  "numSlots": 54,
+  "header": {
+    "bytes": 28,
+    "version": 0,
+    "seat": 1,
+    "role": 2,
+    "landlordRel": 3,
+    "trumpRank": 4,
+    "trumpSuit": 5,
+    "trickIndex": 6,
+    "trickPos": 7,
+    "isLead": 8,
+    "handSize": 9,
+    "winnerRel": 10,
+    "tablePoints": 11,
+    "attackerPoints": 12,
+    "cardsSeen": 14,
+    "numCandidates": 16,
+    "iAmAttacker": 17,
+    "voidMask": 18,
+    "gameId": 22,
+    "handId": 24
+  },
+  "planes": {
+    "count": 10,
+    "bytes": 540,
+    "myHand": 0,
+    "playedBase": 1,
+    "trickBase": 5,
+    "myKitty": 9
+  },
+  "stateBytes": 568,
+  "candidate": {
+    "headerBytes": 4,
+    "bytes": 20,
+    "maxCards": 16,
+    "noCard": 255,
+    "shapes": {
+      "single": 0,
+      "pair": 1,
+      "tractor2": 2,
+      "tractor3plus": 3,
+      "throwShape": 4,
+      "broken": 5,
+      "count": 6
+    },
+    "flags": {
+      "allTrump": 1,
+      "allLedSuit": 2,
+      "hasPoints": 4,
+      "beatsWinner": 8
+    }
+  },
+  "episode": {
+    "bytes": 68,
+    "handId": 0,
+    "landlordSeat": 4,
+    "numTricks": 5,
+    "attackerPoints": 6,
+    "levelDelta": 8,
+    "defendersWon": 9,
+    "trumpRank": 10,
+    "trumpSuit": 11,
+    "tricksBase": 12,
+    "maxTricks": 25,
+    "kittyPoints": 62,
+    "gameId": 64
+  },
+  "frame": {
+    "headerBytes": 4,
+    "batchHeaderBytes": 4,
+    "actionBytes": 3
+  }
+}
