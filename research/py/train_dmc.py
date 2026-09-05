@@ -34,7 +34,13 @@ from tractor_rl.features import (
     split_per_worker,
     state_features,
 )
-from tractor_rl.model import ModelConfig, QNet, epsilon_greedy, group_argmax
+from tractor_rl.model import (
+    ModelConfig,
+    QNet,
+    epsilon_greedy,
+    greedy_indices,
+    group_argmax,
+)
 from tractor_rl.protocol import WorkerConfig, WorkerPool
 
 RESEARCH_DIR = Path(__file__).resolve().parents[1]
@@ -63,6 +69,13 @@ def main() -> None:
     ap.add_argument("--minutes", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--device", type=str, default="auto", help="cpu, cuda, or auto")
+    ap.add_argument(
+        "--groups",
+        type=int,
+        default=1,
+        help="worker groups stepped in rotation; >1 overlaps worker compute with Python",
+    )
     ap.add_argument("--epsilon", type=float, default=DEFAULTS.epsilon)
     ap.add_argument("--lr", type=float, default=DEFAULTS.lr)
     ap.add_argument("--batch-size", type=int, default=DEFAULTS.batch_size)
@@ -86,7 +99,10 @@ def main() -> None:
         train_every=args.train_every,
         steps_per_train=args.steps_per_train,
     )
-    device = torch.device("cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     model = QNet(ModelConfig()).to(device)
     if args.resume:
         state = torch.load(args.resume, map_location=device)
@@ -99,10 +115,12 @@ def main() -> None:
     pool = WorkerPool(
         args.workers,
         WorkerConfig(games=args.games, seed=args.seed, preplay=args.preplay),
+        num_groups=args.groups,
     )
     print(
         f"model {model.num_parameters() / 1e6:.2f}M params | "
-        f"{args.workers} workers x {args.games} games | threads {args.threads}"
+        f"{args.workers} workers x {args.games} games in {pool.num_groups} group(s) | "
+        f"device {device} | threads {args.threads}"
     )
 
     log_path = RUN_DIR / f"{args.run_name}.jsonl"
@@ -121,12 +139,18 @@ def main() -> None:
     try:
         while time.perf_counter() < deadline:
             t0 = time.perf_counter()
-            batches = pool.read_round()
+            # With >1 group, the group being read has been computing since
+            # its actions went out several iterations ago, while the group
+            # we last wrote to is computing now: the two sides overlap
+            # instead of taking turns idling.
+            group = pool.next_group()
+            group_workers = pool.workers_of(group)
+            batches = pool.read_group(group)
             merged = merge_batches(batches)
             t1 = time.perf_counter()
 
             if merged.num_decisions == 0:
-                pool.write_round(batches, [np.zeros(0, dtype=np.int64)] * len(batches))
+                pool.write_group(group, batches, [np.zeros(0, dtype=np.int64)] * len(batches))
                 continue
 
             sf_np = state_features(merged.states)
@@ -135,13 +159,26 @@ def main() -> None:
 
             with torch.no_grad():
                 q = model(
-                    torch.from_numpy(sf_np),
-                    torch.from_numpy(af_np),
-                    torch.from_numpy(merged.owner),
-                ).numpy()
-            best = group_argmax(q, merged.owner, merged.cand_offsets, merged.cand_counts)
+                    torch.from_numpy(sf_np).to(device),
+                    torch.from_numpy(af_np).to(device),
+                    torch.from_numpy(merged.owner).to(device),
+                )
+                if device.type == "cpu":
+                    best = group_argmax(
+                        q.numpy(), merged.owner, merged.cand_offsets, merged.cand_counts
+                    )
+                else:
+                    # Keep the argmax on-device: only B indices cross back,
+                    # not N floats.
+                    best = greedy_indices(
+                        q,
+                        torch.from_numpy(merged.owner).to(device),
+                        torch.from_numpy(merged.cand_offsets).to(device),
+                        int(merged.cand_counts.max()),
+                        merged.num_decisions,
+                    ).cpu().numpy()
             picks = epsilon_greedy(best, merged.cand_counts, cfg.epsilon, rng)
-            pool.write_round(batches, split_per_worker(picks, merged.bounds))
+            pool.write_group(group, batches, split_per_worker(picks, merged.bounds))
             t3 = time.perf_counter()
 
             # --- stash this round's decisions until their hands finish ---
@@ -153,15 +190,21 @@ def main() -> None:
             hand_ids = field_u32(merged.states, L.H_HAND_ID)
             trick_idx = field_u8(merged.states, L.H_TRICK_INDEX)
             is_attacker = field_u8(merged.states, L.H_I_AM_ATTACKER)
-            worker_of = np.searchsorted(merged.bounds[1:], np.arange(merged.num_decisions), side="right")
+            # Index within the group, mapped back to the global worker id,
+            # so decisions and episodes from the same worker share a key.
+            local_of = np.searchsorted(
+                merged.bounds[1:], np.arange(merged.num_decisions), side="right"
+            )
+            worker_of = [group_workers[int(j)].index for j in local_of]
             for i in range(merged.num_decisions):
-                key = (int(worker_of[i]), int(game_ids[i]), int(hand_ids[i]))
+                key = (worker_of[i], int(game_ids[i]), int(hand_ids[i]))
                 sign = 1.0 if is_attacker[i] else -1.0
                 pending.setdefault(key, []).append((store, i, int(trick_idx[i]), sign))
             decisions += merged.num_decisions
 
             # --- finished hands become Monte-Carlo targets ---
-            for w, batch in enumerate(batches):
+            for local_w, batch in enumerate(batches):
+                w = group_workers[local_w].index
                 for ep in parse_episodes(batch.episodes):
                     hands += 1
                     recent_points.append(ep.attacker_points)
