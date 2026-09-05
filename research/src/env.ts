@@ -53,6 +53,11 @@ export type SlotOptions = {
   readonly learnerSeats: ReadonlyArray<boolean>;
   // Bot used for non-learner seats during play.
   readonly baselineBot?: BotType;
+  // Per-seat override of `baselineBot`, indexed by seat. Lets the two
+  // teams be filled by *different* bots, which is what makes bot-vs-bot
+  // duplicate-deal matches possible (the same instrument the agent is
+  // measured with, pointed at two heuristics instead).
+  readonly baselineBotBySeat?: ReadonlyArray<BotType | undefined>;
   // Bot used for declaration and kitty burial at every seat.
   readonly prePlayBot?: BotType;
   readonly maxCandidates?: number;
@@ -156,9 +161,14 @@ export class GameSlot {
 
   // Runs until a learner seat must act (pending set) or the step budget
   // is exhausted. Any hands finished along the way come back as episodes.
+  //
+  // With no learner seats at all (bot-vs-bot duplicate matches) nothing
+  // ever pends, so the slot instead yields after each completed hand --
+  // otherwise it would play until the step budget and report nothing.
   advance(): AdvanceResult {
     const episodes: EpisodeSummary[] = [];
     if (this.pending !== null) return { episodes, pending: this.pending };
+    const hasLearnerSeats = this.opts.learnerSeats.some((x) => x === true);
 
     for (let step = 0; step < MAX_STEPS_PER_ADVANCE; step++) {
       const phase = this.state.phase;
@@ -196,6 +206,7 @@ export class GameSlot {
               ),
             );
           }
+          if (!hasLearnerSeats) return { episodes, pending: null };
         }
         continue;
       }
@@ -213,7 +224,7 @@ export class GameSlot {
             return { episodes, pending: this.pending };
           }
         }
-        this.playWithBot(seat, this.baselineBot);
+        this.playWithBot(seat, this.botForSeat(seat));
         continue;
       }
 
@@ -384,6 +395,10 @@ export class GameSlot {
     }
     this.buriedKitty = [...action.cards];
     this.apply({ kind: 'replace_kitty', seat, cards: action.cards });
+  }
+
+  private botForSeat(seat: Seat): BotType {
+    return this.opts.baselineBotBySeat?.[seat] ?? this.baselineBot;
   }
 
   private playWithBot(seat: Seat, bot: BotType): void {

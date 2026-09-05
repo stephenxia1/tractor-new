@@ -45,6 +45,10 @@ class WorkerConfig:
     deal_seed_base: int | None = None
     fixed_landlord: int | None = None
     fixed_level: str | None = None
+    # A second bot, used on the seats in `alt_seats` (bit i = seat i).
+    # Lets one team be filled by a different heuristic from the other.
+    baseline_alt: str | None = None
+    alt_seats: int = 0
 
 
 class Worker:
@@ -76,6 +80,8 @@ class Worker:
             args += ["--fixed-landlord", str(config.fixed_landlord)]
         if config.fixed_level is not None:
             args += ["--fixed-level", str(config.fixed_level)]
+        if config.baseline_alt is not None:
+            args += ["--baseline-alt", config.baseline_alt, "--alt-seats", str(config.alt_seats)]
         self.index = index
         self.proc = subprocess.Popen(
             args,

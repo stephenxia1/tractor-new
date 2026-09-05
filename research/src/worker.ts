@@ -33,6 +33,7 @@ type Args = {
   dealSeedBase: number | undefined;
   fixedLandlord: Seat | undefined;
   fixedLevel: NaturalRank | undefined;
+  baselineBySeat: Array<BotType | undefined>;
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Args {
@@ -49,6 +50,15 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
   if (levelRaw !== undefined && !NATURAL_RANKS.includes(levelRaw as NaturalRank)) {
     throw new Error(`--fixed-level ${levelRaw} is not a natural rank`);
   }
+  // A second bot for a chosen set of seats, so the two teams can be filled
+  // by different heuristics (bot-vs-bot duplicate matches).
+  const altBot = get('baseline-alt');
+  const altMask = Number(get('alt-seats') ?? '0');
+  const baselineBySeat: Array<BotType | undefined> = [0, 1, 2, 3].map((s) =>
+    altBot !== undefined && (altMask & (1 << s)) !== 0
+      ? (altBot as BotType)
+      : undefined,
+  );
   return {
     games: Number(get('games') ?? '32'),
     seed: Number(get('seed') ?? '1'),
@@ -61,6 +71,7 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
     fixedLandlord:
       landlordRaw === undefined ? undefined : (Number(landlordRaw) as Seat),
     fixedLevel: levelRaw === undefined ? undefined : (levelRaw as NaturalRank),
+    baselineBySeat,
   };
 }
 
@@ -156,6 +167,7 @@ async function main(): Promise<void> {
         dealSeedBase: args.dealSeedBase,
         fixedLandlord: args.fixedLandlord,
         fixedLevel: args.fixedLevel,
+        baselineBotBySeat: args.baselineBySeat,
       }),
     );
   }
