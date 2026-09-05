@@ -151,7 +151,21 @@ function writeAll(buf: Uint8Array): Promise<void> {
   });
 }
 
+// The learner closing its end is the normal shutdown signal, but it can
+// land mid-write and surface as an unhandled EPIPE/EOF on stdout. Exit
+// quietly on those so a clean shutdown does not look like a crash (and a
+// real error still does).
+function installPipeGuards(): void {
+  const quiet = (err: NodeJS.ErrnoException): void => {
+    if (err.code === 'EPIPE' || err.code === 'EOF') process.exit(0);
+    throw err;
+  };
+  process.stdout.on('error', quiet);
+  process.stdin.on('error', quiet);
+}
+
 async function main(): Promise<void> {
+  installPipeGuards();
   const args = parseArgs(process.argv.slice(2));
   const slots: GameSlot[] = [];
   for (let i = 0; i < args.games; i++) {
