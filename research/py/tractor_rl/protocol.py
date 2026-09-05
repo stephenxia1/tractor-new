@@ -39,6 +39,12 @@ class WorkerConfig:
     preplay: str = "smart-v34"
     max_candidates: int = 48
     randomize: bool = True
+    # Duplicate mode: when set, this worker's deals are a pure function of
+    # (deal_seed_base, game slot, hand index), so a second worker given the
+    # same base plays the identical cards while controlling other seats.
+    deal_seed_base: int | None = None
+    fixed_landlord: int | None = None
+    fixed_level: str | None = None
 
 
 class Worker:
@@ -64,6 +70,12 @@ class Worker:
             "--randomize",
             "1" if config.randomize else "0",
         ]
+        if config.deal_seed_base is not None:
+            args += ["--deal-seed-base", str(config.deal_seed_base)]
+        if config.fixed_landlord is not None:
+            args += ["--fixed-landlord", str(config.fixed_landlord)]
+        if config.fixed_level is not None:
+            args += ["--fixed-level", str(config.fixed_level)]
         self.index = index
         self.proc = subprocess.Popen(
             args,
@@ -122,18 +134,63 @@ class Worker:
 
 class WorkerPool:
     """A set of workers stepped in lockstep: read every worker's pending
-    decisions, decide them all in one forward pass, write the answers back."""
+    decisions, decide them all in one forward pass, write the answers back.
+
+    With `num_groups > 1` the workers are split into groups stepped in
+    rotation instead. That matters because a worker computes only between
+    receiving its actions and emitting its next frame: with one group, the
+    TypeScript side sits idle for the whole featurise-and-forward window and
+    Python sits idle for the whole worker window, and the two are almost the
+    same size (measured 50.6% / 47.2% of loop time). Handing group *g* its
+    actions and then immediately reading group *g+1* -- which has been
+    computing since its own actions went out one iteration ago -- overlaps
+    the two instead of alternating them.
+
+    Each group is stepped at 1/num_groups the rate, so double the workers to
+    keep the forward-pass batch the same size.
+    """
 
     def __init__(
         self,
         num_workers: int,
         config: WorkerConfig,
         node: str = "node",
+        num_groups: int = 1,
+        configs: list[WorkerConfig] | None = None,
     ) -> None:
-        self.workers = [
-            Worker(i, replace(config, seed=config.seed + i * 101), node)
-            for i in range(num_workers)
-        ]
+        # `configs` lets a caller give individual workers different settings
+        # (the arena runs half its workers on each side of a duplicate pair).
+        if configs is None:
+            configs = [
+                replace(config, seed=config.seed + i * 101) for i in range(num_workers)
+            ]
+        self.workers = [Worker(i, cfg, node) for i, cfg in enumerate(configs)]
+        n = max(1, min(num_groups, len(self.workers)))
+        # Round-robin so a group spans workers evenly even if the caller
+        # ordered them by role.
+        self.groups: list[list[Worker]] = [self.workers[i::n] for i in range(n)]
+        self._cursor = 0
+
+    @property
+    def num_groups(self) -> int:
+        return len(self.groups)
+
+    def next_group(self) -> int:
+        g = self._cursor
+        self._cursor = (self._cursor + 1) % len(self.groups)
+        return g
+
+    def workers_of(self, group: int) -> list[Worker]:
+        return self.groups[group]
+
+    def read_group(self, group: int) -> list[Batch]:
+        return [parse_frame(w.read_frame()) for w in self.groups[group]]
+
+    def write_group(
+        self, group: int, batches: Iterable[Batch], choices: Iterable[np.ndarray]
+    ) -> None:
+        for worker, batch, picks in zip(self.groups[group], batches, choices):
+            worker.send_actions(game_ids_of(batch), picks)
 
     def read_round(self) -> list[Batch]:
         return [parse_frame(w.read_frame()) for w in self.workers]

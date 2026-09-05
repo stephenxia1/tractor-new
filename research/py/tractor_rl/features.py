@@ -302,6 +302,11 @@ class Episode:
     kitty_points: int
     trick_points: np.ndarray  # [num_tricks] int
     trick_attacker_won: np.ndarray  # [num_tricks] bool
+    # Fingerprint of the deal this hand came from (env.ts computeDealDigest).
+    # Duplicate-deal evaluation joins pairs on (game, hand) and checks this.
+    deal_digest: int = 0
+    trump_rank: int = 0
+    trump_suit: int = 0
 
 
 def parse_episodes(episodes: np.ndarray) -> list[Episode]:
@@ -326,6 +331,11 @@ def parse_episodes(episodes: np.ndarray) -> list[Episode]:
                 kitty_points=int(row[L.E_KITTY_POINTS]),
                 trick_points=pts,
                 trick_attacker_won=won,
+                deal_digest=int.from_bytes(
+                    raw[L.E_DEAL_DIGEST : L.E_DEAL_DIGEST + 4], "little"
+                ),
+                trump_rank=int(row[L.E_TRUMP_RANK]),
+                trump_suit=int(row[L.E_TRUMP_SUIT]),
             )
         )
     return out

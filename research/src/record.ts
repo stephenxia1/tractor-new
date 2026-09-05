@@ -12,7 +12,7 @@
 
 import { NUM_SLOTS } from './cards';
 
-export const RECORD_VERSION = 2;
+export const RECORD_VERSION = 3;
 
 // ---- Decision record header ------------------------------------------------
 
@@ -92,7 +92,14 @@ export const E_KITTY_POINTS = 62; // u8
 // Game slot this hand belongs to. Hand ids restart per slot, so the
 // learner keys decisions by (worker, game, hand).
 export const E_GAME_ID = 64; // u16
-export const EPISODE_BYTES = 68;
+// Fingerprint of the deal this hand was played from: the four dealt hands
+// (seat by seat), the kitty, the landlord seat and the trump rank, hashed
+// before anybody declares or buries. Duplicate-deal evaluation joins the
+// two halves of a pair on (game, hand) and then *checks* this matches, so
+// a broken deal-seed scheme shows up as a failed assertion rather than as
+// a plausible-looking number.
+export const E_DEAL_DIGEST = 66; // u32
+export const EPISODE_BYTES = 72;
 
 // ---- Frame format ----------------------------------------------------------
 //
@@ -269,6 +276,7 @@ export function layoutSpec(): Record<string, unknown> {
       maxTricks: MAX_TRICKS,
       kittyPoints: E_KITTY_POINTS,
       gameId: E_GAME_ID,
+      dealDigest: E_DEAL_DIGEST,
     },
     frame: {
       headerBytes: FRAME_HEADER_BYTES,

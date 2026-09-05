@@ -8,10 +8,14 @@
 //
 // Usage (the Python side spawns this; the defaults let you run it by hand):
 //   tsx src/worker.ts --games 32 --seed 7 --learner-seats 15
+//
+// For duplicate-deal evaluation, --deal-seed-base makes each slot's deals a
+// pure function of (base, gameId, handIndex), so two workers given the same
+// base play the same cards while controlling different seats.
 
 import { GameSlot } from './env';
 import { writeDecision, writeEpisode } from './encode';
-import type { BotType } from '@tractor/engine';
+import { NATURAL_RANKS, type BotType, type NaturalRank, type Seat } from '@tractor/engine';
 import {
   ByteWriter,
   BATCH_HEADER_BYTES,
@@ -26,6 +30,9 @@ type Args = {
   preplay: BotType;
   maxCandidates: number;
   randomize: boolean;
+  dealSeedBase: number | undefined;
+  fixedLandlord: Seat | undefined;
+  fixedLevel: NaturalRank | undefined;
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Args {
@@ -35,6 +42,13 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
   };
   // Seat mask: bit i set means seat i is learner-controlled. 15 = all four.
   const mask = Number(get('learner-seats') ?? '15');
+  // Duplicate mode: deals become a pure function of (base, gameId, handIndex).
+  const dealBaseRaw = get('deal-seed-base');
+  const landlordRaw = get('fixed-landlord');
+  const levelRaw = get('fixed-level');
+  if (levelRaw !== undefined && !NATURAL_RANKS.includes(levelRaw as NaturalRank)) {
+    throw new Error(`--fixed-level ${levelRaw} is not a natural rank`);
+  }
   return {
     games: Number(get('games') ?? '32'),
     seed: Number(get('seed') ?? '1'),
@@ -43,6 +57,10 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
     preplay: (get('preplay') ?? 'smart-v34') as BotType,
     maxCandidates: Number(get('max-cands') ?? '48'),
     randomize: (get('randomize') ?? '1') !== '0',
+    dealSeedBase: dealBaseRaw === undefined ? undefined : Number(dealBaseRaw),
+    fixedLandlord:
+      landlordRaw === undefined ? undefined : (Number(landlordRaw) as Seat),
+    fixedLevel: levelRaw === undefined ? undefined : (levelRaw as NaturalRank),
   };
 }
 
@@ -135,6 +153,9 @@ async function main(): Promise<void> {
         prePlayBot: args.preplay,
         maxCandidates: args.maxCandidates,
         randomize: args.randomize,
+        dealSeedBase: args.dealSeedBase,
+        fixedLandlord: args.fixedLandlord,
+        fixedLevel: args.fixedLevel,
       }),
     );
   }

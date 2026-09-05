@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "numSlots": 54,
   "header": {
     "bytes": 28,
@@ -54,7 +54,7 @@
     }
   },
   "episode": {
-    "bytes": 68,
+    "bytes": 72,
     "handId": 0,
     "landlordSeat": 4,
     "numTricks": 5,
@@ -66,7 +66,8 @@
     "tricksBase": 12,
     "maxTricks": 25,
     "kittyPoints": 62,
-    "gameId": 64
+    "gameId": 64,
+    "dealDigest": 66
   },
   "frame": {
     "headerBytes": 4,

@@ -11,6 +11,7 @@
 import {
   NATURAL_RANKS,
   applyEvent,
+  cardKey,
   createGame,
   defaultV1Config,
   mulberry32,
@@ -24,8 +25,25 @@ import {
   type Seat,
 } from '@tractor/engine';
 
+import { cardSlot } from './cards';
 import { enumerateCandidates, type Candidate } from './candidates';
 import { summarizeHand, type EpisodeSummary } from './encode';
+
+// A 32-bit mixer, so a deal can be addressed by coordinates rather than by
+// a position in an RNG stream. Duplicate-deal evaluation needs the deal for
+// (base, game, hand) to be the same cards no matter what the policy did
+// beforehand, and a per-slot RNG chain cannot promise that.
+function mix32(a: number, b: number, c: number): number {
+  let x = (a ^ 0x9e3779b9) >>> 0;
+  x = Math.imul(x ^ ((b + 0x85ebca6b) >>> 0), 0xcc9e2d51) >>> 0;
+  x = (((x << 15) | (x >>> 17)) >>> 0) ^ ((c + 0xc2b2ae35) >>> 0);
+  x = Math.imul(x, 0x1b873593) >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0;
+  x = Math.imul(x, 0x85ebca6b) >>> 0;
+  x = (x ^ (x >>> 13)) >>> 0;
+  x = Math.imul(x, 0xc2b2ae35) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
+}
 
 export type SlotOptions = {
   readonly gameId: number;
@@ -41,9 +59,36 @@ export type SlotOptions = {
   // Randomise landlord + levels per hand (on by default; off for
   // duplicate-deal evaluation, where the deal must be reproducible).
   readonly randomize?: boolean;
-  // Fixed landlord/level when randomize is false.
+  // Fixed landlord/level when randomize is false, or an override of the
+  // value duplicate mode would otherwise derive.
   readonly fixedLandlord?: Seat;
   readonly fixedLevel?: NaturalRank;
+  // Duplicate mode. When set, hand h of this slot is dealt from
+  // mix32(dealSeedBase, gameId, h) rather than from the slot's own RNG
+  // chain: the shuffle seed, the landlord and the trump rank all become
+  // pure functions of those three coordinates. Two slots given the same
+  // base and gameId therefore play the identical sequence of deals even
+  // though different seats are learner-controlled and the number of RNG
+  // draws along the way differs.
+  //
+  // Both teams are put on the *same* level, so swapping the agent between
+  // team A and team B is an exact mirror: the two halves of a pair differ
+  // only in which policy sits in which seats.
+  readonly dealSeedBase?: number;
+  // Keep a copy of the dealt hands for the current hand (see `dealt`).
+  // Off in training; used by src/dupcheck.ts to compare paired deals card
+  // for card rather than trusting the digest.
+  readonly captureDeal?: boolean;
+};
+
+// The deal as it stood the instant after the shuffle, before anyone
+// declared or touched the kitty. Card keys, sorted, so two deals compare
+// with a string equality.
+export type DealtCards = {
+  readonly hands: ReadonlyArray<ReadonlyArray<string>>;
+  readonly kitty: ReadonlyArray<string>;
+  readonly landlord: number;
+  readonly trumpRank: string;
 };
 
 export type Pending = {
@@ -67,6 +112,8 @@ export class GameSlot {
   private state: GameState;
   private handCounter = 0;
   private currentHandId = 0;
+  private dealDigestValue = 0;
+  private dealtCards: DealtCards | null = null;
   private buriedKitty: Card[] = [];
   private pending: Pending | null = null;
   private forcedLeads = 0;
@@ -95,6 +142,16 @@ export class GameSlot {
 
   get kitty(): ReadonlyArray<Card> {
     return this.buriedKitty;
+  }
+
+  // Fingerprint of the current hand's deal, taken right after the shuffle.
+  get dealDigest(): number {
+    return this.dealDigestValue;
+  }
+
+  // The dealt cards, when `captureDeal` was requested. Null otherwise.
+  get dealt(): DealtCards | null {
+    return this.dealtCards;
   }
 
   // Runs until a learner seat must act (pending set) or the step budget
@@ -130,7 +187,13 @@ export class GameSlot {
           const finished = this.state.currentHand ?? before.currentHand;
           if (finished !== null && finished !== undefined) {
             episodes.push(
-              summarizeHand(this.state, finished, this.gameId, this.currentHandId),
+              summarizeHand(
+                this.state,
+                finished,
+                this.gameId,
+                this.currentHandId,
+                this.dealDigestValue,
+              ),
             );
           }
         }
@@ -196,24 +259,93 @@ export class GameSlot {
   private startHand(): void {
     const config = defaultV1Config();
     let base = createGame(config);
-    const randomize = this.opts.randomize ?? true;
-    const landlord: Seat = randomize
-      ? Math.floor(this.rng() * config.numPlayers)
-      : this.opts.fixedLandlord ?? 0;
-    const levelFor = (): NaturalRank => {
-      if (!randomize) return this.opts.fixedLevel ?? '2';
-      return NATURAL_RANKS[Math.floor(this.rng() * NATURAL_RANKS.length)]!;
-    };
-    base = {
-      ...base,
-      landlord,
-      teamLevels: { A: levelFor(), B: levelFor() },
-    };
-    this.state = base;
-    this.buriedKitty = [];
     this.handCounter += 1;
     this.currentHandId = this.handCounter;
-    this.apply({ kind: 'start_hand', seed: this.nextSeed() });
+
+    let landlord: Seat;
+    let levels: { A: NaturalRank; B: NaturalRank };
+    let handSeed: number;
+
+    if (this.opts.dealSeedBase !== undefined) {
+      // Duplicate mode. Draw all three from a private stream keyed on
+      // (base, game, hand) and only then apply any override, so the
+      // shuffle seed does not shift when the landlord is pinned.
+      const dealRng = mulberry32(
+        mix32(this.opts.dealSeedBase, this.gameId, this.currentHandId),
+      );
+      const drawnLandlord = Math.floor(dealRng() * config.numPlayers);
+      const drawnLevel =
+        NATURAL_RANKS[Math.floor(dealRng() * NATURAL_RANKS.length)]!;
+      handSeed = Math.floor(dealRng() * 0x7fffffff);
+      landlord = this.opts.fixedLandlord ?? drawnLandlord;
+      const level = this.opts.fixedLevel ?? drawnLevel;
+      levels = { A: level, B: level };
+    } else {
+      const randomize = this.opts.randomize ?? true;
+      landlord = randomize
+        ? Math.floor(this.rng() * config.numPlayers)
+        : this.opts.fixedLandlord ?? 0;
+      const levelFor = (): NaturalRank => {
+        if (!randomize) return this.opts.fixedLevel ?? '2';
+        return NATURAL_RANKS[Math.floor(this.rng() * NATURAL_RANKS.length)]!;
+      };
+      levels = { A: levelFor(), B: levelFor() };
+      handSeed = this.nextSeed();
+    }
+
+    base = { ...base, landlord, teamLevels: levels };
+    this.state = base;
+    this.buriedKitty = [];
+    this.apply({ kind: 'start_hand', seed: handSeed });
+    this.dealDigestValue = this.computeDealDigest();
+    this.dealtCards =
+      this.opts.captureDeal === true ? this.captureDealtCards() : null;
+  }
+
+  private captureDealtCards(): DealtCards {
+    const hand = this.state.currentHand;
+    if (hand === null) throw new Error('captureDealtCards with no hand');
+    const keys = (cards: ReadonlyArray<Card>): string[] =>
+      cards.map(cardKey).sort();
+    const hands: string[][] = [];
+    for (let seat = 0; seat < this.state.config.numPlayers; seat++) {
+      hands.push(keys(hand.hands[seat] ?? []));
+    }
+    return {
+      hands,
+      kitty: keys(hand.kitty),
+      landlord: hand.landlord ?? -1,
+      trumpRank: hand.trumpRank ?? 'none',
+    };
+  }
+
+  // FNV-1a over the dealt hands (seat by seat), the kitty, the landlord
+  // and the trump rank. Taken immediately after start_hand, before any
+  // declaration or kitty pickup moves cards around, so it describes the
+  // deal itself rather than what the players then did with it.
+  private computeDealDigest(): number {
+    const hand = this.state.currentHand;
+    if (hand === null) return 0;
+    let h = 0x811c9dc5;
+    const push = (v: number): void => {
+      h = Math.imul(h ^ (v & 0xff), 0x01000193) >>> 0;
+    };
+    const pushCards = (cards: ReadonlyArray<Card>): void => {
+      const slots = cards.map(cardSlot).sort((a, b) => a - b);
+      for (const s of slots) push(s);
+    };
+    for (let seat = 0; seat < this.state.config.numPlayers; seat++) {
+      push(0xc0 + seat);
+      pushCards(hand.hands[seat] ?? []);
+    }
+    push(0xfa);
+    pushCards(hand.kitty);
+    push(0xfb);
+    push(hand.landlord ?? 255);
+    push(
+      hand.trumpRank === null ? 255 : NATURAL_RANKS.indexOf(hand.trumpRank),
+    );
+    return h >>> 0;
   }
 
   private runDeclarePhase(): void {

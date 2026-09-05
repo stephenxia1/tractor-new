@@ -90,6 +90,31 @@ def group_argmax(
     return padded.argmax(axis=1)
 
 
+def greedy_indices(
+    q: torch.Tensor,  # [N] scores, on whatever device the model ran on
+    owner: torch.Tensor,  # [N] decision index per candidate
+    offsets: torch.Tensor,  # [B] first candidate row of each decision
+    max_k: int,  # widest candidate list this round (known host-side)
+    num_decisions: int,
+) -> torch.Tensor:  # [B] chosen index within each decision
+    """`group_argmax` done on-device.
+
+    The numpy version needs the Q-values back on the host, which on a GPU is
+    a device->host sync every round for data we only ever argmax. Doing the
+    segment max here means the round trip carries B indices instead of N
+    floats. `max_k` comes from the host-side candidate counts, so nothing
+    here forces a sync either.
+    """
+    if num_decisions == 0:
+        return torch.zeros(0, dtype=torch.int64, device=q.device)
+    padded = torch.full(
+        (num_decisions, max_k), float("-inf"), dtype=q.dtype, device=q.device
+    )
+    within = torch.arange(q.shape[0], device=q.device, dtype=torch.int64) - offsets[owner]
+    padded[owner, within] = q
+    return padded.argmax(dim=1)
+
+
 def epsilon_greedy(
     best: np.ndarray,
     counts: np.ndarray,

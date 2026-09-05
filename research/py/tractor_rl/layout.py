@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 # The version this Python code was written against.
-LAYOUT_VERSION = 2
+LAYOUT_VERSION = 3
 
 RESEARCH_DIR = Path(__file__).resolve().parents[2]
 SPEC_PATH = RESEARCH_DIR / "spec.json"
@@ -91,6 +91,7 @@ E_TRICKS_BASE: int = _E["tricksBase"]
 MAX_TRICKS: int = _E["maxTricks"]
 E_KITTY_POINTS: int = _E["kittyPoints"]
 E_GAME_ID: int = _E["gameId"]
+E_DEAL_DIGEST: int = _E["dealDigest"]
 
 _F = SPEC["frame"]
 FRAME_HEADER_BYTES: int = _F["headerBytes"]

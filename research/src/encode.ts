@@ -26,6 +26,7 @@ import {
   MAX_CANDIDATE_CARDS,
   NO_CARD,
   E_ATTACKER_POINTS,
+  E_DEAL_DIGEST,
   E_DEFENDERS_WON,
   E_HAND_ID,
   E_KITTY_POINTS,
@@ -240,6 +241,10 @@ export type EpisodeSummary = {
   // Points sitting in the buried kitty. Trick points sum to 200 minus
   // this; if the attackers take the last trick these are multiplied in.
   readonly kittyPoints: number;
+  // Fingerprint of the deal (GameSlot.dealDigest), so duplicate-deal
+  // evaluation can verify that the two halves of a pair really were the
+  // same cards instead of assuming it.
+  readonly dealDigest: number;
 };
 
 export function summarizeHand(
@@ -247,6 +252,7 @@ export function summarizeHand(
   hand: HandState,
   gameId: number,
   handId: number,
+  dealDigest = 0,
 ): EpisodeSummary {
   const landlord = hand.landlord!;
   const landlordTeam = teamOf(state, landlord);
@@ -270,6 +276,7 @@ export function summarizeHand(
     trickPoints,
     trickAttackerWon,
     kittyPoints: sumPoints(hand.kitty),
+    dealDigest,
   };
 }
 
@@ -278,6 +285,7 @@ export function writeEpisode(w: ByteWriter, e: EpisodeSummary): void {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   view.setUint32(E_HAND_ID, e.handId, true);
   view.setUint16(E_GAME_ID, e.gameId, true);
+  view.setUint32(E_DEAL_DIGEST, e.dealDigest >>> 0, true);
   buf[E_LANDLORD_SEAT] = e.landlordSeat;
   buf[E_NUM_TRICKS] = Math.min(e.numTricks, MAX_TRICKS);
   view.setUint16(E_ATTACKER_POINTS, Math.min(e.attackerPoints, 65535), true);
