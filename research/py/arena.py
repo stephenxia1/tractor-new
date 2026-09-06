@@ -42,15 +42,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tractor_rl.features import (
+from tractor_rl.features2 import (
     Episode,
-    action_features,
     merge_batches,
     parse_episodes,
     split_per_worker,
-    state_features,
 )
-from tractor_rl.model import ModelConfig, QNet, group_argmax
+from tractor_rl.policies import load_policy
 from tractor_rl.protocol import WorkerConfig, WorkerPool
 
 RESEARCH_DIR = Path(__file__).resolve().parents[1]
@@ -130,18 +128,13 @@ def summarize(values: np.ndarray, label: str, unit: str) -> str:
     )
 
 
-def load_agent(path: str, device: torch.device) -> QNet | None:
+def load_agent(path: str, device: torch.device):
     """Returns None when `--agent bot:<name>` asked for a heuristic."""
     if path.startswith("bot:"):
         return None
-    model = QNet(ModelConfig()).to(device)
-    state = torch.load(path, map_location=device)
-    model.load_state_dict(state["model"])
-    model.eval()
-    steps = state.get("steps", "?")
-    hands = state.get("hands", "?")
-    print(f"agent: {path} (learner steps {steps}, hands trained on {hands})")
-    return model
+    policy, desc = load_policy(path, device)
+    print(f"agent: {desc}")
+    return policy
 
 
 def main() -> None:
@@ -221,14 +214,7 @@ def main() -> None:
             merged = merge_batches(batches)
 
             if merged.num_decisions > 0 and model is not None:
-                sf = torch.from_numpy(state_features(merged.states)).to(device)
-                af = torch.from_numpy(
-                    action_features(merged.cands, merged.states, merged.owner)
-                ).to(device)
-                owner = torch.from_numpy(merged.owner).to(device)
-                with torch.no_grad():
-                    q = model(sf, af, owner).cpu().numpy()
-                picks = group_argmax(q, merged.owner, merged.cand_offsets, merged.cand_counts)
+                picks = model.pick(merged)
             else:
                 picks = np.zeros(merged.num_decisions, dtype=np.int64)
             pool.write_round(batches, split_per_worker(picks, merged.bounds))
