@@ -219,6 +219,7 @@ Evaluated greedily on duplicate deals at the 190k-step checkpoint:
 | `smart` (v1) | **+14.88** [+10.27, +19.49] | +0.40 | 157 / 86 worse |
 | `smart-v2` | -0.96 [-6.02, +4.10] | +0.04 | 116 / 128 worse |
 | `smart-v13` | **+15.46** [+9.02, +21.89] | +0.37 | 74 / 36 worse |
+| `smart-v18` | **-10.20** [-17.60, -2.80] | -0.22 | 31 / 61 worse |
 
 For reference, `smart` itself scores +83.96 against `random`, so the agent
 has passed the multi-heuristic bot outright and drawn level with
@@ -233,6 +234,21 @@ Beating `smart-v13` is the more meaningful of these: it is the first
 *fair-play* bot in the lineage, the one that established masking opponent
 hands via determinization, and it costs ~3 orders of magnitude more
 compute per decision than the agent does.
+
+**It still loses to `smart-v18`**, the deployed fair-play peak, by 10.2
+points. That is the honest standing: an 80-minute checkpoint sits between
+`smart-v13` and `smart-v18`. Worth keeping in proportion in both
+directions — v18 runs a 5-ply determinized search costing ~1 s per lead
+decision, the network answers in about a millisecond, and the gap is 10
+points rather than 50. Whether training closes it is the question the rest
+of the run answers; this checkpoint is 190k steps of a ~2M-step run.
+
+Note both sides use `smart-v34` for declaration and kitty burial in every
+one of these matches, so what is being compared is in-trick play alone.
+
+An incidental gap in the old lineage this harness could close cheaply: v2
+and v13 were never measured against each other directly, and the agent
+ties one while beating the other.
 
 ### What a serious run costs here
 
