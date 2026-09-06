@@ -18,7 +18,8 @@ set -euo pipefail
 
 # GPU images usually run as root with no sudo installed, and often ship
 # torch already. Both are handled rather than assumed.
-if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
+# As root both must be empty: "$SUDO -E" would expand to a bare "-E".
+if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; SUDO_E=""; else SUDO="sudo"; SUDO_E="sudo -E"; fi
 SKIP_VENV="${SKIP_VENV:-0}"
 # SKIP_CLONE=1 uses whatever source is already in WORKDIR, for when the
 # code was shipped over SSH instead of cloned (no GitHub credential ever
@@ -52,7 +53,7 @@ done
 
 echo "==> installing system packages"
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | cut -c2-3)" -lt 20 ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash -
+  curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO_E bash -
   $SUDO apt-get install -y nodejs
 fi
 $SUDO apt-get update -qq
