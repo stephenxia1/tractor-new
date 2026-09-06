@@ -299,6 +299,48 @@ Reading the v18 row honestly: a tie, not a win. The CI spans zero and 120
 pairs is a small sample against an expensive opponent. What can be said is
 that the 10-point deficit is gone.
 
+## Search (Phase 3)
+
+Determinized value-guided search: sample worlds consistent with public
+play, play each candidate in each, roll forward to the seat's *own* next
+decision, and score the resulting position with the learned value head.
+Leaves travel as ordinary decision records carrying zero candidates,
+tagged with the candidate they inform, so one real decision still costs
+one network round trip.
+
+**Against `smart-v2`, the same checkpoint:**
+
+| configuration | point margin |
+| --- | --- |
+| no search | +17.40 [+11.74, +23.06] |
+| search, leaves at trick end | -6.14 [-20.58, +8.31] |
+| search, leaves at trick end, all candidates | -13.89 [-24.81, -2.96] |
+| **search, rolled to own turn, all candidates** | **+29.76** [+22.07, +37.44] |
+
+Search made the agent *worse* twice before it helped, and both reasons are
+worth writing down.
+
+**The value head had never seen the positions it was being asked about.**
+Training records exist only where the recorded seat is about to move, so
+V(s) is trained exclusively on "my turn" states. Leaves taken at trick end
+are usually someone else's turn -- out of distribution, and confidently
+wrong there. Simulations now roll forward to the searching seat's next
+decision.
+
+**Search was picking from the wrong menu.** The worker searched
+`candidates[0..N]` in enumeration order rather than the top N by Q -- the
+policy prior the design called for was never built -- and then forced a
+pick inside that arbitrary subset, discarding the network's preference
+entirely. Searching every candidate turned a 14-point loss into a
+30-point win. Python now overrides the network only where search covered
+all candidates.
+
+The lesson generalises: a search is only as good as the agreement between
+the distribution its evaluator was trained on and the positions it is
+asked to judge, and adding search to a policy silently *replaces* that
+policy's ranking with the search's -- so a bug in the search is not a
+smaller effect than a bug in the policy, it is a larger one.
+
 ### The run was cut short
 
 The spot instance was reclaimed at ~7.9h uptime, 4.0h into a 9h v2 run.
