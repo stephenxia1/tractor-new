@@ -352,6 +352,19 @@ measured against for most of its life:
     v2, 107k steps           +1.90   tie
     v2 + search             +16.90   win
 
+**Against `smart-v34`, the currently deployed peak:**
+
+```
+120 duplicate pairs (245 hands)
+point margin: +17.75 pts [95% CI +11.09, +24.41]  (77 better / 33 worse / 10 level)
+level margin: +0.49 levels [95% CI +0.32, +0.67]
+attacker points: agent 84.1 / opponent 66.3 on the same deals
+```
+
+v18 and v34 come out within a point of each other (+16.90 and +17.75),
+which is consistent with the lineage's own finding that v34 beats v18 only
+53% of the time -- the two are close, and the agent is clear of both.
+
 Worth being precise about what search is here: it is `smart-v18`'s own
 algorithm -- sample opponent hands, simulate, average -- with the
 hand-tuned rollout policy and cost heuristics swapped for a learned
