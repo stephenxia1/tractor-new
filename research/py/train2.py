@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import signal
 import time
 from collections import deque
 from dataclasses import asdict, replace
@@ -132,7 +133,12 @@ def main() -> None:
     ap.add_argument("--snapshot-refresh", type=int, default=250, help="rounds between resamples")
     ap.add_argument("--snapshot-pool", type=int, default=10)
     ap.add_argument("--log-every", type=int, default=200)
-    ap.add_argument("--checkpoint-every", type=int, default=100000)
+    ap.add_argument("--checkpoint-every", type=int, default=100000, help="learner steps")
+    # Wall-clock checkpointing matters more than step-count checkpointing on
+    # interruptible hardware: a spot reclaim costs whatever has happened
+    # since the last save, and a step threshold can easily be longer than
+    # the machine's life. One run lost 22k steps to exactly that.
+    ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
     ap.add_argument("--run-name", type=str, default="v2")
     ap.add_argument("--resume", type=str, default="")
     args = ap.parse_args()
@@ -184,10 +190,27 @@ def main() -> None:
     print(f"matchups: {counts}")
 
     log_file = (RUN_DIR / f"{args.run_name}.jsonl").open("a", encoding="utf-8")
+
+    # Spot gives a termination notice and then SIGTERM; save on the way out
+    # so the last minutes are not lost on top of whatever the periodic
+    # checkpoint missed.
+    interrupted = {"flag": False}
+
+    def on_term(signum, _frame):
+        interrupted["flag"] = True
+        try:
+            save(net, critic, learner, cfg, net_cfg, args, hands, final=True)
+            print(f"caught signal {signum}; checkpointed at step {learner.steps}", flush=True)
+        finally:
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
     pending: dict[tuple[int, int, int], list] = {}
     started = time.perf_counter()
     deadline = started + args.minutes * 60
     rounds = decisions = trained_decisions = hands = 0
+    last_checkpoint = time.perf_counter()
     recent_points: list[int] = []
     t_env = t_feat = t_fwd = t_learn = 0.0
 
@@ -344,8 +367,13 @@ def main() -> None:
                     f"tgt_std {row.get('target_std')} resid_std {row.get('critic_residual_std')}",
                     flush=True)
 
-            if learner.steps > 0 and learner.steps % args.checkpoint_every == 0:
+            now = time.perf_counter()
+            if learner.steps > 0 and (
+                learner.steps % args.checkpoint_every == 0
+                or now - last_checkpoint >= args.checkpoint_minutes * 60
+            ):
                 save(net, critic, learner, cfg, net_cfg, args, hands)
+                last_checkpoint = now
     finally:
         pool.close()
         save(net, critic, learner, cfg, net_cfg, args, hands, final=True)
