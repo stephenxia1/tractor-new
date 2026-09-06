@@ -335,6 +335,29 @@ entirely. Searching every candidate turned a 14-point loss into a
 30-point win. Python now overrides the network only where search covered
 all candidates.
 
+**Against `smart-v18`, the deployed fair-play peak:**
+
+```
+121 duplicate pairs (246 hands)
+point margin: +16.90 pts [95% CI +10.49, +23.31]  (78 better / 33 worse / 10 level)
+level margin: +0.48 levels [95% CI +0.31, +0.65]
+attacker points: agent 83.8 / opponent 66.9 on the same deals
+search: 5,353/8,088 decisions searched (212,103 leaves)
+```
+
+The full progression against v18, which is the bar this project has been
+measured against for most of its life:
+
+    v1, 190k steps          -10.20   loss
+    v2, 107k steps           +1.90   tie
+    v2 + search             +16.90   win
+
+Worth being precise about what search is here: it is `smart-v18`'s own
+algorithm -- sample opponent hands, simulate, average -- with the
+hand-tuned rollout policy and cost heuristics swapped for a learned
+rollout and a learned evaluator. Beating v18 by 17 points with the same
+method is a statement about the evaluator, not about search.
+
 The lesson generalises: a search is only as good as the agreement between
 the distribution its evaluator was trained on and the positions it is
 asked to judge, and adding search to a policy silently *replaces* that
