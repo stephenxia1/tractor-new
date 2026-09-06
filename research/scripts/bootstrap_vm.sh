@@ -20,6 +20,10 @@ set -euo pipefail
 # torch already. Both are handled rather than assumed.
 if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
 SKIP_VENV="${SKIP_VENV:-0}"
+# SKIP_CLONE=1 uses whatever source is already in WORKDIR, for when the
+# code was shipped over SSH instead of cloned (no GitHub credential ever
+# has to touch the rented box).
+SKIP_CLONE="${SKIP_CLONE:-0}"
 
 REPO_URL="${REPO_URL:-https://github.com/stephenxia1/tractor-new.git}"
 BRANCH="${BRANCH:-rl-research}"
@@ -55,7 +59,10 @@ $SUDO apt-get update -qq
 $SUDO apt-get install -y --no-install-recommends git python3 python3-pip python3-venv
 
 echo "==> fetching $BRANCH"
-if [[ -d "$WORKDIR/.git" ]]; then
+if [[ "$SKIP_CLONE" == "1" ]]; then
+  echo "    using source already in $WORKDIR"
+  [[ -d "$WORKDIR/research" ]] || { echo "no source at $WORKDIR" >&2; exit 1; }
+elif [[ -d "$WORKDIR/.git" ]]; then
   git -C "$WORKDIR" fetch --quiet origin "$BRANCH"
   git -C "$WORKDIR" checkout --quiet "$BRANCH"
   git -C "$WORKDIR" reset --hard --quiet "origin/$BRANCH"
