@@ -64,6 +64,9 @@ class DMC2Config:
     # Warm-up: the teacher is useless until it has trained a little, so
     # ignore it for this many learner steps.
     critic_warmup_steps: int = 2000
+    # The teacher trains on every Nth learner step; it converges fast and
+    # costs as much per step as the policy network does.
+    critic_every: int = 2
 
 
 def hand_returns(episode: Episode, cfg: DMC2Config) -> tuple[np.ndarray, float]:
@@ -149,6 +152,7 @@ class Learner2:
         self.opt = torch.optim.RMSprop(net.parameters(), lr=cfg.lr)
         self.critic_opt = torch.optim.RMSprop(critic.parameters(), lr=cfg.critic_lr)
         self.steps = 0
+        self._last_critic_loss = float("nan")
         self.stats: dict[str, float] = {}
 
     def step(self, buffer: ReplayBuffer2, rng: np.random.Generator) -> dict[str, float] | None:
@@ -172,19 +176,26 @@ class Learner2:
 
         # --- privileged teacher, trained on the raw return ---
         priv = torch.from_numpy(privileged_features(states)).to(self.device)
-        q_priv = self.critic(sf, priv, af, owner)
-        critic_loss = F.mse_loss(q_priv, tgt_points)
-        self.critic_opt.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
-        self.critic_opt.step()
+        train_critic = self.steps % cfg.critic_every == 0
+        if train_critic:
+            q_priv = self.critic(sf, priv, af, owner)
+            critic_loss = F.mse_loss(q_priv, tgt_points)
+            self.critic_opt.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
+            self.critic_opt.step()
+            q_priv = q_priv.detach()
+            self._last_critic_loss = float(critic_loss.detach())
+        else:
+            with torch.no_grad():
+                q_priv = self.critic(sf, priv, af, owner)
 
         # --- policy network ---
         out = self.net(sf, af, owner, roles, tokens, mask, want="all")
         if self.steps < cfg.critic_warmup_steps:
             target = tgt_points
         else:
-            target = cfg.lambda_mc * tgt_points + (1.0 - cfg.lambda_mc) * q_priv.detach()
+            target = cfg.lambda_mc * tgt_points + (1.0 - cfg.lambda_mc) * q_priv
 
         loss_q = F.mse_loss(out["q"], target)
         loss_level = F.mse_loss(out["q_level"], tgt_level)
@@ -207,7 +218,7 @@ class Learner2:
             # How much quieter the teacher's target is than the raw return
             # is the whole point of it, so measure it rather than assume.
             spread_mc = float(tgt_points.std())
-            spread_teacher = float((tgt_points - q_priv.detach()).std())
+            spread_teacher = float((tgt_points - q_priv).std())
             belief_acc = float(
                 ((out["belief"] > 0).float() == belief).float().mean())
         self.stats = {
@@ -216,7 +227,7 @@ class Learner2:
             "loss_level": float(loss_level.detach()),
             "loss_value": float(loss_v.detach()),
             "loss_belief": float(loss_belief.detach()),
-            "critic_loss": float(critic_loss.detach()),
+            "critic_loss": getattr(self, "_last_critic_loss", float("nan")),
             "target_std": spread_mc,
             "critic_residual_std": spread_teacher,
             "belief_acc": belief_acc,

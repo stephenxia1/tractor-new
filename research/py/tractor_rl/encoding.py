@@ -121,6 +121,17 @@ def encode_planes(planes: np.ndarray, trump_rank: np.ndarray, trump_suit: np.nda
     return np.einsum("bps,bse->bpe", planes, mats, optimize=True)
 
 
+# Capacity per encoded position: how many physical cards can land there.
+# It depends only on the trump context, so it is a table rather than a
+# matmul over a constant array on every featurise call.
+CAPACITY = np.einsum(
+    "rtse,s->rte",
+    SCATTER,
+    np.full(NUM_RAW_SLOTS, 2.0, dtype=np.float32),
+    optimize=True,
+).astype(np.float32)
+
+
 def describe(enc_index: int, trump_rank: int, trump_suit: int) -> str:
     """Human-readable name for an encoded position, for debugging."""
     ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]

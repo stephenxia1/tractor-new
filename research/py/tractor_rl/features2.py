@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import layout as L
-from .encoding import NUM_ENC_SLOTS, encode_planes
+from .encoding import CAPACITY, NUM_ENC_SLOTS, encode_planes
 
 # Frame merging, worker splitting and episode parsing do not depend on the
 # card representation, so they are shared with the v1 featuriser rather
@@ -184,11 +184,8 @@ def state_features(states: np.ndarray) -> np.ndarray:
     # The unseen pool is the single most informative derived quantity, and
     # after chain encoding a position can hold up to 4 cards (the off-suit
     # trump-rank tier), so the ceiling is per-position rather than 2.
-    capacity = np.zeros_like(my_hand)
-    capacity[:] = 0
-    ones = np.ones((b, 1, L.NUM_SLOTS), dtype=np.float32) * NUM_DECKS
     rank, suit = _trump(states)
-    capacity = encode_planes(ones, rank, suit)[:, 0]
+    capacity = CAPACITY[rank, suit]
     unseen = np.clip(capacity - my_hand - played.sum(axis=1) - kitty, 0.0, None)
 
     plane_feats = np.concatenate(
