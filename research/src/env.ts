@@ -28,6 +28,7 @@ import {
 import { cardSlot } from './cards';
 import { enumerateCandidates, type Candidate } from './candidates';
 import { summarizeHand, type EpisodeSummary } from './encode';
+import { buildLeaves, type SearchOptions, type SearchResult } from './search';
 
 // A 32-bit mixer, so a deal can be addressed by coordinates rather than by
 // a position in an RNG stream. Duplicate-deal evaluation needs the deal for
@@ -254,6 +255,22 @@ export class GameSlot {
     } finally {
       this.assertNoForcedLead = false;
     }
+  }
+
+  // Positions reachable from the pending decision, for value-guided
+  // search. Null when there is nothing pending or nothing to choose.
+  searchLeaves(opts: SearchOptions): SearchResult | null {
+    const pending = this.pending;
+    const hand = this.state.currentHand;
+    if (pending === null || hand === null || hand.trumpRank === null) return null;
+    return buildLeaves(
+      this.state,
+      pending.seat,
+      pending.candidates,
+      this.buriedKitty,
+      { trumpRank: hand.trumpRank, trumpSuit: hand.trumpSuit },
+      opts,
+    );
   }
 
   // Forced-lead penalties seen on *bot* moves (learner moves throw).

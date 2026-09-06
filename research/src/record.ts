@@ -12,7 +12,7 @@
 
 import { NUM_SLOTS } from './cards';
 
-export const RECORD_VERSION = 4;
+export const RECORD_VERSION = 5;
 
 // ---- Decision record header ------------------------------------------------
 
@@ -39,7 +39,13 @@ export const H_HAND_ID = 24; // u32
 // privileged block is present. Both blocks sit after the planes.
 export const H_HISTORY_LEN = 28; // u8
 export const H_HAS_PRIVILEGED = 29; // u8
-export const HEADER_BYTES = 32; // padded to a multiple of 4
+// Search leaves ride the ordinary record path: a leaf is a record with no
+// candidates, tagged with the candidate it is evidence about and the
+// points the simulated trick settled. 255 means "not a leaf".
+export const H_LEAF_OF = 30; // u8
+export const H_LEAF_POINTS = 32; // i16, signed for the searching seat
+export const NOT_A_LEAF = 255;
+export const HEADER_BYTES = 36; // padded to a multiple of 4
 
 // ---- Card planes -----------------------------------------------------------
 
@@ -264,6 +270,9 @@ export function layoutSpec(): Record<string, unknown> {
       handId: H_HAND_ID,
       historyLen: H_HISTORY_LEN,
       hasPrivileged: H_HAS_PRIVILEGED,
+      leafOf: H_LEAF_OF,
+      leafPoints: H_LEAF_POINTS,
+      notALeaf: NOT_A_LEAF,
     },
     history: {
       steps: HISTORY_STEPS,

@@ -64,6 +64,9 @@ import {
   HISTORY_STEPS,
   H_HAS_PRIVILEGED,
   H_HISTORY_LEN,
+  H_LEAF_OF,
+  H_LEAF_POINTS,
+  NOT_A_LEAF,
   MAX_TRICKS,
   PRIVILEGED_BYTES,
   PLANE_MY_HAND,
@@ -132,6 +135,10 @@ export type DecisionMeta = {
   // the kitty for a centralised critic. Never set this for a record whose
   // decision will be made by the policy in a real game.
   readonly privileged?: boolean;
+  // Search leaf metadata: which candidate this position is evidence for,
+  // and the points the simulated trick settled (signed for this seat).
+  readonly leafOf?: number;
+  readonly leafPoints?: number;
 };
 
 // Writes: u16 recordBytes | header | planes | candidates.
@@ -190,6 +197,9 @@ export function writeDecision(
   header[H_NUM_CANDIDATES] = Math.min(candidates.length, 255);
   header[H_I_AM_ATTACKER] =
     teamOf(state, seat) === teamOf(state, hand.landlord) ? 0 : 1;
+
+  header[H_LEAF_OF] = meta.leafOf === undefined ? NOT_A_LEAF : meta.leafOf;
+  view.setInt16(H_LEAF_POINTS, Math.max(-30000, Math.min(30000, meta.leafPoints ?? 0)), true);
 
   const masks = voidMasks(state, ctx);
   for (let rel = 0; rel < 4; rel++) {

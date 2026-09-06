@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 # The version this Python code was written against.
-LAYOUT_VERSION = 4
+LAYOUT_VERSION = 5
 
 RESEARCH_DIR = Path(__file__).resolve().parents[2]
 SPEC_PATH = RESEARCH_DIR / "spec.json"
@@ -57,6 +57,9 @@ H_GAME_ID: int = _H["gameId"]
 H_HAND_ID: int = _H["handId"]
 H_HISTORY_LEN: int = _H["historyLen"]
 H_HAS_PRIVILEGED: int = _H["hasPrivileged"]
+H_LEAF_OF: int = _H["leafOf"]
+H_LEAF_POINTS: int = _H["leafPoints"]
+NOT_A_LEAF: int = _H["notALeaf"]
 
 _P = SPEC["planes"]
 NUM_PLANES: int = _P["count"]

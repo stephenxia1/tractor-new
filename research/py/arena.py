@@ -48,7 +48,8 @@ from tractor_rl.features2 import (
     parse_episodes,
     split_per_worker,
 )
-from tractor_rl.policies import load_policy
+from tractor_rl.policies import SearchPolicy, load_policy
+from tractor_rl import layout as L
 from tractor_rl.protocol import WorkerConfig, WorkerPool
 
 RESEARCH_DIR = Path(__file__).resolve().parents[1]
@@ -153,6 +154,12 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--max-seconds", type=float, default=1800.0)
+    ap.add_argument("--search-worlds", type=int, default=0,
+                    help="determinized worlds per decision; 0 disables search")
+    ap.add_argument("--search-top", type=int, default=6,
+                    help="candidates searched per decision")
+    ap.add_argument("--search-opponent", type=str, default="smart-v2",
+                    help="rollout policy for the other seats inside a simulation")
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
@@ -171,6 +178,9 @@ def main() -> None:
         preplay=args.preplay,
         baseline=args.opponent,
         randomize=False,
+        search_worlds=args.search_worlds if model is not None else 0,
+        search_top=args.search_top,
+        search_opponent=args.search_opponent,
     )
     configs: list[WorkerConfig] = []
     for i in range(args.worker_pairs):
@@ -197,6 +207,10 @@ def main() -> None:
                 )
             configs.append(cfg)
 
+    if args.search_worlds > 0 and model is not None:
+        model = SearchPolicy(model)
+        print(f"search: {args.search_worlds} worlds x top {args.search_top} candidates, "
+              f"rollouts by {args.search_opponent}")
     pool = WorkerPool(len(configs), base_cfg, configs=configs)
     # Worker order is [pair0-sideA, pair0-sideB, pair1-sideA, ...].
     side_of = ["A" if w % 2 == 0 else "B" for w in range(len(configs))]
@@ -217,7 +231,23 @@ def main() -> None:
                 picks = model.pick(merged)
             else:
                 picks = np.zeros(merged.num_decisions, dtype=np.int64)
-            pool.write_round(batches, split_per_worker(picks, merged.bounds))
+            if isinstance(model, SearchPolicy):
+                # Search frames carry leaves as well as decisions, so the
+                # reply names the games it answers instead of relying on
+                # one record per game.
+                real_rows, _ = model.split(merged)
+                worker_of = np.searchsorted(merged.bounds[1:], real_rows, side="right")
+                states = merged.states[real_rows]
+                gids = (states[:, L.H_GAME_ID].astype(np.int64)
+                        + states[:, L.H_GAME_ID + 1].astype(np.int64) * 256)
+                gid_lists, pick_lists = [], []
+                for w in range(len(batches)):
+                    sel = worker_of == w
+                    gid_lists.append(gids[sel])
+                    pick_lists.append(picks[sel])
+                pool.write_actions(batches, gid_lists, pick_lists)
+            else:
+                pool.write_round(batches, split_per_worker(picks, merged.bounds))
 
             for w, batch in enumerate(batches):
                 for ep in parse_episodes(batch.episodes):
@@ -269,6 +299,12 @@ def main() -> None:
         f"  agent reached 80+ as attacker on {(agent_attack >= 80).mean():.1%} of deals, "
         f"opponent {(opp_attack >= 80).mean():.1%}"
     )
+    if isinstance(model, SearchPolicy):
+        total = model.searched_decisions + model.fallback_decisions
+        print(
+            f"  search: {model.searched_decisions:,}/{total:,} decisions searched "
+            f"({model.leaves_seen:,} leaves), rest forced or unsearched"
+        )
 
 
 if __name__ == "__main__":

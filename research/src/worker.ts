@@ -36,6 +36,11 @@ type Args = {
   baselineBySeat: Array<BotType | undefined>;
   // Training only: emit the other seats' hands for a centralised critic.
   privileged: boolean;
+  // Value-guided search: worlds sampled and candidates searched per
+  // decision. 0 worlds disables it.
+  searchWorlds: number;
+  searchTop: number;
+  searchOpponent: BotType;
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Args {
@@ -75,6 +80,9 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
     fixedLevel: levelRaw === undefined ? undefined : (levelRaw as NaturalRank),
     baselineBySeat,
     privileged: (get('privileged') ?? '0') === '1',
+    searchWorlds: Number(get('search-worlds') ?? '0'),
+    searchTop: Number(get('search-top') ?? '6'),
+    searchOpponent: (get('search-opponent') ?? 'smart-v2') as BotType,
   };
 }
 
@@ -221,6 +229,36 @@ async function main(): Promise<void> {
       );
       pendingSeat.set(slot.gameId, pending.candidates.length);
       nDecisions += 1;
+
+      // Leaves ride the same frame as ordinary records with no candidates,
+      // tagged with the candidate they inform.
+      if (args.searchWorlds > 0) {
+        const result = slot.searchLeaves({
+          worlds: args.searchWorlds,
+          topCandidates: args.searchTop,
+          opponentModel: args.searchOpponent,
+          seed: (slot.gameId + 1) * 7919 + slot.handId,
+        });
+        if (result !== null) {
+          for (const leaf of result.leaves) {
+            writeDecision(
+              writer,
+              leaf.state,
+              {
+                gameId: slot.gameId,
+                handId: slot.handId,
+                seat: pending.seat,
+                myKitty: slot.kitty,
+                privileged: false,
+                leafOf: leaf.candidateIndex,
+                leafPoints: leaf.points,
+              },
+              [],
+            );
+            nDecisions += 1;
+          }
+        }
+      }
     }
     for (const e of episodes) writeEpisode(writer, e);
 

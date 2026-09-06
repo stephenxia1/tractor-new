@@ -1,8 +1,8 @@
 {
-  "version": 4,
+  "version": 5,
   "numSlots": 54,
   "header": {
-    "bytes": 32,
+    "bytes": 36,
     "version": 0,
     "seat": 1,
     "role": 2,
@@ -23,7 +23,10 @@
     "gameId": 22,
     "handId": 24,
     "historyLen": 28,
-    "hasPrivileged": 29
+    "hasPrivileged": 29,
+    "leafOf": 30,
+    "leafPoints": 32,
+    "notALeaf": 255
   },
   "history": {
     "steps": 16,
@@ -34,7 +37,7 @@
   "privileged": {
     "planes": 4,
     "bytes": 216,
-    "stateBytesWith": 980
+    "stateBytesWith": 984
   },
   "planes": {
     "count": 10,
@@ -44,7 +47,7 @@
     "trickBase": 5,
     "myKitty": 9
   },
-  "stateBytes": 764,
+  "stateBytes": 768,
   "candidate": {
     "headerBytes": 4,
     "bytes": 20,

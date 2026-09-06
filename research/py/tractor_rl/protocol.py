@@ -51,6 +51,10 @@ class WorkerConfig:
     alt_seats: int = 0
     # Training only: emit the other seats' hands for the centralised critic.
     privileged: bool = False
+    # Value-guided search at decision time; 0 worlds disables it.
+    search_worlds: int = 0
+    search_top: int = 6
+    search_opponent: str = "smart-v2"
 
 
 class Worker:
@@ -84,6 +88,12 @@ class Worker:
             args += ["--fixed-level", str(config.fixed_level)]
         if config.privileged:
             args += ["--privileged", "1"]
+        if config.search_worlds > 0:
+            args += [
+                "--search-worlds", str(config.search_worlds),
+                "--search-top", str(config.search_top),
+                "--search-opponent", config.search_opponent,
+            ]
         if config.baseline_alt is not None:
             args += ["--baseline-alt", config.baseline_alt, "--alt-seats", str(config.alt_seats)]
         self.index = index
@@ -209,6 +219,15 @@ class WorkerPool:
         for worker, batch, picks in zip(self.workers, batches, choices):
             game_ids = game_ids_of(batch)
             worker.send_actions(game_ids, picks)
+
+    def write_actions(self, batches, game_ids_list, picks_list) -> None:
+        """Reply with an explicit game-id list per worker.
+
+        Search frames carry more records than games -- the leaves -- so the
+        reply cannot be positional: it names the games it answers.
+        """
+        for worker, gids, picks in zip(self.workers, game_ids_list, picks_list):
+            worker.send_actions(gids, picks)
 
     def close(self) -> None:
         for w in self.workers:
