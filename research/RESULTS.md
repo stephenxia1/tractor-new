@@ -109,14 +109,9 @@ End-to-end loop, random policy, `py/smoke_protocol.py`:
 | 4 × 32 | 4,087 | 42 |
 | 4 × 96 | 4,815 | 39 |
 
-Throughput does not improve past ~4 workers: Python featurises and scores
-serially while workers idle, and vice versa (measured 50.6% / 47.2%). The
-`WorkerPool` group-rotation path exists to overlap them but has not been
-benchmarked yet.
-
-With the network in the loop (`py/train_dmc.py`, 3 workers × 64 games,
-0.74M params): **1,550 decisions/s, ~20 hands/s**, time split
-env 12% / features 6% / forward 36% / learn 44%.
+Those were measured before the group-rotation and thread findings above,
+with a random policy and torch idle; the sweep table supersedes them for
+anything with the network in the loop.
 
 ## Agent results
 

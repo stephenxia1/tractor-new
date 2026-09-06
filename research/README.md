@@ -39,7 +39,7 @@ Measured on the dev laptop (i7-1270P, 16 threads, no GPU):
 | PyTorch training step | ~3.5k samples/s |
 | numpy featurisation | ~12k decisions/s in-loop |
 | Wire volume | ~0.7 KB/decision |
-| **End-to-end training loop** | **~1.5–2k decisions/s, ~20 hands/s** |
+| **End-to-end training loop** | **~4k decisions/s, ~56 hands/s** (tuned; see RESULTS.md) |
 
 The network, not TypeScript, is the bottleneck; on a GPU box the actors
 become the constraint and scale by adding workers.
@@ -124,22 +124,31 @@ non-linear objective.
 
 ---
 
-## Status and next steps
+## Status
 
-Working end to end: environment, wire protocol, featurisation, Q-net, DMC
-learner, checkpointing. A 1.8-minute smoke run played 2,218 hands and took
-351 learner steps with the loss trending down.
+Working end to end and measured — see [`RESULTS.md`](./RESULTS.md) for every
+number, including how the evaluation harness was validated before any agent
+result was believed.
 
-Not built yet, in priority order:
+- **Duplicate-deal arena** (`py/arena.py`): each deal played twice with the
+  teams swapped, scored on point and level margins with 95% CIs. Verified
+  by a null test (same bot both sides ⇒ exactly 0.00 on 96/96 pairs) and by
+  reproducing known gaps (`smart` vs `random` +84 pts).
+- **Deterministic deals** (`src/dupcheck.ts`): 3,888 cards compared
+  card-for-card across paired runs, plus negative controls.
+- **Trained agent**: a 20-minute pilot moved the net from −17.4 (untrained,
+  worse than random) to **+62.4 pts vs `random`** over 252 pairs.
+- **Throughput**: tuned from 1.4k to ~4.1k decisions/s. The dominant term
+  was torch thread count starving the Node actors, not the loop structure.
 
-1. **Duplicate-deal evaluation.** Play each deal twice with teams swapped
-   and compare point differentials. The `smart-v*` lineage was repeatedly
-   misled by 32-game matches (v28 benchmarked 56% then 25% on re-run);
-   pairing removes the deal luck that caused those reversals.
-2. **Baseline benchmarks** vs `random`, `lowball`, `smart-v18`, `smart-v34`.
-3. **Throughput work**: overlap worker compute with Python compute
-   (currently serialised — the biggest single win), faster featurisation,
-   torch thread tuning.
-4. **Learned pre-play**: kitty burial as 8 sequential card choices, then
-   declaration.
-5. **Bot adapter** so a trained checkpoint can fill a seat in the web app.
+## Next steps
+
+1. **Longer training**, then evaluate against the real opponents. Budget
+   matters: `smart-v18`/`v34` cost ~70 s/hand to play against (~50
+   hands/hour/worker), so a 200-pair match is an ~8 worker-hour job.
+   `smart-v13` at 12 s/hand is the affordable middle rung.
+2. **Faster featurisation / GPU path**. `--device cuda` is wired but
+   untested; featurisation would need to move onto the device with it.
+3. **Learned pre-play**: kitty burial as 8 sequential card choices, then
+   declaration. Both are currently `smart-v34`'s job.
+4. **Bot adapter** so a trained checkpoint can fill a seat in the web app.
