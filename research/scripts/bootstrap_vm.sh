@@ -16,6 +16,11 @@
 
 set -euo pipefail
 
+# GPU images usually run as root with no sudo installed, and often ship
+# torch already. Both are handled rather than assumed.
+if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
+SKIP_VENV="${SKIP_VENV:-0}"
+
 REPO_URL="${REPO_URL:-https://github.com/stephenxia1/tractor-new.git}"
 BRANCH="${BRANCH:-rl-research}"
 WORKDIR="${WORKDIR:-$HOME/tractor-new}"
@@ -43,11 +48,11 @@ done
 
 echo "==> installing system packages"
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | cut -c2-3)" -lt 20 ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash -
+  $SUDO apt-get install -y nodejs
 fi
-sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends git python3 python3-pip python3-venv
+$SUDO apt-get update -qq
+$SUDO apt-get install -y --no-install-recommends git python3 python3-pip python3-venv
 
 echo "==> fetching $BRANCH"
 if [[ -d "$WORKDIR/.git" ]]; then
@@ -63,14 +68,22 @@ echo "==> installing node workspace deps"
 npm ci --include=dev --silent
 
 echo "==> installing python deps"
-python3 -m venv "$WORKDIR/.venv" 2>/dev/null || true
-# shellcheck disable=SC1091
-source "$WORKDIR/.venv/bin/activate"
-pip install --quiet --upgrade pip
-if [[ -n "${CUDA_INDEX:-}" ]]; then
-  pip install --quiet numpy "torch>=2.0" --index-url "$CUDA_INDEX"
+# On a GPU image that already ships a CUDA torch, reinstalling it into a
+# venv costs several minutes and ~2.5GB for no benefit: SKIP_VENV=1 uses
+# what is there and only adds what is missing.
+if [[ "$SKIP_VENV" == "1" ]] && python3 -c "import torch" 2>/dev/null; then
+  echo "    using preinstalled torch ($(python3 -c 'import torch; print(torch.__version__)'))"
+  python3 -c "import numpy" 2>/dev/null || pip3 install --quiet numpy
 else
-  pip install --quiet numpy "torch>=2.0" --index-url https://download.pytorch.org/whl/cpu
+  python3 -m venv "$WORKDIR/.venv" 2>/dev/null || true
+  # shellcheck disable=SC1091
+  source "$WORKDIR/.venv/bin/activate"
+  pip install --quiet --upgrade pip
+  if [[ -n "${CUDA_INDEX:-}" ]]; then
+    pip install --quiet numpy "torch>=2.0" --index-url "$CUDA_INDEX"
+  else
+    pip install --quiet numpy "torch>=2.0" --index-url https://download.pytorch.org/whl/cpu
+  fi
 fi
 
 cd "$WORKDIR/research"
