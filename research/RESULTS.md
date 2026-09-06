@@ -199,6 +199,32 @@ optimises steps/s at a sane replay ratio instead of decisions/s:
 Chose the first: fresh data at replay 0.79 rather than 2.4x the steps
 grinding each sample seven times.
 
+### First cloud run (in progress)
+
+`c7i.8xlarge`, 10 workers / 22 threads, replay 0.79. After **80 minutes**:
+1.9M hands, 122M decisions, **190k gradient steps** — 15x the hands and
+8.6x the steps of the laptop's entire 8-hour run. Training loss hovers
+between 0.67 and 0.92 rather than falling, which is what DMC looks like
+when the policy keeps shifting the target distribution; the arena is the
+progress signal, not the loss.
+
+Evaluated greedily on duplicate deals at the 190k-step checkpoint:
+
+| opponent | point margin (95% CI) | level margin | pairs better |
+| --- | --- | --- | --- |
+| `random` | **+89.13** [+84.31, +93.94] | +2.20 | 250 / 1 worse |
+| `smart` (v1) | **+14.88** [+10.27, +19.49] | +0.40 | 157 / 86 worse |
+| `smart-v2` | -0.96 [-6.02, +4.10] | +0.04 | 116 / 128 worse |
+
+For reference, `smart` itself scores +83.96 against `random`, so the agent
+has passed the multi-heuristic bot outright and drawn level with
+`smart-v2`, the 1-ply search bot that beat `smart` 116-4 in the original
+lineage. The progression on this measure:
+
+    untrained            -17.4  vs random
+    20 min / 1.5k steps  +62.4  vs random
+    80 min / 190k steps  +89.1  vs random   (> smart's +84.0)
+
 ### What a serious run costs here
 
 At the measured ~1,900 decisions/s and ~5 learner steps/s, the laptop
