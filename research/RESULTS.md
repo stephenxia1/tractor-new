@@ -161,10 +161,50 @@ because duplicate-deal evaluations were running on the same box and
 starved the workers. Training and evaluation should not share this
 machine — the throughput numbers above assume exclusive use.
 
+## Moving to AWS (2026-09-05)
+
+A `c7i.8xlarge` spot instance (32 vCPU Sapphire Rapids, $0.616/hr) runs the
+same loop **17x faster than the laptop**, far beyond the 3-5x I estimated:
+
+| | laptop (sustained) | c7i.8xlarge |
+| --- | --- | --- |
+| decisions/s | ~1,900 | **24,300** |
+| hands/s | ~26 | **381** |
+| learner steps/s | ~5 | **36** |
+| loop split env/feat/fwd/learn | 2/6/39/51 | 9/24/19/36 |
+
+The split is the explanation. On the laptop torch was 90% of the loop; here
+it is 55%. Sapphire Rapids has AVX-512, which the i7-1270P has fused off,
+and it holds its clocks instead of dropping to base under sustained load.
+The laptop was not merely smaller, it was running the arithmetic-heavy half
+of this workload without the instructions for it.
+
+**Featurisation is the next ceiling, as predicted.** It was 6% of the loop
+on the laptop and is 24% here, because it is numpy on the host and does not
+speed up when torch does. On a GPU box it would dominate, so moving it onto
+the device is the prerequisite for GPU work rather than an optimisation
+after it.
+
+**Tuning flipped objective.** With 24k decisions/s the environment stopped
+being the constraint and gradient steps became scarce, so `py/tune_learner.py`
+optimises steps/s at a sane replay ratio instead of decisions/s:
+
+| config | dec/s | steps/s | replay |
+| --- | --- | --- | --- |
+| 10 workers / 22 threads, every2 x1 | 24,866 | 38.3 | 0.79 |
+| 8 / 24, every1 x2 | 10,516 | 79.7 | 3.88 |
+| 8 / 24, every1 x4 | 6,351 | 92.4 | 7.45 |
+| 5 / 27, every1 x4, batch 1024 | 4,170 | 62.6 | 15.36 |
+
+Chose the first: fresh data at replay 0.79 rather than 2.4x the steps
+grinding each sample seven times.
+
 ### What a serious run costs here
 
-At the measured ~1,800 decisions/s and ~2.3 learner steps/s, the laptop
-delivers roughly **150k hands and 200k gradient steps per day**. DouZero
+At the measured ~1,900 decisions/s and ~5 learner steps/s, the laptop
+delivers roughly **150k hands and 200k gradient steps per day**; the
+8-hour laptop run reached 1.9h, 184908 hands, 31811 steps, loss 0.62555 before being superseded. The AWS box
+delivers ~33M hands and ~3M steps per day for about $15. DouZero
 needed on the order of 10^7-10^8 games for Dou Dizhu, so this hardware can
 reach a decent heuristic-beating agent overnight at best, and the case for
 moving training to a GPU box is mostly a case about gradient steps per
