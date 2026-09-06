@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -83,21 +84,51 @@ def run_one(workers: int, games: int, threads: int, groups: int, seconds: float)
     }
 
 
+def build_configs(cores: int) -> list[tuple[int, int, int, int]]:
+    """Configurations to try, scaled to the machine.
+
+    The split that matters is how many cores go to the Node actors versus
+    torch: on the dev laptop the wrong split cost 3x, and the crossover is
+    machine-specific, so the sweep brackets it rather than assuming it.
+    Games per worker is chosen to keep the per-round batch near 400-800
+    decisions, which is what the forward pass wants.
+    """
+    cores = max(4, cores)
+    out: list[tuple[int, int, int, int]] = []
+    for worker_share in (0.5, 0.65, 0.8):
+        workers = max(2, int(round(cores * worker_share)))
+        threads = max(2, cores - workers)
+        games = max(16, int(round(512 / max(workers, 1))) * 2)
+        out.append((workers, games, threads, 2))
+        out.append((workers, games, threads, 1))
+    # A torch-heavy corner, in case the learner rather than the actors is
+    # the binding constraint (likely on a GPU box).
+    workers = max(2, cores // 3)
+    out.append((workers, 96, max(2, cores - workers), 2))
+    # Deduplicate while preserving order.
+    seen: set[tuple[int, int, int, int]] = set()
+    unique = []
+    for cfg in out:
+        if cfg in seen:
+            continue
+        seen.add(cfg)
+        unique.append(cfg)
+    return unique
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=75.0, help="per configuration")
+    ap.add_argument(
+        "--cores",
+        type=int,
+        default=0,
+        help="override the detected core count when sizing the sweep",
+    )
     args = ap.parse_args()
 
-    configs = [
-        # (workers, games, threads, groups)
-        (4, 96, 8, 1),  # the current default, for reference
-        (4, 96, 8, 2),  # same, with worker/Python overlap
-        (6, 64, 8, 2),
-        (6, 64, 6, 2),
-        (8, 48, 6, 2),
-        (4, 192, 8, 2),
-        (3, 128, 10, 1),
-    ]
+    configs = build_configs(args.cores or os.cpu_count() or 8)
+    print(f"sweeping {len(configs)} configurations on {os.cpu_count()} logical cores\n")
     results = []
     for workers, games, threads, groups in configs:
         started = time.perf_counter()
