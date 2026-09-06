@@ -56,14 +56,17 @@ Per-hand cost when a bot fills two of the four seats (laptop, one worker):
 | --- | --- | --- |
 | `random`, `lowball`, `point-hoarder`, `smart` | 0.01-0.02 | 150k-350k |
 | `smart-v2` | 0.03 | 135k |
-| `smart-v13` | 12.2 | 296 |
+| `smart-v13` | 12.2 (3.8 uncontended) | 296 |
 | `smart-v34` | 69.2 | 52 |
 | `smart-v18` | 75.2 | 48 |
 
 The determinization-search bots are ~3 orders of magnitude more expensive
 than the heuristics, so evaluation against them has to be budgeted rather
 than run casually: 200 duplicate pairs (400 hands) against `smart-v34`
-costs ~8 worker-hours. An initial attempt at exactly that was abandoned
+costs ~8 worker-hours. Caveat on this table: it was measured while other
+work shared the laptop, and it overstates the cost by roughly 3x — a later
+uncontended `smart-v13` evaluation ran 245 hands in 2.6 minutes across 6
+workers (~3.8 s/hand), against the 12.2 s/hand predicted here. An initial attempt at exactly that was abandoned
 after 19 minutes without completing its first round.
 
 ## Throughput (laptop)
@@ -215,6 +218,7 @@ Evaluated greedily on duplicate deals at the 190k-step checkpoint:
 | `random` | **+89.13** [+84.31, +93.94] | +2.20 | 250 / 1 worse |
 | `smart` (v1) | **+14.88** [+10.27, +19.49] | +0.40 | 157 / 86 worse |
 | `smart-v2` | -0.96 [-6.02, +4.10] | +0.04 | 116 / 128 worse |
+| `smart-v13` | **+15.46** [+9.02, +21.89] | +0.37 | 74 / 36 worse |
 
 For reference, `smart` itself scores +83.96 against `random`, so the agent
 has passed the multi-heuristic bot outright and drawn level with
@@ -224,6 +228,11 @@ lineage. The progression on this measure:
     untrained            -17.4  vs random
     20 min / 1.5k steps  +62.4  vs random
     80 min / 190k steps  +89.1  vs random   (> smart's +84.0)
+
+Beating `smart-v13` is the more meaningful of these: it is the first
+*fair-play* bot in the lineage, the one that established masking opponent
+hands via determinization, and it costs ~3 orders of magnitude more
+compute per decision than the agent does.
 
 ### What a serious run costs here
 
