@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 # The version this Python code was written against.
-LAYOUT_VERSION = 3
+LAYOUT_VERSION = 4
 
 RESEARCH_DIR = Path(__file__).resolve().parents[2]
 SPEC_PATH = RESEARCH_DIR / "spec.json"
@@ -55,6 +55,8 @@ H_I_AM_ATTACKER: int = _H["iAmAttacker"]
 H_VOID_MASK: int = _H["voidMask"]
 H_GAME_ID: int = _H["gameId"]
 H_HAND_ID: int = _H["handId"]
+H_HISTORY_LEN: int = _H["historyLen"]
+H_HAS_PRIVILEGED: int = _H["hasPrivileged"]
 
 _P = SPEC["planes"]
 NUM_PLANES: int = _P["count"]
@@ -65,6 +67,18 @@ PLANE_TRICK_BASE: int = _P["trickBase"]
 PLANE_MY_KITTY: int = _P["myKitty"]
 
 STATE_BYTES: int = SPEC["stateBytes"]
+
+_HIST = SPEC["history"]
+HISTORY_STEPS: int = _HIST["steps"]
+HISTORY_MAX_CARDS: int = _HIST["maxCards"]
+HISTORY_STEP_BYTES: int = _HIST["stepBytes"]
+HISTORY_BYTES: int = _HIST["bytes"]
+
+# Training only -- see features2.privileged_features.
+_PRIV = SPEC["privileged"]
+PRIVILEGED_PLANES: int = _PRIV["planes"]
+PRIVILEGED_BYTES: int = _PRIV["bytes"]
+STATE_BYTES_PRIVILEGED: int = _PRIV["stateBytesWith"]
 
 _C = SPEC["candidate"]
 CANDIDATE_HEADER_BYTES: int = _C["headerBytes"]

@@ -1,8 +1,8 @@
 {
-  "version": 3,
+  "version": 4,
   "numSlots": 54,
   "header": {
-    "bytes": 28,
+    "bytes": 32,
     "version": 0,
     "seat": 1,
     "role": 2,
@@ -21,7 +21,20 @@
     "iAmAttacker": 17,
     "voidMask": 18,
     "gameId": 22,
-    "handId": 24
+    "handId": 24,
+    "historyLen": 28,
+    "hasPrivileged": 29
+  },
+  "history": {
+    "steps": 16,
+    "maxCards": 8,
+    "stepBytes": 12,
+    "bytes": 192
+  },
+  "privileged": {
+    "planes": 4,
+    "bytes": 216,
+    "stateBytesWith": 980
   },
   "planes": {
     "count": 10,
@@ -31,7 +44,7 @@
     "trickBase": 5,
     "myKitty": 9
   },
-  "stateBytes": 568,
+  "stateBytes": 764,
   "candidate": {
     "headerBytes": 4,
     "bytes": 20,

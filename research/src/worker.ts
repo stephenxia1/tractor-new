@@ -34,6 +34,8 @@ type Args = {
   fixedLandlord: Seat | undefined;
   fixedLevel: NaturalRank | undefined;
   baselineBySeat: Array<BotType | undefined>;
+  // Training only: emit the other seats' hands for a centralised critic.
+  privileged: boolean;
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Args {
@@ -72,6 +74,7 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
       landlordRaw === undefined ? undefined : (Number(landlordRaw) as Seat),
     fixedLevel: levelRaw === undefined ? undefined : (levelRaw as NaturalRank),
     baselineBySeat,
+    privileged: (get('privileged') ?? '0') === '1',
   };
 }
 
@@ -212,6 +215,7 @@ async function main(): Promise<void> {
           handId: slot.handId,
           seat: pending.seat,
           myKitty: slot.kitty,
+          privileged: args.privileged,
         },
         pending.candidates,
       );

@@ -14,6 +14,8 @@ import {
   ByteWriter,
   CANDIDATE_BYTES,
   EPISODE_BYTES,
+  HISTORY_BYTES,
+  H_HISTORY_LEN,
   H_HAND_SIZE,
   H_IS_LEAD,
   H_NUM_CANDIDATES,
@@ -145,7 +147,8 @@ function checkRecord(
   if (header[H_NUM_CANDIDATES] !== numCandidates) {
     throw new Error('candidate count mismatch in record');
   }
-  const expectedBytes = HEADER_BYTES + PLANES_BYTES + numCandidates * CANDIDATE_BYTES;
+  const expectedBytes =
+    HEADER_BYTES + PLANES_BYTES + HISTORY_BYTES + numCandidates * CANDIDATE_BYTES;
   if (declared !== expectedBytes) {
     throw new Error(`record is ${declared} bytes, layout says ${expectedBytes}`);
   }
@@ -156,6 +159,10 @@ function checkRecord(
   const handSize = (handState.hands[seat] ?? []).length;
   if (header[H_HAND_SIZE] !== handSize) throw new Error('hand size mismatch');
 
+  // History length must never exceed the window.
+  if (header[H_HISTORY_LEN]! > 16) {
+    throw new Error(`history length ${header[H_HISTORY_LEN]} exceeds the window`);
+  }
   // Plane 0 must be exactly the acting seat's hand.
   const planes = buf.subarray(2 + HEADER_BYTES, 2 + HEADER_BYTES + PLANES_BYTES);
   let planeTotal = 0;

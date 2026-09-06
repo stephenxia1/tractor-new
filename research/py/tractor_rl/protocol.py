@@ -19,7 +19,7 @@ from typing import Iterable
 import numpy as np
 
 from . import layout as L
-from .features import Batch, parse_frame
+from .features2 import Batch, parse_frame
 
 RESEARCH_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = RESEARCH_DIR.parent
@@ -49,6 +49,8 @@ class WorkerConfig:
     # Lets one team be filled by a different heuristic from the other.
     baseline_alt: str | None = None
     alt_seats: int = 0
+    # Training only: emit the other seats' hands for the centralised critic.
+    privileged: bool = False
 
 
 class Worker:
@@ -80,6 +82,8 @@ class Worker:
             args += ["--fixed-landlord", str(config.fixed_landlord)]
         if config.fixed_level is not None:
             args += ["--fixed-level", str(config.fixed_level)]
+        if config.privileged:
+            args += ["--privileged", "1"]
         if config.baseline_alt is not None:
             args += ["--baseline-alt", config.baseline_alt, "--alt-seats", str(config.alt_seats)]
         self.index = index

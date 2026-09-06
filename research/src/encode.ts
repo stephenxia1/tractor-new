@@ -58,7 +58,14 @@ import {
   H_VOID_MASK,
   H_WINNER_REL,
   HEADER_BYTES,
+  HISTORY_BYTES,
+  HISTORY_MAX_CARDS,
+  HISTORY_STEP_BYTES,
+  HISTORY_STEPS,
+  H_HAS_PRIVILEGED,
+  H_HISTORY_LEN,
   MAX_TRICKS,
+  PRIVILEGED_BYTES,
   PLANE_MY_HAND,
   PLANE_MY_KITTY,
   PLANE_PLAYED_BASE,
@@ -121,6 +128,10 @@ export type DecisionMeta = {
   readonly handId: number;
   readonly seat: Seat;
   readonly myKitty: ReadonlyArray<Card>;
+  // Training only. When true the record carries the other seats' hands and
+  // the kitty for a centralised critic. Never set this for a record whose
+  // decision will be made by the policy in a real game.
+  readonly privileged?: boolean;
 };
 
 // Writes: u16 recordBytes | header | planes | candidates.
@@ -206,6 +217,53 @@ export function writeDecision(
   }
   if (seat === hand.landlord && meta.myKitty.length > 0) {
     addToPlane(meta.myKitty, planes, PLANE_MY_KITTY * NUM_SLOTS);
+  }
+
+  // ---- move history (most recent last) ----
+  // Ordering, timing and authorship, which the aggregate planes drop.
+  type Step = { seat: Seat; cards: ReadonlyArray<Card>; trickIndex: number; pos: number };
+  const steps: Step[] = [];
+  hand.tricks.forEach((t, ti) => {
+    t.plays.forEach((p, pi) => {
+      steps.push({ seat: p.seat, cards: p.cards, trickIndex: ti, pos: pi });
+    });
+  });
+  if (trick !== null) {
+    trick.plays.forEach((p, pi) => {
+      steps.push({ seat: p.seat, cards: p.cards, trickIndex: hand.tricks.length, pos: pi });
+    });
+  }
+  const recent = steps.slice(-HISTORY_STEPS);
+  const historyBuf = w.claim(HISTORY_BYTES);
+  recent.forEach((step, i) => {
+    const off = i * HISTORY_STEP_BYTES;
+    const n = Math.min(step.cards.length, HISTORY_MAX_CARDS);
+    historyBuf[off] = n;
+    historyBuf[off + 1] = (step.seat - seat + numPlayers) % numPlayers;
+    historyBuf[off + 2] = Math.min(step.trickIndex, 255);
+    historyBuf[off + 3] = step.pos;
+    for (let c = 0; c < n; c++) {
+      historyBuf[off + 4 + c] = cardSlot(step.cards[c]!);
+    }
+    for (let c = n; c < HISTORY_MAX_CARDS; c++) {
+      historyBuf[off + 4 + c] = NO_CARD;
+    }
+  });
+  for (let i = recent.length; i < HISTORY_STEPS; i++) {
+    const off = i * HISTORY_STEP_BYTES;
+    for (let c = 0; c < HISTORY_MAX_CARDS; c++) historyBuf[off + 4 + c] = NO_CARD;
+  }
+  header[H_HISTORY_LEN] = recent.length;
+
+  // ---- privileged block (training only) ----
+  header[H_HAS_PRIVILEGED] = meta.privileged === true ? 1 : 0;
+  if (meta.privileged === true) {
+    const priv = w.claim(PRIVILEGED_BYTES);
+    for (let rel = 1; rel < numPlayers; rel++) {
+      const other = (seat + rel) % numPlayers;
+      addToPlane(hand.hands[other] ?? [], priv, (rel - 1) * NUM_SLOTS);
+    }
+    addToPlane(hand.kitty, priv, 3 * NUM_SLOTS);
   }
 
   // ---- candidates (fixed width, padded) ----

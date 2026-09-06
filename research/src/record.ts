@@ -12,7 +12,7 @@
 
 import { NUM_SLOTS } from './cards';
 
-export const RECORD_VERSION = 3;
+export const RECORD_VERSION = 4;
 
 // ---- Decision record header ------------------------------------------------
 
@@ -35,7 +35,11 @@ export const H_I_AM_ATTACKER = 17; // u8
 export const H_VOID_MASK = 18; // u8[4] per relative seat: bit0..3 suits, bit4 trump
 export const H_GAME_ID = 22; // u16
 export const H_HAND_ID = 24; // u32
-export const HEADER_BYTES = 28;
+// Number of history steps written (0..HISTORY_STEPS) and whether the
+// privileged block is present. Both blocks sit after the planes.
+export const H_HISTORY_LEN = 28; // u8
+export const H_HAS_PRIVILEGED = 29; // u8
+export const HEADER_BYTES = 32; // padded to a multiple of 4
 
 // ---- Card planes -----------------------------------------------------------
 
@@ -46,7 +50,34 @@ export const PLANE_MY_KITTY = 9; // cards I buried (landlord only; zeros otherwi
 export const NUM_PLANES = 10;
 
 export const PLANES_BYTES = NUM_PLANES * NUM_SLOTS; // 540
-export const STATE_BYTES = HEADER_BYTES + PLANES_BYTES; // 568
+
+// ---- Move history ----------------------------------------------------------
+//
+// The planes say *what* has been played; they cannot say in what order, by
+// whom, or when. A causal-attention encoder over the recent move sequence
+// gets that back. Cards per move are capped: a longer play still appears,
+// truncated, because history is context rather than ground truth.
+
+export const HISTORY_STEPS = 16;
+export const HISTORY_MAX_CARDS = 8;
+// Per step: u8 nCards, u8 seatRel, u8 trickIndex, u8 posInTrick, then slots.
+export const HISTORY_STEP_BYTES = 4 + HISTORY_MAX_CARDS; // 12
+export const HISTORY_BYTES = HISTORY_STEPS * HISTORY_STEP_BYTES; // 192
+
+// ---- Privileged block (TRAINING ONLY) --------------------------------------
+//
+// The other three seats' hands and the kitty, in relative-seat order. This
+// exists so a centralised critic can be trained on full information
+// (rules.md has nothing to say about it -- it is a learning device, not a
+// game concept). It must never reach the policy: it is written only when
+// the worker is started with --privileged, and the Python featuriser keeps
+// it behind a separate function that the policy path does not call.
+
+export const PRIVILEGED_PLANES = 4; // three opponents (relative) + kitty
+export const PRIVILEGED_BYTES = PRIVILEGED_PLANES * NUM_SLOTS; // 216
+
+export const STATE_BYTES = HEADER_BYTES + PLANES_BYTES + HISTORY_BYTES; // 764
+export const STATE_BYTES_PRIVILEGED = STATE_BYTES + PRIVILEGED_BYTES; // 980
 
 // ---- Candidate encoding ----------------------------------------------------
 
@@ -231,6 +262,19 @@ export function layoutSpec(): Record<string, unknown> {
       voidMask: H_VOID_MASK,
       gameId: H_GAME_ID,
       handId: H_HAND_ID,
+      historyLen: H_HISTORY_LEN,
+      hasPrivileged: H_HAS_PRIVILEGED,
+    },
+    history: {
+      steps: HISTORY_STEPS,
+      maxCards: HISTORY_MAX_CARDS,
+      stepBytes: HISTORY_STEP_BYTES,
+      bytes: HISTORY_BYTES,
+    },
+    privileged: {
+      planes: PRIVILEGED_PLANES,
+      bytes: PRIVILEGED_BYTES,
+      stateBytesWith: STATE_BYTES_PRIVILEGED,
     },
     planes: {
       count: NUM_PLANES,

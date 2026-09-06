@@ -165,7 +165,11 @@ def state_features(states: np.ndarray) -> np.ndarray:
         return np.zeros((0, STATE_DIM), dtype=np.float32)
 
     header = states[:, : L.HEADER_BYTES]
-    planes = states[:, L.HEADER_BYTES :].reshape(b, L.NUM_PLANES, L.NUM_SLOTS)
+    # Explicit slice, not the tail: v4 records carry history (and possibly
+    # privileged) blocks after the planes, and this v1 featuriser must keep
+    # working so checkpoints trained on it stay evaluable.
+    planes = states[:, L.HEADER_BYTES : L.HEADER_BYTES + L.PLANES_BYTES]
+    planes = planes.reshape(b, L.NUM_PLANES, L.NUM_SLOTS)
 
     trump_suit = header[:, L.H_TRUMP_SUIT].astype(np.int64)
     perm = SUIT_PERM[trump_suit]  # [B, 54]
