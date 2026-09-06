@@ -272,11 +272,41 @@ learner steps/s against v1's 38** -- roughly 4x fewer gradient steps per
 hour, split env 4 / features 26 / forward 22 / learn 46. So v2 has to be
 worth about 4 steps of v1 per step of its own. That is the experiment.
 
-**Early diagnostics** (420 steps): the privileged critic already explains
-~60% of the target's spread (`target_std` 0.68 vs `critic_residual_std`
-0.27), and the belief head predicts opponents' card positions at 84%.
-Those are the two mechanisms the design rests on, both confirmed live
-rather than assumed.
+**Diagnostics over 107k steps**: the privileged critic explains ~63% of
+the target's spread throughout (`target_std` ~0.57 vs
+`critic_residual_std` ~0.21), and belief accuracy climbed 0.847 -> 0.879.
+Both mechanisms the design rests on held up for the whole run rather than
+just at the start.
+
+### v2 vs v1 on the ladder
+
+v2 at **107k steps / 4.0h** against v1 at **190k steps / 1.3h** -- v2 had
+*fewer* gradient steps, since it runs ~4x slower per step:
+
+| opponent | v1 | v2 |
+| --- | --- | --- |
+| `random` | +89.13 | **+95.33** [+88.90, +101.76] |
+| `smart-v2` | -0.96 (tie) | **+17.40** [+11.74, +23.06] |
+| `smart-v13` | +15.46 | **+20.53** [+13.23, +27.83] |
+| `smart-v18` | **-10.20** (loss) | **+1.90** [-4.17, +7.97] (tie) |
+
+v2 is ahead on every rung, and the one that matters is the last: v1 lost
+to the deployed fair-play peak by 10 points, v2 draws level with it. Since
+v2 took *fewer* gradient steps to get there, the gain is sample
+efficiency -- the architecture and the target -- rather than compute.
+
+Reading the v18 row honestly: a tie, not a win. The CI spans zero and 120
+pairs is a small sample against an expensive opponent. What can be said is
+that the 10-point deficit is gone.
+
+### The run was cut short
+
+The spot instance was reclaimed at ~7.9h uptime, 4.0h into a 9h v2 run.
+Nothing was lost: checkpoints and metrics mirror to S3 every 20 minutes,
+so the 107k-step checkpoint and the full curve survived the instance.
+Total spend ~$4.90. The lesson for next time is in the setup rather than
+the outcome -- the box carried a 20h self-terminate while the run was 9h,
+so an uninterrupted instance would have idled ~7h on the meter.
 
 ### What a serious run costs here
 
