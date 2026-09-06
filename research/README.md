@@ -88,6 +88,48 @@ to `runs/<run>.jsonl`.
 
 ---
 
+## Running in the cloud
+
+The laptop runs this loop at **base clock** under sustained load: 70-second
+benchmarks report ~4.1k decisions/s, but an hour-long run settles at
+~1.9k. A server CPU (or any box that holds its clocks) is worth roughly 2x
+before any extra cores are counted.
+
+Two ways to stand a box up, both from the `rl-research` branch:
+
+```sh
+# 1. Bare VM (Ubuntu/Debian), leaves training running after you disconnect
+bash research/scripts/bootstrap_vm.sh --workers 24 --games 64 --threads 12 --minutes 1440
+
+# 2. Container (build from the repo root, not from research/)
+docker build -f research/Dockerfile -t tractor-train .
+docker run --rm -v $PWD/out:/app/research/checkpoints tractor-train     --workers 12 --games 64 --threads 8 --groups 2 --minutes 600
+```
+
+Both verify the stack (`dupcheck`, `selftest`, return tests) before
+starting, so a broken image fails in seconds rather than after an hour.
+`bootstrap_vm.sh` switches to `--device cuda` automatically when torch sees
+a GPU. `research/scripts/publish_progress.sh <run>` pushes metrics and the
+latest checkpoint to a `training-progress` branch so another machine can
+pull them.
+
+**Sizing.** The tuned loop splits roughly 50% learner / 40% acting forward
+pass / 6% featurisation / 2% environment, so it is torch-bound, and a GPU
+is worth having. But the Node workers need about a core each to feed it:
+prefer ~16 vCPU alongside a modest GPU over 8 vCPU alongside a large one.
+Do not port the thread settings — on any new box run
+`python3 py/sweep_throughput.py`, because the actor/torch thread split was
+worth 3x here and is machine-specific.
+
+**What to expect from a GPU.** Two things currently sized for a CPU will
+need attention before one is saturated: the per-round batch (~384
+decisions, ~2,700 candidate rows) is small, so raise games-in-flight; and
+featurisation is numpy on the host, which is 6% of the loop now but becomes
+the ceiling once the forward pass gets 10x faster. The wire format ships
+raw bytes precisely so featurisation can move onto the device.
+
+---
+
 ## Design notes
 
 **Episodes are single hands.** Landlord seat and both team levels are

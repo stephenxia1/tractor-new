@@ -94,6 +94,14 @@ training loop, exclusive use of the machine):
 | 3 × 128 | 10 | 1 | 1,324 | 19.0 |
 | 6 × 64 | 8 | 2 | 1,194 | 12.8 |
 
+**These are burst numbers.** Each setting ran 70 s, which fits inside the
+laptop's turbo window. A sustained run at the winning setting (6 x 64, 6
+threads, 2 groups) settles at **~1,900 decisions/s, ~26 hands/s** — 2.1x
+lower — with the CPU pegged at 88% of its 2.2 GHz nominal clock, i.e. no
+turbo at all. Short benchmarks systematically overstate this machine; the
+sustained figure is the one to plan with, and the gap is itself an argument
+for moving training somewhere that holds its clocks.
+
 Nearly 3x, and the lever is not the one I expected. Overlapping workers
 with Python (groups=2) does help, but the dominant term is **torch thread
 count**: at 8-10 threads torch and the Node actors fight for the same
