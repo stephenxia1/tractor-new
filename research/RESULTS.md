@@ -250,6 +250,34 @@ An incidental gap in the old lineage this harness could close cheaply: v2
 and v13 were never measured against each other directly, and the agent
 ties one while beating the other.
 
+## Architecture v2 (experiment running)
+
+Changes, in the order they matter:
+
+1. **Points-primary targets.** The level bracket is a step function of
+   points and fired once per hand; the point return is smooth and arrives
+   every trick. Level becomes an auxiliary head so the 80-point cliff
+   stays represented.
+2. **Privileged critic.** A critic seeing all four hands is distilled into
+   the policy network, which is unbiased in expectation and far quieter.
+3. **Chain-position encoding**, built from the engine's own `chainPosition`
+   via `chains.json` so it cannot drift from the rules.
+4. **Per-role heads**, causal-attention move history, a state-value head
+   for search, and a belief head over opponents' hands.
+5. **Opponent mixture**: 65% self-play, 20% vs frozen snapshots, 10% with a
+   snapshot as *partner*, 5% vs a cheap bot.
+
+**Cost, measured on the same box:** 3.13M params (v1: 0.67M) and **7.3
+learner steps/s against v1's 38** -- roughly 4x fewer gradient steps per
+hour, split env 4 / features 26 / forward 22 / learn 46. So v2 has to be
+worth about 4 steps of v1 per step of its own. That is the experiment.
+
+**Early diagnostics** (420 steps): the privileged critic already explains
+~60% of the target's spread (`target_std` 0.68 vs `critic_residual_std`
+0.27), and the belief head predicts opponents' card positions at 84%.
+Those are the two mechanisms the design rests on, both confirmed live
+rather than assumed.
+
 ### What a serious run costs here
 
 At the measured ~1,900 decisions/s and ~5 learner steps/s, the laptop
