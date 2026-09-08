@@ -1,8 +1,8 @@
 {
  "format": "float16",
  "count": 3133099,
- "steps": 207733,
- "hands": 2744314,
+ "steps": 966632,
+ "hands": 12741626,
  "net_config": {
   "width": 512,
   "blocks": 2,
