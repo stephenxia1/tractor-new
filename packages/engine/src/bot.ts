@@ -133,12 +133,12 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
   'smart-v18',
   'smart-v34',
-  // 'rl-v2' is hidden until the ws server that serves this page has been
-  // redeployed. The lobby and the game server ship separately, and a bot
-  // the server does not know is not a missing feature: `pickBotAction`
-  // returns undefined for an unknown type and the scheduler dereferences
-  // it inside a setTimeout, which takes the process down and every
-  // in-memory room with it. Re-add once Fly is on the same build.
+  // Safe to offer only because the ws server ships it too. The lobby and
+  // the game server deploy separately, so adding a bot here before the
+  // server knows it hands the server an unknown type, which it resolves
+  // to undefined and then dereferences -- taking the process, and every
+  // in-memory room, down with it. Deploy the server first.
+  'rl-v2',
 ];
 
 export function botTypeLabel(t: BotType): string {

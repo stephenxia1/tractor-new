@@ -14,3 +14,10 @@ node_modules
 apps/web/.next
 plan.md
 rules.md
+
+# Never copied by the Dockerfile, but the whole context is uploaded to
+# Fly's remote builder, so excluding these is pure upload time saved.
+.claude
+research
+scratchpad
+*.pt
