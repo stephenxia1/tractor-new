@@ -91,12 +91,26 @@ function main(): void {
   let baselineInitialized = false;
 
   const grad = new Float64Array(PARAM_COUNT);
-  const heuristicAgents: Array<Agent> = [
-    'lowball',
-    'aggressive',
-    'point-hoarder',
-    'random',
+  // (agent, sampling weight). smart and smart-v2 are heavy per-decision
+  // (smart-v2 does a one-ply search), so we down-weight them — including
+  // them at all is the win; running them every episode would dominate
+  // wall time.
+  // (agent, sampling weight). smart-v2 does a per-decision one-ply
+  // search and is roughly 10× slower than the others; weighting it down
+  // keeps wall-time manageable while still exposing the policy to its
+  // play patterns.
+  const heuristicAgents: Array<readonly [Agent, number]> = [
+    ['lowball', 1.0],
+    ['aggressive', 1.0],
+    ['point-hoarder', 1.0],
+    ['random', 1.0],
+    ['smart', 1.0],
+    ['smart-v2', 0.15],
   ];
+  const heuristicTotalWeight = heuristicAgents.reduce(
+    (s, [, w]) => s + w,
+    0,
+  );
 
   const startTime = Date.now();
   let lastEvalLog = 0;
@@ -133,7 +147,13 @@ function main(): void {
       });
     }
     for (const s of oppSeats) {
-      agents[s] = chooseOpponent(snapshots, heuristicAgents, rng, seatRng);
+      agents[s] = chooseOpponent(
+        snapshots,
+        heuristicAgents,
+        heuristicTotalWeight,
+        rng,
+        seatRng,
+      );
     }
 
     let summary;
@@ -250,7 +270,8 @@ function main(): void {
 
 function chooseOpponent(
   snapshots: ReadonlyArray<Policy>,
-  heuristics: ReadonlyArray<Agent>,
+  heuristics: ReadonlyArray<readonly [Agent, number]>,
+  heuristicTotalWeight: number,
   rng: () => number,
   seatRng: () => number,
 ): Agent {
@@ -261,11 +282,17 @@ function chooseOpponent(
     return makePolicyAgent({
       policy: snap,
       mode: 'eval',
-      temperature: 0.5, // small noise so the snapshots aren't deterministic
+      temperature: 0.5,
       rng: seatRng,
     });
   }
-  return heuristics[Math.floor(rng() * heuristics.length)]!;
+  // Weighted sample over heuristics.
+  let r = rng() * heuristicTotalWeight;
+  for (const [agent, w] of heuristics) {
+    r -= w;
+    if (r <= 0) return agent;
+  }
+  return heuristics[heuristics.length - 1]![0];
 }
 
 // Quick eval: trained policy on team A vs `random` on team B.
