@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import signal
 import time
 from collections import deque
@@ -155,13 +156,21 @@ def main() -> None:
     net_cfg = NetConfig(history=args.history)
     net = TractorNet(net_cfg).to(device)
     critic = PrivilegedCritic().to(device)
+    resumed_snapshots: list[dict] = []
+    resumed_steps = 0
+    hands_base = 0
     if args.resume:
         state = torch.load(args.resume, map_location=device)
         net.load_state_dict(state["model"])
         if "critic" in state:
             critic.load_state_dict(state["critic"])
-        print(f"resumed from {args.resume} (step {state.get('steps', 0)})")
+        resumed_snapshots = state.get("snapshots", [])
+        resumed_steps = int(state.get("steps", 0))
+        hands_base = int(state.get("hands", 0))
+        print(f"resumed from {args.resume} (step {resumed_steps}, "
+              f"{len(resumed_snapshots)} snapshots)")
     learner = Learner2(net, critic, cfg, device)
+    learner.steps = resumed_steps
     buffer = ReplayBuffer2(cfg.buffer_capacity, L.STATE_BYTES_PRIVILEGED)
     rng = np.random.default_rng(args.seed)
 
@@ -169,6 +178,23 @@ def main() -> None:
     snapshot_net.load_state_dict(net.state_dict())
     snapshot_net.eval()
     snapshots: deque[dict] = deque(maxlen=args.snapshot_pool)
+    # Restored snapshots are only opponents, so a shape mismatch (a resume
+    # under a different --history, say) must not be fatal: crashing here
+    # costs the whole run, since this is boot time on a spot box.
+    for snap in resumed_snapshots[-args.snapshot_pool:]:
+        state = _to_float(snap["state"])
+        try:
+            snapshot_net.load_state_dict(state)
+        except RuntimeError as err:
+            detail = " ".join(str(err).split())[:200]
+            print(f"dropping snapshot at step {snap['steps']}: {detail}")
+            continue
+        snapshots.append({"steps": snap["steps"], "state": state})
+    if snapshots:
+        snapshot_net.load_state_dict(snapshots[-1]["state"])
+        print(f"opponent pool warm: {[s['steps'] for s in snapshots]}")
+    else:
+        snapshot_net.load_state_dict(net.state_dict())
 
     matchups = assign_matchups(args.workers)
     configs = [
@@ -199,7 +225,7 @@ def main() -> None:
     def on_term(signum, _frame):
         interrupted["flag"] = True
         try:
-            save(net, critic, learner, cfg, net_cfg, args, hands, final=True)
+            save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots, final=True)
             print(f"caught signal {signum}; checkpointed at step {learner.steps}", flush=True)
         finally:
             raise SystemExit(0)
@@ -345,7 +371,7 @@ def main() -> None:
             if rounds % args.log_every == 0:
                 el = time.perf_counter() - started
                 row = {
-                    "elapsed_s": round(el, 1), "rounds": rounds, "hands": hands,
+                    "elapsed_s": round(el, 1), "rounds": rounds, "hands": hands_base + hands,
                     "decisions": decisions, "trained_decisions": trained_decisions,
                     "decisions_per_s": round(decisions / el, 1),
                     "hands_per_s": round(hands / el, 2),
@@ -361,7 +387,7 @@ def main() -> None:
                 }
                 log_file.write(json.dumps(row) + "\n"); log_file.flush()
                 print(
-                    f"[{row['elapsed_s']:7.1f}s] hands {hands:7d} dec/s {row['decisions_per_s']:7.0f} "
+                    f"[{row['elapsed_s']:7.1f}s] hands {row['hands']:7d} dec/s {row['decisions_per_s']:7.0f} "
                     f"steps {learner.steps:7d} loss {row.get('loss')} "
                     f"q {row.get('loss_q')} belief {row.get('belief_acc')} "
                     f"tgt_std {row.get('target_std')} resid_std {row.get('critic_residual_std')}",
@@ -372,11 +398,16 @@ def main() -> None:
                 learner.steps % args.checkpoint_every == 0
                 or now - last_checkpoint >= args.checkpoint_minutes * 60
             ):
-                save(net, critic, learner, cfg, net_cfg, args, hands)
+                # Only the step-based trigger keeps a numbered archive.
+                # The 10-minute one fires ~40x in a run, and with the
+                # opponent pool inside, every one of those is a large
+                # file nobody reads.
+                save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots,
+                     archive=learner.steps % args.checkpoint_every == 0)
                 last_checkpoint = now
     finally:
         pool.close()
-        save(net, critic, learner, cfg, net_cfg, args, hands, final=True)
+        save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots, final=True)
         log_file.close()
 
     el = time.perf_counter() - started
@@ -384,7 +415,30 @@ def main() -> None:
           f"in {el/60:.1f} min, {learner.steps} steps")
 
 
-def save(net, critic, learner, cfg, net_cfg, args, hands, final=False) -> None:
+# Snapshots are frozen *opponents*, never the weights being trained, so
+# they are stored at half precision. It halves a file that mirrors to S3
+# on a timer, and a few thousandths of drift in an opponent net is not
+# something the learner can perceive.
+def _to_half(state: dict) -> dict:
+    return {k: (v.half() if v.is_floating_point() else v) for k, v in state.items()}
+
+
+def _to_float(state: dict) -> dict:
+    return {k: (v.float() if v.is_floating_point() else v) for k, v in state.items()}
+
+
+def _atomic_save(payload: dict, path: Path) -> None:
+    # The S3 mirror copies checkpoints on its own timer and cannot tell a
+    # finished file from a half-written one; a truncated latest.pt is a
+    # failed resume at the next boot. Rename is atomic, so the mirror
+    # either sees the old file or the new one.
+    tmp = path.with_suffix(".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def save(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
+         final=False, archive=True) -> None:
     payload = {
         "arch": "v2",
         "model": net.state_dict(),
@@ -393,10 +447,19 @@ def save(net, critic, learner, cfg, net_cfg, args, hands, final=False) -> None:
         "config": asdict(cfg),
         "steps": learner.steps,
         "hands": hands,
+        # The opponent pool is training state, not a by-product. Left out,
+        # a resume restarts self-play against copies of the current net
+        # and needs snapshot_every * snapshot_pool steps -- 100k at the
+        # current settings -- to rebuild its diversity, which is longer
+        # than a spot instance has been living.
+        "snapshots": [
+            {"steps": s["steps"], "state": _to_half(s["state"])} for s in snapshots
+        ],
     }
-    name = f"{args.run_name}_final.pt" if final else f"{args.run_name}_{learner.steps}.pt"
-    torch.save(payload, CHECKPOINT_DIR / name)
-    torch.save(payload, CHECKPOINT_DIR / f"{args.run_name}_latest.pt")
+    if archive:
+        name = f"{args.run_name}_final.pt" if final else f"{args.run_name}_{learner.steps}.pt"
+        _atomic_save(payload, CHECKPOINT_DIR / name)
+    _atomic_save(payload, CHECKPOINT_DIR / f"{args.run_name}_latest.pt")
 
 
 if __name__ == "__main__":

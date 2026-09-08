@@ -26,6 +26,10 @@ import {
 } from '@tractor/engine';
 
 import { cardSlot } from './cards';
+// Makes `rl-v2` selectable as a baseline/opponent in self-play and in
+// the arena; without it the engine throws rather than substituting.
+import '@tractor/engine/rl/v2/register';
+
 import { enumerateCandidates, type Candidate } from './candidates';
 import { summarizeHand, type EpisodeSummary } from './encode';
 import { buildLeaves, type SearchOptions, type SearchResult } from './search';

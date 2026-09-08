@@ -31,6 +31,9 @@ import {
 import { EMBEDDED_WEIGHTS as EMBEDDED_RL_WEIGHTS } from './rl/mlp/embeddedWeights';
 import { deserialize as deserializeRlPolicy } from './rl/mlp/policy';
 import { makePolicyAgent as makeRlPolicyAgent } from './rl/mlp/agent';
+import { makeDmcAgent } from './rl/dmc/agent';
+import { deserializeWeights as deserializeDmcWeights } from './rl/dmc/weights';
+import { EMBEDDED_DMC_WEIGHTS } from './rl/dmc/embeddedWeights';
 
 export type BotAction =
   | { readonly kind: 'declare'; readonly cards: ReadonlyArray<Card> }
@@ -74,7 +77,11 @@ export type BotType =
   | 'smart-v31'      // v18 play-phase + smarter declare + smarter bury
   | 'smart-v33'      // v18 clone with lead bonus weight reduced 0.15 -> 0.10
   | 'smart-v34'      // v18 clone with lead bonus weight reduced 0.15 -> 0.05
-  | 'rl-mlp';        // small-MLP policy trained via REINFORCE self-play
+  | 'rl-mlp'         // small-MLP policy trained via REINFORCE self-play
+  | 'rl-dmc'         // DMC self-play, three Q-nets (landlord / defender / attacker)
+  | 'rl-v2'          // DMC self-play, points-target net with history attention + CTDE critic
+  | 'rl-v2-search'   // rl-v2 + determinized search, worlds weighted by the belief head
+  | 'rl-v2-search-u';// rl-v2 + determinized search, uniform worlds (the A/B control)
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
   'lowball',
@@ -109,6 +116,10 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v33',
   'smart-v34',
   'rl-mlp',
+  'rl-dmc',
+  'rl-v2',
+  'rl-v2-search',
+  'rl-v2-search-u',
 ];
 
 // User-facing subset shown in the lobby dropdown. Only the latest
@@ -120,10 +131,9 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
 // the lobby UI.
 export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
-  'smart-v16',
   'smart-v18',
-  'smart-v33',
   'smart-v34',
+  'rl-v2',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -173,7 +183,7 @@ export function botTypeLabel(t: BotType): string {
     case 'smart-v17':
       return 'v17: Quartz (N=10)';
     case 'smart-v18':
-      return 'v18: Riptide (throw-trump aware + lead bonus)';
+      return 'Easy';
     case 'smart-v19':
       return 'v19: Sirocco (relative lead bonus)';
     case 'smart-v20':
@@ -189,9 +199,17 @@ export function botTypeLabel(t: BotType): string {
     case 'smart-v33':
       return 'v33: Ganges (lead bonus 0.10)';
     case 'smart-v34':
-      return 'v34: Hudson (lead bonus 0.05)';
+      return 'Medium';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
+    case 'rl-dmc':
+      return 'RL (experimental)';
+    case 'rl-v2':
+      return 'RL (neural)';
+    case 'rl-v2-search':
+      return 'RL (neural + search)';
+    case 'rl-v2-search-u':
+      return 'RL (neural + search, uniform worlds)';
   }
 }
 
@@ -356,6 +374,30 @@ export function pickBotAction(
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
   }
+  if (type === 'rl-dmc') {
+    return rlDmcAgent()(state, seat);
+  }
+  if (type === 'rl-v2-search' || type === 'rl-v2-search-u') {
+    const impl = type === 'rl-v2-search' ? _rlV2SearchAgent : _rlV2SearchUniformAgent;
+    if (impl === null) {
+      throw new Error(
+        `bot '${type}' has no implementation registered: import ` +
+        "'@tractor/engine/rl/v2/register' once at startup.",
+      );
+    }
+    return impl(state, seat);
+  }
+  if (type === 'rl-v2') {
+    if (_rlV2Agent === null) {
+      throw new Error(
+        "bot 'rl-v2' has no implementation registered: import " +
+        "'@tractor/engine/rl/v2/register' once at startup. It is a separate " +
+        'module because it reads a 5.9 MB weights file from disk, and this one ' +
+        'is bundled into the browser.',
+      );
+    }
+    return _rlV2Agent(state, seat);
+  }
   const pre = defaultPrePlay(state, seat);
   if (pre !== null) return pre;
 
@@ -391,6 +433,52 @@ function rlMlpAgent(): (s: GameState, seat: Seat) => BotAction {
     _rlMlpAgent = makeRlPolicyAgent({ policy, mode: 'eval' });
   }
   return _rlMlpAgent;
+}
+
+// ---------- Strategy: rl-v2 (points-target DMC with history attention) ----
+// The trained research agent: chain-position card encoding, causal
+// attention over the move history, a per-role points head, and weights
+// shaped by a privileged critic during training. Declaring and kitty
+// burial go to smart-v34 because that is what every training game used,
+// so those are the only pre-play positions the network has ever seen.
+//
+// The implementation is *injected* rather than imported. It reads its
+// weights from disk with `node:fs`, and this module is reachable from the
+// web app's client bundle (`VISIBLE_BOT_TYPES`, `botTypeLabel`), where a
+// `node:` import is a hard build error. Node entry points opt in with
+// `import '@tractor/engine/rl/v2/register'`; browsers never pay for it.
+let _rlV2Agent: ((s: GameState, seat: Seat) => BotAction) | null = null;
+
+let _rlV2SearchAgent: ((s: GameState, seat: Seat) => BotAction) | null = null;
+let _rlV2SearchUniformAgent: ((s: GameState, seat: Seat) => BotAction) | null = null;
+
+export function registerV2Agent(agent: (s: GameState, seat: Seat) => BotAction): void {
+  _rlV2Agent = agent;
+}
+
+// The searching variants differ only in how worlds are sampled, which is
+// the whole point: they are each other's control in the A/B.
+export function registerV2SearchAgents(
+  weighted: (s: GameState, seat: Seat) => BotAction,
+  uniform: (s: GameState, seat: Seat) => BotAction,
+): void {
+  _rlV2SearchAgent = weighted;
+  _rlV2SearchUniformAgent = uniform;
+}
+
+// ---------- Strategy: rl-dmc (DMC three-network self-play) ----------------
+// Three role-specific Q-networks (landlord, defender, attacker). Non-play
+// phases delegate to smart-v34. Weights resolve lazily: if a serialized
+// weights file is available at `rl/dmc/embeddedWeights.ts` it's loaded;
+// otherwise we fall back to zero-init so the bot can still play (badly)
+// for plumbing tests.
+let _rlDmcAgent: ((s: GameState, seat: Seat) => BotAction) | null = null;
+function rlDmcAgent(): (s: GameState, seat: Seat) => BotAction {
+  if (_rlDmcAgent === null) {
+    const weights = deserializeDmcWeights(EMBEDDED_DMC_WEIGHTS);
+    _rlDmcAgent = makeDmcAgent({ weights });
+  }
+  return _rlDmcAgent;
 }
 
 // ---------- Strategy: lowball ---------------------------------------------

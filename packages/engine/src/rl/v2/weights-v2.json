@@ -1,0 +1,538 @@
+{
+ "format": "float16",
+ "count": 3133099,
+ "steps": 207733,
+ "hands": 2744314,
+ "net_config": {
+  "width": 512,
+  "blocks": 2,
+  "action_dim": 128,
+  "head_hidden": 256,
+  "history": "attn",
+  "hist_model": 96,
+  "hist_layers": 2,
+  "hist_heads": 4
+ },
+ "tensors": {
+  "stem.weight": {
+   "shape": [
+    512,
+    920
+   ],
+   "offset": 0
+  },
+  "stem.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 471040
+  },
+  "blocks.0.norm.weight": {
+   "shape": [
+    512
+   ],
+   "offset": 471552
+  },
+  "blocks.0.norm.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 472064
+  },
+  "blocks.0.fc1.weight": {
+   "shape": [
+    512,
+    512
+   ],
+   "offset": 472576
+  },
+  "blocks.0.fc1.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 734720
+  },
+  "blocks.0.fc2.weight": {
+   "shape": [
+    512,
+    512
+   ],
+   "offset": 735232
+  },
+  "blocks.0.fc2.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 997376
+  },
+  "blocks.1.norm.weight": {
+   "shape": [
+    512
+   ],
+   "offset": 997888
+  },
+  "blocks.1.norm.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 998400
+  },
+  "blocks.1.fc1.weight": {
+   "shape": [
+    512,
+    512
+   ],
+   "offset": 998912
+  },
+  "blocks.1.fc1.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 1261056
+  },
+  "blocks.1.fc2.weight": {
+   "shape": [
+    512,
+    512
+   ],
+   "offset": 1261568
+  },
+  "blocks.1.fc2.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 1523712
+  },
+  "history.pos": {
+   "shape": [
+    16,
+    96
+   ],
+   "offset": 1524224
+  },
+  "history.proj.weight": {
+   "shape": [
+    96,
+    76
+   ],
+   "offset": 1525760
+  },
+  "history.proj.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1533056
+  },
+  "history.layers.0.norm1.weight": {
+   "shape": [
+    96
+   ],
+   "offset": 1533152
+  },
+  "history.layers.0.norm1.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1533248
+  },
+  "history.layers.0.attn.in_proj_weight": {
+   "shape": [
+    288,
+    96
+   ],
+   "offset": 1533344
+  },
+  "history.layers.0.attn.in_proj_bias": {
+   "shape": [
+    288
+   ],
+   "offset": 1560992
+  },
+  "history.layers.0.attn.out_proj.weight": {
+   "shape": [
+    96,
+    96
+   ],
+   "offset": 1561280
+  },
+  "history.layers.0.attn.out_proj.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1570496
+  },
+  "history.layers.0.norm2.weight": {
+   "shape": [
+    96
+   ],
+   "offset": 1570592
+  },
+  "history.layers.0.norm2.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1570688
+  },
+  "history.layers.0.ff.0.weight": {
+   "shape": [
+    192,
+    96
+   ],
+   "offset": 1570784
+  },
+  "history.layers.0.ff.0.bias": {
+   "shape": [
+    192
+   ],
+   "offset": 1589216
+  },
+  "history.layers.0.ff.2.weight": {
+   "shape": [
+    96,
+    192
+   ],
+   "offset": 1589408
+  },
+  "history.layers.0.ff.2.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1607840
+  },
+  "history.layers.1.norm1.weight": {
+   "shape": [
+    96
+   ],
+   "offset": 1607936
+  },
+  "history.layers.1.norm1.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1608032
+  },
+  "history.layers.1.attn.in_proj_weight": {
+   "shape": [
+    288,
+    96
+   ],
+   "offset": 1608128
+  },
+  "history.layers.1.attn.in_proj_bias": {
+   "shape": [
+    288
+   ],
+   "offset": 1635776
+  },
+  "history.layers.1.attn.out_proj.weight": {
+   "shape": [
+    96,
+    96
+   ],
+   "offset": 1636064
+  },
+  "history.layers.1.attn.out_proj.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1645280
+  },
+  "history.layers.1.norm2.weight": {
+   "shape": [
+    96
+   ],
+   "offset": 1645376
+  },
+  "history.layers.1.norm2.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1645472
+  },
+  "history.layers.1.ff.0.weight": {
+   "shape": [
+    192,
+    96
+   ],
+   "offset": 1645568
+  },
+  "history.layers.1.ff.0.bias": {
+   "shape": [
+    192
+   ],
+   "offset": 1664000
+  },
+  "history.layers.1.ff.2.weight": {
+   "shape": [
+    96,
+    192
+   ],
+   "offset": 1664192
+  },
+  "history.layers.1.ff.2.bias": {
+   "shape": [
+    96
+   ],
+   "offset": 1682624
+  },
+  "fuse.0.weight": {
+   "shape": [
+    608
+   ],
+   "offset": 1682720
+  },
+  "fuse.0.bias": {
+   "shape": [
+    608
+   ],
+   "offset": 1683328
+  },
+  "fuse.1.weight": {
+   "shape": [
+    512,
+    608
+   ],
+   "offset": 1683936
+  },
+  "fuse.1.bias": {
+   "shape": [
+    512
+   ],
+   "offset": 1995232
+  },
+  "action_encoder.0.weight": {
+   "shape": [
+    128,
+    144
+   ],
+   "offset": 1995744
+  },
+  "action_encoder.0.bias": {
+   "shape": [
+    128
+   ],
+   "offset": 2014176
+  },
+  "action_encoder.2.weight": {
+   "shape": [
+    128,
+    128
+   ],
+   "offset": 2014304
+  },
+  "action_encoder.2.bias": {
+   "shape": [
+    128
+   ],
+   "offset": 2030688
+  },
+  "q_points.0.0.weight": {
+   "shape": [
+    256,
+    640
+   ],
+   "offset": 2030816
+  },
+  "q_points.0.0.bias": {
+   "shape": [
+    256
+   ],
+   "offset": 2194656
+  },
+  "q_points.0.2.weight": {
+   "shape": [
+    128,
+    256
+   ],
+   "offset": 2194912
+  },
+  "q_points.0.2.bias": {
+   "shape": [
+    128
+   ],
+   "offset": 2227680
+  },
+  "q_points.0.4.weight": {
+   "shape": [
+    1,
+    128
+   ],
+   "offset": 2227808
+  },
+  "q_points.0.4.bias": {
+   "shape": [
+    1
+   ],
+   "offset": 2227936
+  },
+  "q_points.1.0.weight": {
+   "shape": [
+    256,
+    640
+   ],
+   "offset": 2227937
+  },
+  "q_points.1.0.bias": {
+   "shape": [
+    256
+   ],
+   "offset": 2391777
+  },
+  "q_points.1.2.weight": {
+   "shape": [
+    128,
+    256
+   ],
+   "offset": 2392033
+  },
+  "q_points.1.2.bias": {
+   "shape": [
+    128
+   ],
+   "offset": 2424801
+  },
+  "q_points.1.4.weight": {
+   "shape": [
+    1,
+    128
+   ],
+   "offset": 2424929
+  },
+  "q_points.1.4.bias": {
+   "shape": [
+    1
+   ],
+   "offset": 2425057
+  },
+  "q_points.2.0.weight": {
+   "shape": [
+    256,
+    640
+   ],
+   "offset": 2425058
+  },
+  "q_points.2.0.bias": {
+   "shape": [
+    256
+   ],
+   "offset": 2588898
+  },
+  "q_points.2.2.weight": {
+   "shape": [
+    128,
+    256
+   ],
+   "offset": 2589154
+  },
+  "q_points.2.2.bias": {
+   "shape": [
+    128
+   ],
+   "offset": 2621922
+  },
+  "q_points.2.4.weight": {
+   "shape": [
+    1,
+    128
+   ],
+   "offset": 2622050
+  },
+  "q_points.2.4.bias": {
+   "shape": [
+    1
+   ],
+   "offset": 2622178
+  },
+  "q_level.0.weight": {
+   "shape": [
+    256,
+    640
+   ],
+   "offset": 2622179
+  },
+  "q_level.0.bias": {
+   "shape": [
+    256
+   ],
+   "offset": 2786019
+  },
+  "q_level.2.weight": {
+   "shape": [
+    128,
+    256
+   ],
+   "offset": 2786275
+  },
+  "q_level.2.bias": {
+   "shape": [
+    128
+   ],
+   "offset": 2819043
+  },
+  "q_level.4.weight": {
+   "shape": [
+    1,
+    128
+   ],
+   "offset": 2819171
+  },
+  "q_level.4.bias": {
+   "shape": [
+    1
+   ],
+   "offset": 2819299
+  },
+  "v_head.0.weight": {
+   "shape": [
+    256,
+    512
+   ],
+   "offset": 2819300
+  },
+  "v_head.0.bias": {
+   "shape": [
+    256
+   ],
+   "offset": 2950372
+  },
+  "v_head.2.weight": {
+   "shape": [
+    1,
+    256
+   ],
+   "offset": 2950628
+  },
+  "v_head.2.bias": {
+   "shape": [
+    1
+   ],
+   "offset": 2950884
+  },
+  "belief_head.0.weight": {
+   "shape": [
+    256,
+    512
+   ],
+   "offset": 2950885
+  },
+  "belief_head.0.bias": {
+   "shape": [
+    256
+   ],
+   "offset": 3081957
+  },
+  "belief_head.2.weight": {
+   "shape": [
+    198,
+    256
+   ],
+   "offset": 3082213
+  },
+  "belief_head.2.bias": {
+   "shape": [
+    198
+   ],
+   "offset": 3132901
+  }
+ }
+}

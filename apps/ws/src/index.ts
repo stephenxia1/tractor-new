@@ -1,5 +1,9 @@
 import { createServer } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
+// Installs the `rl-v2` bot. Side-effect import: it reads its weights
+// from disk, so it is deliberately not part of the engine barrel.
+import '@tractor/engine/rl/v2/register';
+
 import {
   decodeClient,
   encode,
@@ -455,14 +459,28 @@ function broadcastRoom(room: Room): void {
   scheduleBotActions(room);
 }
 
-// Snapshot of every seat's cards. Used to power spectate mode.
+// Snapshot of every seat's cards. Used to power spectate mode. During
+// the 'dealing' phase, only reveal as many cards per seat as the engine
+// has dealt so far (cardsDealtBySeat), so spectators see the deal
+// animate one card at a time just like regular players.
 function collectAllHands(
   room: Room,
 ): Readonly<Record<Seat, ReadonlyArray<Card>>> {
   const ch = room.game.currentHand;
   const out: Record<Seat, ReadonlyArray<Card>> = {};
+  const dealing = room.game.phase === 'dealing';
   for (let s = 0; s < room.game.config.numPlayers; s++) {
-    out[s] = ch === null ? [] : [...(ch.hands[s] ?? [])];
+    if (ch === null) {
+      out[s] = [];
+      continue;
+    }
+    const full = ch.hands[s] ?? [];
+    if (dealing) {
+      const dealt = ch.cardsDealtBySeat[s] ?? 0;
+      out[s] = full.slice(0, dealt);
+    } else {
+      out[s] = [...full];
+    }
   }
   return out;
 }
