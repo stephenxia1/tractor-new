@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import layout as L
-from .encoding import CAPACITY, NUM_ENC_SLOTS, encode_planes
+from .encoding import CAPACITY, ENC_OF_RAW, NUM_ENC_SLOTS, encode_planes
 
 # Frame merging, worker splitting and episode parsing do not depend on the
 # card representation, so they are shared with the v1 featuriser rather
@@ -269,17 +269,22 @@ def history_features(states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     pos = block[:, :, 3].astype(np.int64)
     slots = block[:, :, 4 : 4 + L.HISTORY_MAX_CARDS].astype(np.int64)
 
-    # Card counts per step, then the same chain-position encoding as the
-    # planes so a card means the same thing everywhere.
+    # Card counts per step, in chain positions. Counting into the 54 raw
+    # slots and permuting afterwards does the same work twice: each card is
+    # sent to its encoded position first, so the bincount lands directly in
+    # the 66 output bins and the permutation disappears.
     valid_card = slots != L.NO_CARD
     flat_rows = np.repeat(np.arange(b * HISTORY_STEPS), L.HISTORY_MAX_CARDS).reshape(
         b, HISTORY_STEPS, L.HISTORY_MAX_CARDS
     )
-    idx = flat_rows[valid_card] * L.NUM_SLOTS + slots[valid_card]
-    raw_counts = np.bincount(idx, minlength=b * HISTORY_STEPS * L.NUM_SLOTS).astype(np.float32)
-    raw_counts = raw_counts.reshape(b, HISTORY_STEPS, L.NUM_SLOTS)
     rank, suit = _trump(states)
-    enc = encode_planes(raw_counts, rank, suit)  # [B, W, 66]
+    enc_map = ENC_OF_RAW[rank, suit]  # [B, 54]
+    # NO_CARD would index out of range; those entries are masked out below.
+    safe_slots = np.where(valid_card, slots, 0)
+    enc_slots = np.take_along_axis(enc_map[:, None, :], safe_slots, axis=2)
+    idx = flat_rows[valid_card] * NUM_ENC_SLOTS + enc_slots[valid_card]
+    enc = np.bincount(idx, minlength=b * HISTORY_STEPS * NUM_ENC_SLOTS).astype(np.float32)
+    enc = enc.reshape(b, HISTORY_STEPS, NUM_ENC_SLOTS)  # [B, W, 66]
 
     tokens = np.zeros((b, HISTORY_STEPS, HISTORY_TOKEN_DIM), dtype=np.float32)
     tokens[:, :, :NUM_ENC_SLOTS] = enc * 0.5
@@ -304,14 +309,21 @@ def action_features(cands: np.ndarray, states: np.ndarray, owner: np.ndarray) ->
     flags = cands[:, 2].astype(np.int64)
     points = cands[:, 3].astype(np.float32)
 
+    # Same shortcut as the history tokens: send each card straight to its
+    # chain position so the bincount lands in the 66 output bins, instead of
+    # counting into 54 raw slots and permuting afterwards. This is the
+    # hottest featuriser -- a decision carries ~26 candidates -- so the
+    # intermediate it removes was the largest one in the pipeline.
     slots = cands[:, L.CANDIDATE_HEADER_BYTES :].astype(np.int64)
     valid = slots != L.NO_CARD
     rows, _ = np.nonzero(valid)
-    flat = rows * L.NUM_SLOTS + slots[valid]
-    raw = np.bincount(flat, minlength=n * L.NUM_SLOTS).astype(np.float32)
-    raw = raw.reshape(n, 1, L.NUM_SLOTS)
     rank, suit = _trump(states)
-    counts = encode_planes(raw, rank[owner], suit[owner])[:, 0]
+    enc_map = ENC_OF_RAW[rank[owner], suit[owner]]  # [n, 54]
+    safe_slots = np.where(valid, slots, 0)
+    enc_slots = np.take_along_axis(enc_map, safe_slots, axis=1)
+    flat = rows * NUM_ENC_SLOTS + enc_slots[valid]
+    counts = np.bincount(flat, minlength=n * NUM_ENC_SLOTS).astype(np.float32)
+    counts = counts.reshape(n, NUM_ENC_SLOTS)
 
     out = np.zeros((n, ACTION_DIM), dtype=np.float32)
     out[:, :NUM_ENC_SLOTS] = counts >= 1
@@ -354,10 +366,16 @@ def privileged_features(states: np.ndarray) -> np.ndarray:
     return (enc * 0.5).reshape(b, -1)
 
 
-def belief_targets(states: np.ndarray) -> np.ndarray:
+def belief_targets(states: np.ndarray, priv: np.ndarray | None = None) -> np.ndarray:
     """[B, 3 * 66] in {0,1}: does relative seat r hold a card at position p.
 
     The belief head's supervision, and training-only for the same reason.
+
+    `priv` lets a caller that already built the privileged view hand it back
+    instead of paying for it twice; the learner does exactly that on every
+    step, which was a full redundant featurisation per gradient step.
     """
-    priv = privileged_features(states).reshape(states.shape[0], L.PRIVILEGED_PLANES, NUM_ENC_SLOTS)
+    if priv is None:
+        priv = privileged_features(states)
+    priv = priv.reshape(states.shape[0], L.PRIVILEGED_PLANES, NUM_ENC_SLOTS)
     return (priv[:, :3] > 0).astype(np.float32).reshape(states.shape[0], -1)

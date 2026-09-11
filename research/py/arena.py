@@ -58,6 +58,9 @@ RESEARCH_DIR = Path(__file__).resolve().parents[1]
 SIDE_A_SEATS = 0b0101
 SIDE_B_SEATS = 0b1010
 SIDE_A_LIST = (0, 2)
+# The partner seat within each side, for mixed-team runs: seat 2 when the
+# agent holds {0,2}, seat 3 when it holds {1,3}.
+AGENT_B_SEATS = (2, 3)
 SIDE_B_LIST = (1, 3)
 
 
@@ -145,6 +148,12 @@ def main() -> None:
         required=True,
         help="checkpoint path, or bot:<BotType> to evaluate a heuristic",
     )
+    # A second checkpoint for the partner seat, so a *mixed* team can be
+    # measured. Two agents trained from different seeds and never paired
+    # play together here for the first time; the gap between this and each
+    # one partnering itself is the cost of their conventions not matching.
+    ap.add_argument("--agent-b", default="",
+                    help="second checkpoint; fills --agent-b-seat on the agent's team")
     ap.add_argument("--opponent", default="smart-v34", help="BotType for the other team")
     ap.add_argument("--pairs", type=int, default=200, help="deals played twice each")
     ap.add_argument("--worker-pairs", type=int, default=2, help="worker pairs (2 processes each)")
@@ -166,6 +175,18 @@ def main() -> None:
     device = torch.device(args.device)
     model = load_agent(args.agent, device)
     agent_bot = args.agent[4:] if model is None else None
+    model_b = None
+    if args.agent_b:
+        if model is None:
+            raise SystemExit("--agent-b needs --agent to be a checkpoint, not a bot")
+        if args.search_worlds > 0:
+            # Search frames carry leaves as well as decisions and the two
+            # policies would have to agree on the split; not needed for the
+            # convention measurement, so refuse rather than get it subtly wrong.
+            raise SystemExit("--agent-b and --search-worlds cannot be combined")
+        model_b = load_agent(args.agent_b, device)
+        print(f"mixed team: {args.agent} partnered with {args.agent_b} "
+              f"(B takes seats {AGENT_B_SEATS[0]}/{AGENT_B_SEATS[1]})")
     if agent_bot is not None:
         print(f"agent: bot {agent_bot}")
     print(f"opponent: {args.opponent}")
@@ -229,6 +250,20 @@ def main() -> None:
 
             if merged.num_decisions > 0 and model is not None:
                 picks = model.pick(merged)
+                if model_b is not None:
+                    # Both policies score every decision and the seat decides
+                    # which answer is used. Twice the forward cost, but the
+                    # alternative is splitting `merged` into two consistent
+                    # sub-batches, and this loop is bound by the engine.
+                    #
+                    # Seats 2 and 3, not one fixed seat: the duplicate design
+                    # puts the agent on {0,2} in the side-A workers and {1,3}
+                    # in the side-B ones, so B takes the second seat of
+                    # whichever pair its team holds. Decisions only ever
+                    # arrive for learner seats, so this never claims a bot's.
+                    seats = merged.states[:, L.H_SEAT]
+                    picks = np.where(np.isin(seats, AGENT_B_SEATS),
+                                     model_b.pick(merged), picks)
             else:
                 picks = np.zeros(merged.num_decisions, dtype=np.int64)
             if isinstance(model, SearchPolicy):

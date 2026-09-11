@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Shell scripts run on Linux VMs. Windows checkouts were rewriting them
+# with CRLF, which bash rejects outright -- `$'\r': command not found`,
+# and a training box that boots, reports success, and never trains.
+*.sh text eol=lf

@@ -65,6 +65,10 @@ export type SlotOptions = {
   readonly baselineBotBySeat?: ReadonlyArray<BotType | undefined>;
   // Bot used for declaration and kitty burial at every seat.
   readonly prePlayBot?: BotType;
+  // Probability that a hand's kitty is perturbed away from the pre-play
+  // bot's choice, and the most cards that can be swapped when it is.
+  readonly kittyNoise?: number;
+  readonly kittyMaxSwaps?: number;
   readonly maxCandidates?: number;
   // Randomise landlord + levels per hand (on by default; off for
   // duplicate-deal evaluation, where the deal must be reproducible).
@@ -404,6 +408,16 @@ export class GameSlot {
     this.apply({ kind: 'pick_up_kitty', seat: landlord });
   }
 
+  // Every training game so far buried its kitty with one heuristic, so the
+  // agent has only ever seen the positions that heuristic produces. That is
+  // a distribution the agent can quietly fit to: measured, swapping the
+  // pre-play regime moves its margin by ~7 points.
+  //
+  // `kittyNoise` perturbs the bot's choice instead of replacing it. Burying
+  // uniformly at random is the wrong treatment -- it discards jokers and
+  // point cards in ways no player ever would, so the agent would spend
+  // capacity on positions that never occur. Swapping k of the buried cards
+  // for k random others covers the neighbourhood of sensible play.
   private runKittyReplace(): void {
     const hand = this.state.currentHand;
     if (hand === null || hand.landlord === null) {
@@ -414,8 +428,35 @@ export class GameSlot {
     if (action.kind !== 'replace_kitty') {
       throw new Error(`expected replace_kitty from bot, got ${action.kind}`);
     }
-    this.buriedKitty = [...action.cards];
-    this.apply({ kind: 'replace_kitty', seat, cards: action.cards });
+    const cards = this.perturbKitty(hand.hands[seat] ?? [], action.cards);
+    this.buriedKitty = [...cards];
+    this.apply({ kind: 'replace_kitty', seat, cards });
+  }
+
+  private perturbKitty(
+    landlordHand: ReadonlyArray<Card>,
+    chosen: ReadonlyArray<Card>,
+  ): ReadonlyArray<Card> {
+    const noise = this.opts.kittyNoise ?? 0;
+    if (noise <= 0 || this.rng() >= noise) return chosen;
+
+    // How many of the buried cards to re-draw. Weighted towards small
+    // perturbations: a wholly random kitty is rare, a nudge is common.
+    const maxSwaps = Math.min(chosen.length, this.opts.kittyMaxSwaps ?? 3);
+    const swaps = 1 + Math.floor(this.rng() * maxSwaps);
+
+    const buried = new Set(chosen.map(cardKey));
+    const pool = landlordHand.filter((c) => !buried.has(cardKey(c)));
+    if (pool.length === 0) return chosen;
+
+    const out = [...chosen];
+    for (let i = 0; i < swaps && pool.length > 0; i++) {
+      const drop = Math.floor(this.rng() * out.length);
+      const take = Math.floor(this.rng() * pool.length);
+      out[drop] = pool[take]!;
+      pool.splice(take, 1);
+    }
+    return out;
   }
 
   private botForSeat(seat: Seat): BotType {

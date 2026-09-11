@@ -645,3 +645,117 @@ The `rl-dmc` entry that has been in the lobby dropdown is a placeholder:
 trained export, so every Q value tied and the bot played the first
 enumerated candidate each turn. It stays in `BOT_TYPES` for the protocol
 but `rl-v2` replaces it in `VISIBLE_BOT_TYPES`.
+
+## Where the run ended (Phase 6)
+
+Training stopped on its deadline at **1,103,832 steps / 14.5M hands**.
+1,149,500 steps were actually computed across **14 instance lives** and 41.5
+instance-hours at a sustained 7.7 steps/s; the 4% difference is what spot
+reclaims cost, and it is small only because the resume path carries the
+optimiser-free state, the cumulative counters and the snapshot pool.
+
+### One opponent is not a measurement
+
+The 966k checkpoint was first measured against `smart-v13` alone, scored
++34.11 against the 417k checkpoint's +38.17, and was written off as a
+plateau. Run across nine opponents it is better on **eight of them**:
+
+| opponent | 417k | 966k | 1104k |
+| --- | --- | --- | --- |
+| `random` | +108.93 | +112.12 | +107.19 |
+| `lowball` | +107.26 | +108.48 | +112.91 |
+| `point-hoarder` | +118.09 | +126.55 | +127.64 |
+| `aggressive` | +133.25 | +137.52 | +137.73 |
+| `smart` | +45.93 | +51.04 | +50.83 |
+| `smart-v2` | +33.62 | +40.41 | +35.74 |
+| `smart-v4` * | -7.52 | +1.67 | +3.46 |
+| `smart-v9` * | -7.09 | -1.41 | -8.08 |
+| `smart-v13` | +38.17 | +34.11 | +36.07 |
+
+`* sees the real opponent hands.`
+
+417k -> 966k: **+4.43 mean, better on 8 of 9**. `smart-v13` is the lone
+dissenting rung and it happened to be the one measured first. A single
+opponent cannot distinguish "the agent stopped improving" from "this
+opponent cannot resolve the difference", and picking the wrong one produced
+a confident, wrong conclusion. `py/ladder.py` exists so the comparison is
+one command over the whole list on one deal base.
+
+### The plateau is real, one checkpoint later
+
+966k -> 1104k: **-0.78 mean, better on 5 of 9** -- scatter with no
+direction, which is what re-measuring the same agent looks like. The last
+137k steps bought nothing, so 966k stays deployed rather than being
+replaced with newer weights of equal strength.
+
+### `smart-v4` .. `smart-v12` are not fair-play opponents
+
+`smart-v13` is defined in the engine as "`smart-v9` with opponent hands
+masked", so every rung below it reads the real hands inside its search.
+Those rows are a perfect-information reference, not a ladder rung. Read
+that way, the agent went from losing to `smart-v4` by 7.5 points to
+holding level with it -- level against an opponent that can see its cards
+-- while still trailing `smart-v9` by 8. That residual gap is the value of
+perfect information and no amount of self-play will close it.
+
+### What is left
+
+More gradient steps are no longer the lever. The two that remain are a
+search that actually pays -- the shipped one measured +0.82 [-4.52, +6.16]
+against the bare network, i.e. nothing, and was never re-tested after its
+configuration was corrected to the validated `worlds=4` -- and expert
+iteration, training on the search's choices rather than the policy's own.
+
+## The plateau was a decline, and replay ratio is why
+
+Measured 2026-09-11. All numbers below are 1000 duplicate pairs against
+`smart-v2` from deal base 424200 -- a +/-2.5 point CI, where the 120-pair
+runs used earlier give +/-7 and cannot resolve anything under ~10 points.
+
+| checkpoint | steps | replay | margin vs `smart-v2` |
+| --- | --- | --- | --- |
+| `v2_final` | 1,103,832 | ~1.6 | **+32.88** [+30.41, +35.35] |
+| `anneal_ctl` | 1,300,000 | ~2.5 | +24.00 [+21.47, +26.53] |
+| `anneal_a65` | 1,300,000 | ~2.5 | +24.13 [+21.70, +26.55] |
+| `anneal_a10` | 1,300,000 | ~2.5 | +17.66 [+15.00, +20.31] |
+| `xpA` (cross-play) | 579,366 | ~9.0 | **-29.76** |
+
+Three arms resumed from `v2_final` and every one finished ~9 points *worse*
+196k steps later, confidence intervals disjoint. The 1104k checkpoint was
+not a ceiling the run had reached; it was the last good point before a
+decline. The one systematic difference between how the run arrived at
+1104k and how the arms left it is `--steps-per-train`, 1 against 2, which
+moves the replay ratio from ~1.6 to ~2.5.
+
+The cross-play pair is the same effect at a larger dose. Two agents were
+trained from scratch on one 8-vCPU box with three workers each, so the GPU
+learner outran its data and reused every sample nine times; both ended up
+*worse than `smart-v2`*, sixty points below the plateau, after 579k steps.
+
+### Why the replay sweep got this wrong
+
+`--replay-sweep` reported "nothing gained past `steps_per_train=2`" from
+throughput and loss curves. Those metrics invert: `loss_q` **falls** as
+replay rises, because a network reusing a narrow buffer memorises it.
+`xpA` sat at `loss_q` 0.006-0.009 where the healthy lineage runs 0.027.
+Read as convergence, it was overfitting. Replay has to be judged on the
+ladder; loss curves actively mislead about it.
+
+## Annealing the privileged teacher out: refuted
+
+`lambda_mc` was made a schedule (`--lambda-mc-final`) after noticing that
+the target blend is algebraically a regulariser: `MSE(q, l*G + (1-l)*P)`
+equals `l*MSE(q,G) + (1-l)*MSE(q,P)` up to a constant, so the shipped
+l=0.3 penalises disagreement with the teacher 7:3 *against the data*.
+
+At a matched 1,300,000 steps, l=0.3 and l=0.65 are indistinguishable
+(+24.00 vs +24.13, a 0.13 point difference) and l=1.0 -- no teacher -- is
+significantly worse (+17.66, CI disjoint from the control). The teacher is
+earning its weight and the FPDou-style worry about its bias binding late
+does not hold here. The weight is not load-bearing at 0.7 though: half of
+it can go for free.
+
+A warning about sample size, since it nearly produced a wrong answer. At
+120 pairs `a65` led the control by 6.7 points *and* led on all three rungs.
+At 1000 pairs the lead was 0.13. Correlated rungs do not make a weak
+signal strong.

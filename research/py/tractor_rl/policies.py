@@ -53,7 +53,7 @@ class PolicyV1:
         af = torch.from_numpy(
             self._action_features(merged.cands, merged.states, merged.owner)).to(self.device)
         owner = torch.from_numpy(merged.owner).to(self.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             q = self.net(sf, af, owner).cpu().numpy()
         return _group_argmax(q, merged.owner, merged.cand_offsets, merged.cand_counts)
 
@@ -87,7 +87,7 @@ class PolicyV2:
         else:
             tokens = mask = None
         empty_actions = torch.zeros((0, 0), device=self.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             z = self.net.encode_state(sf, tokens, mask)
             v = self.net.v_head(z).squeeze(-1)
         del empty_actions
@@ -107,7 +107,7 @@ class PolicyV2:
             mask = torch.from_numpy(msk).to(self.device)
         else:
             tokens = mask = None
-        with torch.no_grad():
+        with torch.inference_mode():
             out = self.net(sf, af, owner, roles, tokens, mask, want="q")
         q = out["q"].cpu().numpy()
         return _group_argmax(q, merged.owner, merged.cand_offsets, merged.cand_counts)

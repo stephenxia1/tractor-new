@@ -34,7 +34,8 @@ import numpy as np
 import torch
 
 from tractor_rl import layout as L
-from tractor_rl.dmc2 import DMC2Config, Learner2, ReplayBuffer2, hand_returns
+from tractor_rl.dmc2 import (
+    AsyncLearner, BatchPrefetcher, DMC2Config, Learner2, ReplayBuffer2, hand_returns)
 from tractor_rl.features2 import (
     action_features,
     field_u8,
@@ -55,11 +56,23 @@ RUN_DIR = RESEARCH_DIR / "runs"
 
 # name, share of workers, learner-seat mask, seats the *current* net plays,
 # bot filling any non-learner seats
+# Every seat is the agent or one of its own past selves. The heuristic
+# `vs_bot` share was dropped: the agent beats smart-v2 by ~40 points, so
+# those games were blowouts carrying almost no gradient signal, and the
+# capacity is better spent on opponents that can still punish a mistake.
+#
+# What that gives up is an *external* reference. Self-play plus snapshots is
+# a closed system, and a closed system can drift into an equilibrium that is
+# self-consistent and still exploitable by anything outside it. The ladder is
+# now the only thing that would catch that, so it has to be run on a
+# schedule rather than when convenient.
+#
+# `preplay` stays smart-v34 everywhere: the network plays cards only, and
+# declaration and kitty burial are still heuristic by design.
 MATCHUPS = [
     ("self", 0.65, 0b1111, (0, 1, 2, 3), "smart-v34"),
-    ("vs_snapshot", 0.20, 0b1111, (0, 2), "smart-v34"),
+    ("vs_snapshot", 0.25, 0b1111, (0, 2), "smart-v34"),
     ("mixed_partner", 0.10, 0b1111, (0,), "smart-v34"),
-    ("vs_bot", 0.05, 0b0101, (0, 2), "smart-v2"),
 ]
 
 
@@ -127,11 +140,47 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--history", type=str, default="attn", choices=["attn", "none"])
     ap.add_argument("--lambda-mc", type=float, default=DMC2Config().lambda_mc)
+    # The target blend is a regulariser on the teacher (see dmc2.py): at the
+    # default 0.3 it outweighs the data 7:3. Right early, when the return is
+    # mostly deal noise; suspect late, when the teacher's own error is what
+    # binds. These anneal it out. Left unset the blend is constant, which is
+    # what every run before this one did.
+    ap.add_argument("--lambda-mc-final", type=float, default=None,
+                    help="anneal the blend to this value (default: constant)")
+    ap.add_argument("--lambda-anneal-start", type=int, default=0,
+                    help="learner steps at which the anneal begins")
+    ap.add_argument("--lambda-anneal-end", type=int, default=0,
+                    help="learner steps at which it reaches --lambda-mc-final")
     ap.add_argument("--batch-size", type=int, default=DMC2Config().batch_size)
     ap.add_argument("--train-every", type=int, default=DMC2Config().train_every)
     ap.add_argument("--steps-per-train", type=int, default=DMC2Config().steps_per_train)
+    # The critic costs about as much per step as the policy does, so its
+    # cadence is a direct lever on learner time -- the dominant cost once
+    # featurisation was fixed.
+    ap.add_argument("--critic-every", type=int, default=DMC2Config().critic_every)
+    # Depth of the featurisation prefetch queue; 0 disables the thread.
+    ap.add_argument("--prefetch", type=int, default=0)
+    ap.add_argument("--async-learner", action="store_true")
+    # Cycle steps_per_train through these values, `--sweep-minutes` on each.
+    # Cycling rather than ramping: the metrics drift as training proceeds, so
+    # a monotonic sweep would confound the setting with the drift. Visiting
+    # each value repeatedly shares the drift across all of them.
+    ap.add_argument("--replay-sweep", type=str, default="",
+                    help='e.g. "1,2,4,8"')
+    ap.add_argument("--sweep-minutes", type=float, default=8.0)
+    ap.add_argument("--amp", choices=["off", "bf16", "fp16"], default="off")
+    ap.add_argument("--tf32", action="store_true")
     ap.add_argument("--snapshot-every", type=int, default=10000, help="learner steps")
-    ap.add_argument("--snapshot-refresh", type=int, default=250, help="rounds between resamples")
+    # Rounds a pairing is held before resampling the opponent. Long blocks
+    # amortise the state_dict copy and keep per-agent batches large, which is
+    # what makes batched multi-agent GEMM worth anything on a GPU.
+    #
+    # The cost is buffer correlation: the replay buffer holds ~55s of play on
+    # a GPU box, so a 2500-round block (~113s) means that partway through,
+    # every sample involving the snapshot comes from one opponent. That is
+    # ~25% of the buffer -- vs_snapshot and mixed_partner -- since self-play
+    # and bot games do not use the snapshot net at all.
+    ap.add_argument("--snapshot-refresh", type=int, default=2500, help="rounds between resamples")
     ap.add_argument("--snapshot-pool", type=int, default=10)
     ap.add_argument("--log-every", type=int, default=200)
     ap.add_argument("--checkpoint-every", type=int, default=100000, help="learner steps")
@@ -152,7 +201,16 @@ def main() -> None:
 
     cfg = DMC2Config(
         lambda_mc=args.lambda_mc, batch_size=args.batch_size,
-        train_every=args.train_every, steps_per_train=args.steps_per_train)
+        train_every=args.train_every, steps_per_train=args.steps_per_train,
+        critic_every=args.critic_every,
+        lambda_mc_final=args.lambda_mc_final,
+        lambda_anneal_start=args.lambda_anneal_start,
+        lambda_anneal_end=args.lambda_anneal_end)
+    if args.lambda_mc_final is not None:
+        if args.lambda_anneal_end <= args.lambda_anneal_start:
+            raise SystemExit("--lambda-anneal-end must exceed --lambda-anneal-start")
+        print(f"lambda_mc anneals {args.lambda_mc} -> {args.lambda_mc_final} "
+              f"over steps {args.lambda_anneal_start}..{args.lambda_anneal_end}")
     net_cfg = NetConfig(history=args.history)
     net = TractorNet(net_cfg).to(device)
     critic = PrivilegedCritic().to(device)
@@ -170,8 +228,28 @@ def main() -> None:
         print(f"resumed from {args.resume} (step {resumed_steps}, "
               f"{len(resumed_snapshots)} snapshots)")
     learner = Learner2(net, critic, cfg, device)
+    if args.amp != "off":
+        learner.amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
+    if device.type == "cuda":
+        # TF32 accelerates fp32 matmuls on Ampere and later at reduced
+        # mantissa. Free on A10G (g5); a no-op on the T4 we benchmarked,
+        # which is Turing and has no TF32 path.
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        torch.backends.cudnn.allow_tf32 = args.tf32
     learner.steps = resumed_steps
     buffer = ReplayBuffer2(cfg.buffer_capacity, L.STATE_BYTES_PRIVILEGED)
+    # Featurising the next batch while the current one trains. Worth it when
+    # the device half is fast relative to the numpy half -- which is the
+    # normal case on a GPU and marginal on CPU, so it is opt-in.
+    prefetch = (
+        BatchPrefetcher(buffer, cfg.batch_size, args.seed + 977, depth=args.prefetch,
+                        featurise=device.type != "cuda")
+        if args.prefetch > 0 and not args.async_learner else None)
+    # Gradient steps off the game loop entirely. Supersedes the prefetch
+    # thread, which only hid featurisation; this hides the whole learner.
+    async_learner = (
+        AsyncLearner(learner, buffer, cfg, args.seed + 613)
+        if args.async_learner else None)
     rng = np.random.default_rng(args.seed)
 
     snapshot_net = TractorNet(net_cfg).to(device)
@@ -235,17 +313,29 @@ def main() -> None:
     pending: dict[tuple[int, int, int], list] = {}
     started = time.perf_counter()
     deadline = started + args.minutes * 60
+    sweep = [int(x) for x in args.replay_sweep.split(",") if x.strip()]
+    sweep_at = time.perf_counter()
+    sweep_i = 0
+    if sweep:
+        cfg = replace(cfg, steps_per_train=sweep[0])
+        print(f"replay sweep: {sweep}, {args.sweep_minutes} min per phase")
     rounds = decisions = trained_decisions = hands = 0
+    # Per-phase counters, so each setting is scored on its own window rather
+    # than on run-to-date totals.
+    phase_dec = phase_steps = 0
+    phase_start_step = 0
     last_checkpoint = time.perf_counter()
     recent_points: list[int] = []
-    t_env = t_feat = t_fwd = t_learn = 0.0
+    t_env = t_feat = t_fwd = t_learn = t_book = 0.0
 
     def score(model, rows, merged, tokens_all, mask_all, sf_all, af_all):
         """Greedy candidate index for a subset of decisions, under `model`."""
         if rows.shape[0] == 0:
             return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
         cand_mask, new_owner = subset_indices(rows, merged, merged.num_decisions)
-        with torch.no_grad():
+        # inference_mode rather than no_grad: it also skips version-counter
+        # and view tracking, measured 12% faster on a realistic actor round.
+        with torch.inference_mode():
             out = model(
                 sf_all[rows], af_all[cand_mask],
                 torch.from_numpy(new_owner).to(device),
@@ -319,6 +409,7 @@ def main() -> None:
                 pending.setdefault(key, []).append(
                     (store, local_i, int(trick_idx[i]), 1.0 if attacker[i] else -1.0))
             decisions += merged.num_decisions
+            phase_dec += merged.num_decisions
             trained_decisions += rows_cur.shape[0]
 
             for local_w, batch in enumerate(batches):
@@ -342,8 +433,18 @@ def main() -> None:
 
             t4 = time.perf_counter()
             if rounds % cfg.train_every == 0:
-                for _ in range(cfg.steps_per_train):
-                    learner.step(buffer, rng)
+                if async_learner is not None:
+                    # Hand the work off and keep the game loop moving.
+                    async_learner.request(cfg.steps_per_train)
+                else:
+                    for _ in range(cfg.steps_per_train):
+                        if prefetch is None:
+                            learner.step(buffer, rng)
+                        elif buffer.size >= cfg.min_buffer:
+                            nxt = prefetch.next()
+                            learner.step_batch(
+                                learner.featurise_on_device(nxt)
+                                if learner.device_featurise else nxt)
             t5 = time.perf_counter()
 
             if learner.steps > 0 and learner.steps % args.snapshot_every == 0:
@@ -365,7 +466,8 @@ def main() -> None:
                 else:
                     snapshot_net.load_state_dict(net.state_dict())
 
-            t_env += t1 - t0; t_feat += t2 - t1; t_fwd += t3 - t2; t_learn += t5 - t4
+            t_env += t1 - t0; t_feat += t2 - t1; t_fwd += t3 - t2
+            t_book += t4 - t3; t_learn += t5 - t4
             rounds += 1
 
             if rounds % args.log_every == 0:
@@ -383,17 +485,47 @@ def main() -> None:
                     "pct_features": round(100 * t_feat / el, 1),
                     "pct_forward": round(100 * t_fwd / el, 1),
                     "pct_learn": round(100 * t_learn / el, 1),
+                    # Buffer inserts, episode assembly and the pending map.
+                    # Untimed until now, which is why these used to sum to 96.
+                    "pct_bookkeeping": round(100 * t_book / el, 1),
+                    "async_dropped": (async_learner.dropped
+                                      if async_learner is not None else 0),
                     **{k: round(v, 5) for k, v in learner.stats.items()},
                 }
                 log_file.write(json.dumps(row) + "\n"); log_file.flush()
+                # lambda only earns a column while it is actually moving.
+                lam = (f" lam {row.get('lambda_mc')}"
+                       if cfg.lambda_mc_final is not None else "")
                 print(
                     f"[{row['elapsed_s']:7.1f}s] hands {row['hands']:7d} dec/s {row['decisions_per_s']:7.0f} "
                     f"steps {learner.steps:7d} loss {row.get('loss')} "
                     f"q {row.get('loss_q')} belief {row.get('belief_acc')} "
-                    f"tgt_std {row.get('target_std')} resid_std {row.get('critic_residual_std')}",
+                    f"tgt_std {row.get('target_std')} resid_std {row.get('critic_residual_std')}{lam}",
                     flush=True)
 
             now = time.perf_counter()
+            if sweep and buffer.size < cfg.min_buffer:
+                # Warm-up is not a data point: hold the clock until the
+                # buffer is full so every phase measures its own setting.
+                sweep_at = now
+                phase_dec = 0
+                phase_start_step = learner.steps
+            if sweep and now - sweep_at >= args.sweep_minutes * 60:
+                took = now - sweep_at
+                gained = learner.steps - phase_start_step
+                print(f"[sweep] steps_per_train={cfg.steps_per_train} "
+                      f"dec/s {phase_dec/took:7.0f} steps/s {gained/took:6.2f} "
+                      f"replay {gained*cfg.batch_size/max(1,phase_dec*0.85):5.2f} "
+                      f"| q {learner.stats.get('loss_q')} "
+                      f"resid {learner.stats.get('critic_residual_std')} "
+                      f"belief {learner.stats.get('belief_acc')}", flush=True)
+                sweep_i = (sweep_i + 1) % len(sweep)
+                cfg = replace(cfg, steps_per_train=sweep[sweep_i])
+                if async_learner is not None:
+                    async_learner.cfg = cfg
+                sweep_at = now
+                phase_dec = 0
+                phase_start_step = learner.steps
             if learner.steps > 0 and (
                 learner.steps % args.checkpoint_every == 0
                 or now - last_checkpoint >= args.checkpoint_minutes * 60
@@ -406,6 +538,10 @@ def main() -> None:
                      archive=learner.steps % args.checkpoint_every == 0)
                 last_checkpoint = now
     finally:
+        if async_learner is not None:
+            async_learner.close()
+        if prefetch is not None:
+            prefetch.close()
         pool.close()
         save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots, final=True)
         log_file.close()
