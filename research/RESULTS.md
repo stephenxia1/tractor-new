@@ -795,3 +795,55 @@ is the most destructive hyperparameter measured in this project so far. It
 was raised to 2 on the strength of a sweep that scored it on loss curves,
 and every run since has been quietly losing ground. Keep it at 1, and
 score any future change to it on the ladder.
+
+## The batched GEMM works, and buys nothing
+
+Built `tractor_rl/stacked.py`: N agents as one module, every Linear a
+`[N, in, out]` weight driven by `baddbmm`, including the causal history
+attention (projections as per-agent bmms, the agent axis folded into the
+batch for `scaled_dot_product_attention`). Parity with N separate
+`TractorNet`s holds to 1e-16 in float64 and 1e-8 in float32, outputs and
+gradients, on CPU and CUDA. It is correct. On the network we actually train
+it is also pointless.
+
+T4, batch 512 per agent, full forward and backward:
+
+| N | separate ms | stacked ms | speedup | cost vs N=1 |
+| --- | --- | --- | --- | --- |
+| 1 | 13.77 | 15.26 | 0.90x | 1.00x |
+| 4 | 55.55 | 57.08 | 0.97x | 3.74x |
+| 8 | 108.32 | 112.25 | 0.97x | 7.35x |
+| 16 | 215.50 | 217.22 | 0.99x | 14.23x |
+
+Same measurement with `--history none`:
+
+| N | separate ms | stacked ms | speedup | cost vs N=1 |
+| --- | --- | --- | --- | --- |
+| 1 | 6.64 | 5.90 | 1.13x | 1.00x |
+| 8 | 66.61 | 23.17 | **2.87x** | **3.93x** |
+
+So the batching does exactly what it was designed to do -- the MLP path
+goes from 8x to 3.93x -- and then the causal history encoder swamps it.
+Attention is **61% of a step at N=1 and 79% at N=8**, and it scales 9.52x
+from N=1 to N=8, slightly *worse* than linear. It is compute-bound, not
+launch-bound: it runs over 16 tokens per row, so 8192 tokens where the
+trunk sees 512, and no arrangement of the agent axis changes how much
+arithmetic that is.
+
+**This corrects an earlier claim in this file.** The 5.69x figure came from
+`bench_multiagent.py`, which covered the MLP path and said so, and was read
+as "the batched GEMM is a requirement of the population design, not an
+optimisation". With attention included it is neither: a plain Python loop
+over 8 agents on a T4 runs at 73.9 agent-steps/s against the stacked net's
+71.3. The population needs 3.53 steps/s per agent -- 28.2 aggregate -- so
+**N=8 is already viable on one GPU with no batching at all**. What made the
+population run slow was that it ran on a CPU, where it managed 0.99.
+
+### The real lever is the history encoder
+
+Dropping it takes N=8 from 112.25 ms to 23.17 ms a step, 71 agent-steps/s
+to 345. Its value has never been measured: it was added on the argument
+that planes say *what* was played but not by whom or when, and nothing has
+ever tested a run without it against the ladder. At 61-79% of every
+gradient step in the project, that is now the most expensive unmeasured
+assumption in the stack.
