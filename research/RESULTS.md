@@ -759,3 +759,39 @@ A warning about sample size, since it nearly produced a wrong answer. At
 120 pairs `a65` led the control by 6.7 points *and* led on all three rungs.
 At 1000 pairs the lead was 0.13. Correlated rungs do not make a weak
 signal strong.
+
+### Confirmed: the replay ratio caused it
+
+The controlled run. Same start, same box family, same everything the three
+annealing arms used, with `--steps-per-train 1` instead of 2. Matched at
+two step counts against `smart-v2`, 1000 duplicate pairs, deal base 424200:
+
+| run | `steps_per_train` | replay | @1,250,000 | @1,300,000 |
+| --- | --- | --- | --- | --- |
+| `v2_final` (start, 1,103,832) | -- | -- | +32.88 [+30.41, +35.35] | -- |
+| `replay1` | 1 | 0.82 | **+30.91** [+28.54, +33.29] | **+30.54** [+28.15, +32.93] |
+| `anneal_ctl` | 2 | ~2.5 | +25.37 [+23.03, +27.70] | +24.00 [+21.47, +26.53] |
+
+Confidence intervals are disjoint at both step counts, +5.54 and +6.54.
+The only difference between the two runs is how many gradient steps are
+taken per training round.
+
+So the decline was not continued training, and not the privileged teacher.
+At a healthy replay ratio the same 196k steps are **flat** -- +30.54
+against the start's +32.88, intervals nearly touching -- which makes 1104k
+a genuine plateau rather than a peak being fallen from. At replay ~2.5 the
+same steps cost nine points, and at ~9.0 they cost sixty.
+
+Dose-response, four runs:
+
+| replay | 196k steps from `v2_final` |
+| --- | --- |
+| 0.82 | flat (-2.3, marginal) |
+| ~2.5 | -8.9 |
+| ~9.0 | -60 (from scratch, worse than `smart-v2`) |
+
+**Practical consequence.** `--steps-per-train` is not a throughput knob, it
+is the most destructive hyperparameter measured in this project so far. It
+was raised to 2 on the strength of a sweep that scored it on loss curves,
+and every run since has been quietly losing ground. Keep it at 1, and
+score any future change to it on the ladder.
