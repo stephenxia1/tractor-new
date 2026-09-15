@@ -847,3 +847,41 @@ that planes say *what* was played but not by whom or when, and nothing has
 ever tested a run without it against the ladder. At 61-79% of every
 gradient step in the project, that is now the most expensive unmeasured
 assumption in the stack.
+
+## Pre-registration: does the move-history encoder earn its cost? (run 2)
+
+Written before the run finished, so the analysis cannot be chosen to suit
+the numbers. Launched 2026-09-15 03:08 UTC, two 12-hour fleets.
+
+**What the first attempt could and could not show.** Arms level at equal
+machine-hours: `attn` +17.05 [14.50, 19.59] at 195,514 steps, `none` +18.04
+[15.62, 20.45] at 352,797, 1000 pairs against `smart-v2`. Belief accuracy
+identical (0.8803 vs 0.8799), which is the most direct evidence available
+that the encoder is not doing the hidden-hand inference it was added for --
+`--history none` removes the *move-sequence encoder*, not memory; the card
+planes still record everything played, only who played it and when is lost.
+
+It could not separate sample efficiency from speed, because only `_latest`
+was mirrored and the arms were therefore only ever observed at different
+step counts. And neither converged: both scored +17-18 where the deployed
+agent scores +31.81, so the comparison lives in early training, where
+attribution plausibly matters less than it does among fine distinctions.
+
+**Design of run 2.** Identical arms except `--history`, same seed, same
+`--steps-per-train 1`, same instance family, 12 hours. Checkpoints mirrored
+at 50k, 100k, 200k, 300k, 400k, 500k and 600k steps, so both arms can be
+read at **matched steps** and at **matched wall clock** -- the latter from
+S3's `LastModified`, which survives the resume that resets the in-process
+elapsed counter. Every evaluation is 1000 duplicate pairs from base 424200
+against `smart-v2` and `smart-v4`.
+
+**Pre-registered readings:**
+
+| outcome | conclusion |
+| --- | --- |
+| `none` matches `attn` at matched steps | the encoder adds nothing |
+| `attn` > `none` at steps, not at hours | more sample-efficient, still not worth 61% of a step |
+| `attn` > `none` at both | it earns its cost; keep it |
+| `none` > `attn` at matched steps | something is wrong; investigate before believing it |
+
+Harness is `py/hist2_eval.py`, written before the results existed.
