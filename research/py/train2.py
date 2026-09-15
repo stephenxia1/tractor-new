@@ -501,11 +501,14 @@ def main() -> None:
                 next_snapshot_at = ((learner.steps // args.snapshot_every) + 1
                                     ) * args.snapshot_every
                 if not snapshots or snapshots[-1]["steps"] != learner.steps:
-                    snapshots.append({
-                        "steps": learner.steps,
-                        "state": copy.deepcopy(
-                            {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}),
-                    })
+                    # Cloned under the lock for the same reason `save` takes
+                    # it: a snapshot spanning two optimiser steps would put a
+                    # network that never existed into the opponent pool.
+                    with learner.weights_lock:
+                        snap_state = copy.deepcopy(
+                            {k: v.detach().cpu().clone()
+                             for k, v in net.state_dict().items()})
+                    snapshots.append({"steps": learner.steps, "state": snap_state})
             # Reloading a snapshot copies parameters, so do it rarely.
             # Until the pool has anything in it, track the current network:
             # otherwise those seats would play with the random initial
@@ -516,7 +519,8 @@ def main() -> None:
                     pick = snapshots[int(rng.integers(0, len(snapshots)))]
                     snapshot_net.load_state_dict(pick["state"])
                 else:
-                    snapshot_net.load_state_dict(net.state_dict())
+                    with learner.weights_lock:
+                        snapshot_net.load_state_dict(net.state_dict())
 
             t_env += t1 - t0; t_feat += t2 - t1; t_fwd += t3 - t2
             t_book += t4 - t3; t_learn += t5 - t4
@@ -631,6 +635,24 @@ def _atomic_save(payload: dict, path: Path) -> None:
 
 def save(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
          final=False, archive=True) -> None:
+    """Write a checkpoint, holding the weights lock for the whole write.
+
+    `state_dict()` hands back references to the live tensors, not copies, so
+    taking the lock only while building the payload would prove nothing --
+    the optimiser would go on mutating them while `torch.save` serialised.
+    Holding it across the write instead costs the learner thread well under
+    a second every `--checkpoint-minutes`, and buys a checkpoint that is one
+    coherent network rather than parameters from two different optimiser
+    steps, which is a network that never existed and which a resume would
+    then train from.
+    """
+    with learner.weights_lock:
+        _save_locked(net, critic, learner, cfg, net_cfg, args, hands,
+                     snapshots, final, archive)
+
+
+def _save_locked(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
+                 final=False, archive=True) -> None:
     payload = {
         "arch": "v2",
         "model": net.state_dict(),

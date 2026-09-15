@@ -937,3 +937,34 @@ logged rather than fatal -- losing the moments is a transient, losing a
 spot run at boot is not. Cost is **+8.1 MB on a 16.1 MB checkpoint**, and
 `py/test_snapshot_resume.py` checks the moments round-trip element-wise
 after real gradient steps.
+
+## How much the snapshot-cadence bug cost
+
+`train2.py` fired snapshot capture on `learner.steps % snapshot_every == 0`,
+sampled once per round. Under `--async-learner` the counter advances on
+another thread, so successive samples jump by more than one and the test
+mostly misses. Simulated over 20,000 rounds at `snapshot_every = 10000`:
+
+| steps per round | snapshots due | modulo fired | watermark fired |
+| --- | --- | --- | --- |
+| 1 | 1 | 2 | 1 |
+| 3 | 5 | 3 | 5 |
+| 12 | 23 | 1 | 23 |
+| 40 | 80 | 3 | 80 |
+
+An empty pool makes `snapshot_net` track the live net, so `vs_snapshot` and
+`mixed_partner` -- 35% of workers -- quietly become plain self-play. Nothing
+in the metrics changes when this happens.
+
+The runs exposed to it are the ones that used `--async-learner`: the
+cross-play pair (~2 steps/round, so a partly-filled pool) and the GPU replay
+sweep. Both were already discounted for other reasons -- cross-play for
+replay 8.97, the sweep for scoring replay on loss curves -- but this is a
+second, independent reason not to trust the cross-play numbers. No
+conclusion in this file rests on either.
+
+Both triggers are watermarks now, and `--async-learner` also holds a lock
+around the in-place optimiser steps: `state_dict()` returns references to
+live tensors, so a checkpoint written while the learner stepped could
+capture parameters from two different steps -- a network that never existed,
+which a resume would then train from.

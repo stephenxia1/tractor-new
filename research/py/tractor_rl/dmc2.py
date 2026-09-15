@@ -373,6 +373,17 @@ class Learner2:
         self.opt = torch.optim.RMSprop(net.parameters(), lr=cfg.lr)
         self.critic_opt = torch.optim.RMSprop(critic.parameters(), lr=cfg.critic_lr)
         self.steps = 0
+        # Held while the optimisers mutate parameters in place. With
+        # --async-learner that happens on a background thread while the main
+        # thread is reading the same tensors, and a *torn checkpoint* -- one
+        # holding parameters from two different optimiser steps -- is a
+        # network that never existed and that a resume would train from.
+        #
+        # Only the two `.step()` calls are covered, not the forward. Acting
+        # with weights a fraction of a second old is the trade this class
+        # exists to make and DMC tolerates it; saving a network that never
+        # existed is not the same thing.
+        self.weights_lock = threading.Lock()
         self._last_critic_loss_t: torch.Tensor | None = None
         # Featurising on the device only pays when the device is fast
         # relative to numpy, which in practice means CUDA.
@@ -455,7 +466,8 @@ class Learner2:
             self.critic_opt.zero_grad(set_to_none=True)
             critic_loss.backward()
             nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
-            self.critic_opt.step()
+            with self.weights_lock:
+                self.critic_opt.step()
             # .float() to match the no_grad branch below. Without it the
             # teacher target and `critic_residual_std` are computed in the
             # autocast dtype on every critic_every-th step and in fp32 on the
@@ -495,7 +507,8 @@ class Learner2:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), cfg.grad_clip)
-        self.opt.step()
+        with self.weights_lock:
+            self.opt.step()
 
         self.steps += 1
 
