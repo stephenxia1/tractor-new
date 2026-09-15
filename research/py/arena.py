@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
 from dataclasses import dataclass, replace
@@ -70,6 +71,11 @@ class PairResult:
     level_margin: float
     agent_attack_points: int
     opponent_attack_points: int
+    # The deal this pair was played on. Two runs against the same opponent
+    # from the same --base see the same deals, so carrying the digest lets
+    # them be compared *paired* rather than as two independent samples --
+    # deal luck cancels, exactly as it does within a pair.
+    deal_digest: str = ""
 
 
 def agent_defends(landlord_seat: int, agent_seats: tuple[int, ...]) -> bool:
@@ -106,6 +112,7 @@ def score_pair(ep_a: Episode, ep_b: Episode) -> PairResult:
     agent_lv_a, opp_lv_a = signed_levels(ep_a, a_defends)
     agent_lv_b, opp_lv_b = signed_levels(ep_b, b_defends)
     return PairResult(
+        deal_digest=ep_a.deal_digest,
         point_margin=float(agent_attack - opponent_attack),
         level_margin=float((agent_lv_a + agent_lv_b) - (opp_lv_a + opp_lv_b)),
         agent_attack_points=agent_attack,
@@ -178,6 +185,9 @@ def main() -> None:
                     help="candidates searched per decision")
     ap.add_argument("--search-opponent", type=str, default="smart-v2",
                     help="rollout policy for the other seats inside a simulation")
+    ap.add_argument("--dump-pairs", type=str, default="",
+                    help="write per-pair margins as JSONL, keyed by deal digest, "
+                         "so two runs can be compared paired (see py/compare_runs.py)")
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
@@ -328,6 +338,16 @@ def main() -> None:
     levels = np.array([r.level_margin for r in results], dtype=np.float64)
     agent_attack = np.array([r.agent_attack_points for r in results], dtype=np.float64)
     opp_attack = np.array([r.opponent_attack_points for r in results], dtype=np.float64)
+
+    if args.dump_pairs:
+        with open(args.dump_pairs, "w", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps({
+                    "digest": r.deal_digest,
+                    "points": r.point_margin,
+                    "levels": r.level_margin,
+                }) + "\n")
+        print(f"  wrote {len(results)} pair margins to {args.dump_pairs}")
 
     agent_name = args.agent if model is not None else f"bot:{agent_bot}"
     print()

@@ -38,6 +38,13 @@ class WorkerConfig:
     # Bot handling declaration and kitty burial at every seat.
     preplay: str = "smart-v34"
     max_candidates: int = 48
+    # Probability of perturbing the pre-play bot's kitty choice, and how
+    # many cards it may swap. Defaults to 0: the option existed in env.ts
+    # and was read by GameSlot, but nothing ever set it, so the
+    # perturbation never ran. Wired up here so it is reachable, still
+    # off by default so no existing run changes.
+    kitty_noise: float = 0.0
+    kitty_max_swaps: int = 3
     randomize: bool = True
     # Duplicate mode: when set, this worker's deals are a pure function of
     # (deal_seed_base, game slot, hand index), so a second worker given the
@@ -80,6 +87,9 @@ class Worker:
             "--randomize",
             "1" if config.randomize else "0",
         ]
+        if config.kitty_noise > 0:
+            args += ["--kitty-noise", str(config.kitty_noise),
+                     "--kitty-max-swaps", str(config.kitty_max_swaps)]
         if config.deal_seed_base is not None:
             args += ["--deal-seed-base", str(config.deal_seed_base)]
         if config.fixed_landlord is not None:

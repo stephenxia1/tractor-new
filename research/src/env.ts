@@ -445,13 +445,24 @@ export class GameSlot {
     const maxSwaps = Math.min(chosen.length, this.opts.kittyMaxSwaps ?? 3);
     const swaps = 1 + Math.floor(this.rng() * maxSwaps);
 
-    const buried = new Set(chosen.map(cardKey));
-    const pool = landlordHand.filter((c) => !buried.has(cardKey(c)));
+    // Full identity, not `cardKey`: that ignores `deckId`, so with two
+    // decks burying one copy of a card excluded the *other* copy from the
+    // pool too, and a duplicate of anything buried could never be swapped
+    // in -- a systematic hole in the neighbourhood this is meant to cover.
+    const identity = (c: Card): string => `${cardKey(c)}#${c.deckId}`;
+    const buried = new Set(chosen.map(identity));
+    const pool = landlordHand.filter((c) => !buried.has(identity(c)));
     if (pool.length === 0) return chosen;
 
+    // Distinct slots: drawing `drop` with replacement let one slot be
+    // overwritten twice, so a 3-swap draw could land only 2 changes and
+    // discard a card it had just swapped in.
+    const slots = Array.from({ length: chosen.length }, (_, i) => i);
     const out = [...chosen];
-    for (let i = 0; i < swaps && pool.length > 0; i++) {
-      const drop = Math.floor(this.rng() * out.length);
+    for (let i = 0; i < swaps && pool.length > 0 && slots.length > 0; i++) {
+      const dropAt = Math.floor(this.rng() * slots.length);
+      const drop = slots[dropAt]!;
+      slots.splice(dropAt, 1);
       const take = Math.floor(this.rng() * pool.length);
       out[drop] = pool[take]!;
       pool.splice(take, 1);

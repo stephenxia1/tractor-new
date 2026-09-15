@@ -29,6 +29,8 @@ type Args = {
   baseline: BotType;
   preplay: BotType;
   maxCandidates: number;
+  kittyNoise: number;
+  kittyMaxSwaps: number;
   randomize: boolean;
   dealSeedBase: number | undefined;
   fixedLandlord: Seat | undefined;
@@ -73,6 +75,8 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
     baseline: (get('baseline') ?? 'smart-v34') as BotType,
     preplay: (get('preplay') ?? 'smart-v34') as BotType,
     maxCandidates: Number(get('max-cands') ?? '48'),
+    kittyNoise: Number(get('kitty-noise') ?? '0'),
+    kittyMaxSwaps: Number(get('kitty-max-swaps') ?? '3'),
     randomize: (get('randomize') ?? '1') !== '0',
     dealSeedBase: dealBaseRaw === undefined ? undefined : Number(dealBaseRaw),
     fixedLandlord:
@@ -188,6 +192,8 @@ async function main(): Promise<void> {
         baselineBot: args.baseline,
         prePlayBot: args.preplay,
         maxCandidates: args.maxCandidates,
+        kittyNoise: args.kittyNoise,
+        kittyMaxSwaps: args.kittyMaxSwaps,
         randomize: args.randomize,
         dealSeedBase: args.dealSeedBase,
         fixedLandlord: args.fixedLandlord,
