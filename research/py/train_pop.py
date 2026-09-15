@@ -299,6 +299,14 @@ def main() -> None:
             agent.net.load_state_dict(blob["model"])
             agent.acting.load_state_dict(blob.get("acting", blob["model"]))
             agent.critic.load_state_dict(blob["critic"])
+            for key, opt in (("opt", agent.learner.opt),
+                             ("critic_opt", agent.learner.critic_opt)):
+                if blob.get(key) is not None:
+                    try:
+                        opt.load_state_dict(blob[key])
+                    except (ValueError, KeyError, RuntimeError) as err:
+                        print(f"  agent {i}: dropping {key}: "
+                              f"{' '.join(str(err).split())[:100]}")
             agent.learner.steps = int(blob.get("steps", 0))
             agent.decisions = int(blob.get("decisions", 0))
             agent.trained = int(blob.get("trained", 0))
@@ -351,6 +359,11 @@ def main() -> None:
                 "model": a.net.state_dict(),
                 "acting": a.acting.state_dict(),
                 "critic": a.critic.state_dict(),
+                # Each agent's RMSprop moments. A resume without them
+                # restarts every optimiser from zero at once, which is a
+                # population-wide transient rather than a single agent's.
+                "opt": a.learner.opt.state_dict(),
+                "critic_opt": a.learner.critic_opt.state_dict(),
                 "steps": a.learner.steps,
                 "decisions": a.decisions,
                 "trained": a.trained,

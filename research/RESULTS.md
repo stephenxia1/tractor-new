@@ -885,3 +885,55 @@ against `smart-v2` and `smart-v4`.
 | `none` > `attn` at matched steps | something is wrong; investigate before believing it |
 
 Harness is `py/hist2_eval.py`, written before the results existed.
+
+### Result: keep the encoder
+
+The rerun answered the question the first attempt could not. Against
+`smart-v2`, 1000 duplicate pairs from base 424200, at matched step counts:
+
+| steps | attn | none | attn's edge |
+| --- | --- | --- | --- |
+| 50,000 | +4.59 [+2.1, +7.1] | +3.58 [+1.2, +5.9] | +1.01 |
+| 100,000 | +12.66 [+10.2, +15.1] | +8.73 [+6.3, +11.1] | +3.93 |
+| 200,000 | +18.35 [+15.9, +20.8] | +15.59 [+13.1, +18.1] | +2.76 |
+| 300,000 | +23.57 [+21.2, +25.9] | +14.19 [+11.7, +16.7] | +9.38 |
+
+**The encoder is more sample-efficient**, ahead at every matched step on
+`smart-v2` and at three of four on `smart-v4`. The first attempt's null was
+an artifact of observing the arms at 195k and 353k steps and calling that a
+comparison.
+
+On machine-hours the two are level -- `attn` runs 8.4 steps/s against
+`none`'s 15.9, so at ten training-hours it is +23.57 at 300k against
++24.94 at 600k, intervals overlapping. That is pre-registered row 2, and on
+that basis alone the encoder does not pay. Three things argue against
+acting on it, and the decision was to **keep the encoder**:
+
+* `attn` is still climbing steeply at its last point (+18.35 -> +23.57 over
+  100k steps) where `none`'s last two are flat (+24.72 -> +24.94). Neither
+  is near the deployed +31.81, and the curves are not done.
+* The 300k `none` checkpoint is contaminated: worse than its own 200k on
+  *both* rungs, with a restart logged at 265,408 steps. It drives the
+  largest matched-step gap; without it the edge is ~2.6 points.
+* The wall-clock axis is dirty in the other direction -- `attn` was
+  reclaimed seven times to `none`'s three, so its machine-hour efficiency
+  is understated.
+
+The cheap, general lesson is the one below.
+
+## Optimiser state now survives a checkpoint
+
+`train2.py` saved model and critic weights but not RMSprop's second
+moments, so **every resume restarted the optimiser cold**. On interruptible
+hardware that is not an edge case: the `attn` arm above was reclaimed seven
+times in twelve hours, and the `none` arm's checkpoint taken 35k steps
+after one such reset measured worse than its own checkpoint 100k steps
+earlier, on two independent opponents.
+
+Both `train2.py` and `train_pop.py` (per agent) now persist `opt` and
+`critic_opt` and restore them after the optimisers exist. A checkpoint
+predating the field still loads and starts cold, and a shape mismatch is
+logged rather than fatal -- losing the moments is a transient, losing a
+spot run at boot is not. Cost is **+8.1 MB on a 16.1 MB checkpoint**, and
+`py/test_snapshot_resume.py` checks the moments round-trip element-wise
+after real gradient steps.

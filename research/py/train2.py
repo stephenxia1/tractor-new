@@ -217,8 +217,10 @@ def main() -> None:
     resumed_snapshots: list[dict] = []
     resumed_steps = 0
     hands_base = 0
+    resumed_state: dict | None = None
     if args.resume:
         state = torch.load(args.resume, map_location=device)
+        resumed_state = state
         net.load_state_dict(state["model"])
         if "critic" in state:
             critic.load_state_dict(state["critic"])
@@ -228,6 +230,22 @@ def main() -> None:
         print(f"resumed from {args.resume} (step {resumed_steps}, "
               f"{len(resumed_snapshots)} snapshots)")
     learner = Learner2(net, critic, cfg, device)
+    if resumed_state is not None:
+        # After the optimisers exist. Checkpoints written before this was
+        # added carry no optimiser state, and a shape mismatch (a resume
+        # under a different --history) must not be fatal at boot time on a
+        # spot box: losing the moments is a transient, losing the run is not.
+        for key, opt in (("opt", learner.opt), ("critic_opt", learner.critic_opt)):
+            blob = resumed_state.get(key)
+            if blob is None:
+                print(f"  no {key} in checkpoint; optimiser starts cold")
+                continue
+            try:
+                opt.load_state_dict(blob)
+            except (ValueError, KeyError, RuntimeError) as err:
+                print(f"  dropping {key}: {' '.join(str(err).split())[:140]}")
+            else:
+                print(f"  restored {key}")
     if args.amp != "off":
         learner.amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
     if device.type == "cuda":
@@ -591,6 +609,15 @@ def save(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
         "snapshots": [
             {"steps": s["steps"], "state": _to_half(s["state"])} for s in snapshots
         ],
+        # RMSprop's running second moments. Without these a resume restarts
+        # the optimiser from zero, so the first steps after every reclaim
+        # take effectively uncalibrated step sizes. One 12-hour history-A/B
+        # arm was reclaimed seven times, and the checkpoint taken 35k steps
+        # after one of those resets measured worse than the checkpoint
+        # 100k steps *before* it, on two independent opponents. Roughly
+        # +17 MB on the file, which is cheap against that.
+        "opt": learner.opt.state_dict(),
+        "critic_opt": learner.critic_opt.state_dict(),
     }
     if archive:
         name = f"{args.run_name}_final.pt" if final else f"{args.run_name}_{learner.steps}.pt"
