@@ -119,6 +119,32 @@ def test_cold_start() -> None:
     check(counts.sum() == 32, "cold start should fill every seat with a live agent")
 
 
+def test_cold_start_small_population() -> None:
+    """Fewer agents than seats must still deal, and deal evenly.
+
+    `--agents 2` used to die at the first seating with a ValueError naming
+    `live_per_table`, a parameter the caller never set: the cold-start path
+    forced four live seats per table and the balanced assignment refuses to
+    seat one agent twice at a table. Below four agents that is impossible,
+    so repeats are correct -- two agents give a0/a1/a0/a1, which is still
+    both of them playing each other.
+    """
+    print("cold start with fewer agents than seats")
+    for n in (1, 2, 3, 5):
+        worst = 0
+        for t in range(200):
+            seating = plan_seating(np.random.default_rng(t), n, 4, 2, archive_refs=())
+            counts = live_seat_counts(seating, n)
+            check(all(len(row) == 4 for row in seating), f"n={n}: table is not four seats")
+            check(all(r.is_live for row in seating for r in row), f"n={n}: archive ref seated")
+            check(counts.sum() == 16, f"n={n}: seats do not add up")
+            worst = max(worst, int(counts.max() - counts.min()))
+        # Cycled permutations dealt from one pool, so the imbalance is only
+        # the remainder of 16 / n.
+        check(worst <= 1, f"n={n}: seat counts spread by {worst}, want <= 1")
+        print(f"    {n} agent(s): 16 seats dealt, worst spread {worst}")
+
+
 def test_reservoir_is_uniform_over_history() -> None:
     print("reservoir sampling is uniform over the whole history")
     # The claim that matters: an agent published 400 times but only 20 slots
@@ -278,7 +304,8 @@ def test_rejects_bad_config() -> None:
 
 def main() -> int:
     for fn in (test_seating_shape, test_live_spread, test_partner_and_opponent_mix,
-               test_cold_start, test_reservoir_is_uniform_over_history, test_burn_in,
+               test_cold_start, test_cold_start_small_population,
+               test_reservoir_is_uniform_over_history, test_burn_in,
                test_choose_archive_refs, test_routing_arrays,
                test_routing_and_attribution, test_rejects_bad_config):
         fn()

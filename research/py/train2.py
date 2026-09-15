@@ -168,7 +168,10 @@ def main() -> None:
     ap.add_argument("--replay-sweep", type=str, default="",
                     help='e.g. "1,2,4,8"')
     ap.add_argument("--sweep-minutes", type=float, default=8.0)
-    ap.add_argument("--amp", choices=["off", "bf16", "fp16"], default="off")
+    # fp16 is deliberately absent: autocast in fp16 needs a GradScaler to
+    # keep gradients from underflowing, there is none here, and bf16 (which
+    # needs no scaling) measured *slower* on both A10G and T4 anyway.
+    ap.add_argument("--amp", choices=["off", "bf16"], default="off")
     ap.add_argument("--tf32", action="store_true")
     ap.add_argument("--snapshot-every", type=int, default=10000, help="learner steps")
     # Rounds a pairing is held before resampling the opponent. Long blocks
@@ -245,9 +248,16 @@ def main() -> None:
             except (ValueError, KeyError, RuntimeError) as err:
                 print(f"  dropping {key}: {' '.join(str(err).split())[:140]}")
             else:
-                print(f"  restored {key}")
+                # load_state_dict also restores param_groups, so a checkpoint
+                # written under a different --lr would silently override the
+                # one just asked for: a config edit that appears to take
+                # effect and does not. Only the moments are wanted here.
+                lr = cfg.critic_lr if key == "critic_opt" else cfg.lr
+                for group in opt.param_groups:
+                    group["lr"] = lr
+                print(f"  restored {key} (lr held at {lr})")
     if args.amp != "off":
-        learner.amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
+        learner.amp_dtype = torch.bfloat16
     if device.type == "cuda":
         # TF32 accelerates fp32 matmuls on Ampere and later at reduced
         # mantissa. Free on A10G (g5); a no-op on the T4 we benchmarked,
@@ -261,6 +271,7 @@ def main() -> None:
     # normal case on a GPU and marginal on CPU, so it is opt-in.
     prefetch = (
         BatchPrefetcher(buffer, cfg.batch_size, args.seed + 977, depth=args.prefetch,
+                        min_buffer=cfg.min_buffer,
                         featurise=device.type != "cuda")
         if args.prefetch > 0 and not args.async_learner else None)
     # Gradient steps off the game loop entirely. Supersedes the prefetch
@@ -343,6 +354,9 @@ def main() -> None:
     phase_dec = phase_steps = phase_trained = 0
     phase_start_step = 0
     last_checkpoint = time.perf_counter()
+    # Watermarks rather than modulo tests; see the snapshot block below.
+    next_snapshot_at = ((resumed_steps // args.snapshot_every) + 1) * args.snapshot_every
+    next_archive_at = ((resumed_steps // args.checkpoint_every) + 1) * args.checkpoint_every
     recent_points: list[int] = []
     t_env = t_feat = t_fwd = t_learn = t_book = 0.0
 
@@ -453,6 +467,15 @@ def main() -> None:
             t4 = time.perf_counter()
             if rounds % cfg.train_every == 0:
                 if async_learner is not None:
+                    # A learner thread that dies leaves `request` succeeding
+                    # until the queue fills and then silently dropping, so the
+                    # run burns its whole --minutes collecting data and taking
+                    # no gradient steps. The class records the exception; this
+                    # is the half that was missing.
+                    if async_learner.error is not None:
+                        raise RuntimeError(
+                            "async learner thread died: "
+                            f"{async_learner.error!r}") from async_learner.error
                     # Hand the work off and keep the game loop moving.
                     async_learner.request(cfg.steps_per_train)
                 else:
@@ -466,7 +489,17 @@ def main() -> None:
                                 if learner.device_featurise else nxt)
             t5 = time.perf_counter()
 
-            if learner.steps > 0 and learner.steps % args.snapshot_every == 0:
+            # A watermark, not `steps % snapshot_every == 0`. The main loop
+            # samples `learner.steps` once a round, and the step counter can
+            # stride past an exact multiple -- always with --async-learner,
+            # where a background thread advances it between samples, and
+            # whenever --steps-per-train is not 1 and the phase lands on an
+            # odd offset. Missing the multiple leaves the pool empty, and an
+            # empty pool makes `snapshot_net` track the live net, quietly
+            # turning 35% of the matchups into plain self-play.
+            if learner.steps >= next_snapshot_at:
+                next_snapshot_at = ((learner.steps // args.snapshot_every) + 1
+                                    ) * args.snapshot_every
                 if not snapshots or snapshots[-1]["steps"] != learner.steps:
                     snapshots.append({
                         "steps": learner.steps,
@@ -545,8 +578,9 @@ def main() -> None:
                 sweep_at = now
                 phase_dec = phase_trained = 0
                 phase_start_step = learner.steps
+            archive_due = learner.steps >= next_archive_at
             if learner.steps > 0 and (
-                learner.steps % args.checkpoint_every == 0
+                archive_due
                 or now - last_checkpoint >= args.checkpoint_minutes * 60
             ):
                 # Only the step-based trigger keeps a numbered archive.
@@ -554,7 +588,10 @@ def main() -> None:
                 # opponent pool inside, every one of those is a large
                 # file nobody reads.
                 save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots,
-                     archive=learner.steps % args.checkpoint_every == 0)
+                     archive=archive_due)
+                if archive_due:
+                    next_archive_at = ((learner.steps // args.checkpoint_every) + 1
+                                       ) * args.checkpoint_every
                 last_checkpoint = now
     finally:
         if async_learner is not None:

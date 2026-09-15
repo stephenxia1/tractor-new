@@ -319,9 +319,10 @@ class BatchPrefetcher:
     """
 
     def __init__(self, buffer, batch_size: int, seed: int, depth: int = 2,
-                 featurise: bool = True) -> None:
+                 featurise: bool = True, min_buffer: int = 0) -> None:
         self.buffer = buffer
         self.batch_size = batch_size
+        self.min_buffer = min_buffer
         # When the learner featurises on its own device there is nothing for
         # this thread to precompute, so it only samples.
         self.featurise = featurise
@@ -333,7 +334,11 @@ class BatchPrefetcher:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            if self.buffer.size < self.batch_size:
+            # min_buffer, not batch_size: sampling is with replacement, so a
+            # buffer holding one batch happily yields a batch of duplicates,
+            # and the caller's own min_buffer guard comes too late -- the
+            # batch is already drawn.
+            if self.buffer.size < max(self.batch_size, self.min_buffer):
                 time.sleep(0.01)
                 continue
             sample = self.buffer.sample(self.batch_size, self._rng)
@@ -451,7 +456,12 @@ class Learner2:
             critic_loss.backward()
             nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
             self.critic_opt.step()
-            q_priv = q_priv.detach()
+            # .float() to match the no_grad branch below. Without it the
+            # teacher target and `critic_residual_std` are computed in the
+            # autocast dtype on every critic_every-th step and in fp32 on the
+            # rest -- precision alternating with step parity, in the one place
+            # this file argues fp32 matters.
+            q_priv = q_priv.detach().float()
             self._last_critic_loss_t = critic_loss.detach()
         else:
             with torch.no_grad(), amp:

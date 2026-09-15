@@ -211,7 +211,8 @@ def main() -> None:
     ap.add_argument("--lambda-anneal-start", type=int, default=0)
     ap.add_argument("--lambda-anneal-end", type=int, default=0)
     ap.add_argument("--critic-every", type=int, default=DMC2Config().critic_every)
-    ap.add_argument("--amp", choices=["off", "bf16", "fp16"], default="off")
+    # No fp16: autocast in fp16 needs a GradScaler and there is none.
+    ap.add_argument("--amp", choices=["off", "bf16"], default="off")
     ap.add_argument("--tf32", action="store_true")
     ap.add_argument("--log-every", type=int, default=500)
     ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
@@ -266,7 +267,7 @@ def main() -> None:
         critic = PrivilegedCritic().to(device)
         learner = Learner2(net, critic, cfg, device)
         if args.amp != "off":
-            learner.amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
+            learner.amp_dtype = torch.bfloat16
         agents.append(Agent(
             idx=i, net=net, acting=acting, critic=critic, learner=learner,
             buffer=ReplayBuffer2(args.buffer_per_agent, state_bytes)))
@@ -295,7 +296,16 @@ def main() -> None:
     hands_base = 0
     if args.resume:
         state = torch.load(args.resume, map_location=device)
-        for i, agent in enumerate(agents[:len(state["agents"])]):
+        saved = len(state["agents"])
+        if saved != args.agents:
+            # Silently truncating loses the surplus agents' weights,
+            # optimisers and step counts; silently padding leaves new agents
+            # at random init while the archive restores reservoir counters
+            # that assume they have a history.
+            raise SystemExit(
+                f"checkpoint holds {saved} agents but --agents is "
+                f"{args.agents}; rerun with --agents {saved} or start fresh")
+        for i, agent in enumerate(agents[:saved]):
             blob = state["agents"][i]
             agent.net.load_state_dict(blob["model"])
             agent.acting.load_state_dict(blob.get("acting", blob["model"]))

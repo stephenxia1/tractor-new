@@ -27,9 +27,16 @@ CHECKPOINT_DIR = RESEARCH_DIR / "checkpoints"
 def extract(state: dict, idx: int, live: bool) -> dict:
     blob = state["agents"][idx]
     key = "model" if live else "acting"
+    if key not in blob:
+        # Checkpoints predating the `acting` field hold only training
+        # weights. Falling back silently would stamp them "acting weights",
+        # which is exactly the provenance this file exists to preserve.
+        print(f"  agent {idx}: no {key!r} weights in this checkpoint; "
+              f"falling back to 'model'")
+        key = "model"
     return {
         "arch": "v2",
-        "model": blob.get(key, blob["model"]),
+        "model": blob[key],
         "critic": blob["critic"],
         "net_config": state.get("net_config", {"history": "attn"}),
         "steps": blob.get("steps", 0),

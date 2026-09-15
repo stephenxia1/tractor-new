@@ -241,7 +241,29 @@ def plan_seating(rng: np.random.Generator, n_agents: int, n_tables: int,
     if not 1 <= live_per_table <= 4:
         raise ValueError("live_per_table must be between 1 and 4")
     if not archive_refs:
-        live_per_table = 4
+        # Cold start: no history to average over, so every seat is a live
+        # agent. With fewer than four agents a table cannot hold four
+        # distinct ones, so seats repeat -- two agents give a0/a1/a0/a1,
+        # which is still both of them playing each other. `_live_assignment`
+        # forbids repeats by design, so this path does its own dealing.
+        if n_agents >= 4:
+            # Enough agents for four distinct per table, so use the balanced
+            # assignment: it keeps every agent's seat count within one, and
+            # an agent with three times another's seats this iteration would
+            # get three times the training data from it.
+            return [[ModelRef(a) for a in row]
+                    for row in _live_assignment(rng, n_agents, n_tables, 4)]
+        # Fewer agents than seats: deal from one pool of cycled permutations
+        # so the counts stay balanced across the whole iteration, then cut it
+        # into tables. Dealing each table its own pool balances within a
+        # table and not across them -- three agents over sixteen seats came
+        # out 3/6/7 that way, against 5/5/6 here.
+        total = n_tables * 4
+        pool: list[int] = []
+        while len(pool) < total:
+            pool.extend(int(x) for x in rng.permutation(n_agents))
+        return [[ModelRef(a) for a in pool[t * 4:(t + 1) * 4]]
+                for t in range(n_tables)]
     live = _live_assignment(rng, n_agents, n_tables, live_per_table)
 
     seating: list[list[ModelRef]] = []

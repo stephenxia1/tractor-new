@@ -152,6 +152,15 @@ def main() -> None:
     # measured. Two agents trained from different seeds and never paired
     # play together here for the first time; the gap between this and each
     # one partnering itself is the cost of their conventions not matching.
+    #
+    # Invariant worth re-running after any change here: passing the same
+    # checkpoint as both --agent and --agent-b must reproduce the plain
+    # single-agent number exactly. Verified 2026-09-15 on v2_966k at 300
+    # pairs, base 909090 -- +30.38 [+25.81, +34.95] both ways. This is what
+    # catches a seat-selection bug; the first version of --agent-b used one
+    # fixed seat, which silenced agent B in the half of the workers where
+    # the agent's team holds seats {1,3}, and would have quietly reported an
+    # average of a mixed team and a solo one.
     ap.add_argument("--agent-b", default="",
                     help="second checkpoint; fills --agent-b-seat on the agent's team")
     ap.add_argument("--opponent", default="smart-v34", help="BotType for the other team")

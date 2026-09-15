@@ -35,7 +35,11 @@ from tractor_rl.dmc2 import DMC2Config, Learner2
 
 
 def build(run_name: str):
-    net_cfg = NetConfig(history=True)
+    # "attn", not True: `history` is a str compared against "attn", so a
+    # bool silently builds a net with no encoder and the optimiser
+    # round-trip below would cover 93% of the parameters while
+    # reporting a pass on all of them.
+    net_cfg = NetConfig(history="attn")
     net = TractorNet(net_cfg)
     critic = train2.PrivilegedCritic()
     cfg = DMC2Config()
