@@ -52,9 +52,14 @@ def run_one(checkpoint: str, opponent: str, pairs: int, base: int,
     out = proc.stdout
     m = MARGIN.search(out)
     if m is None:
-        print(f"  {opponent:<16} no result ({proc.returncode}) "
-              f"{(proc.stderr or out).strip().splitlines()[-1][:80] if (proc.stderr or out).strip() else ''}")
-        return None
+        tail = (proc.stderr or out).strip()
+        why = tail.splitlines()[-1][:80] if tail else f"exit {proc.returncode}"
+        print(f"  {opponent:<16} NO RESULT  {why}")
+        # Returned rather than dropped: a rung that vanishes from the JSON
+        # turns a later "mean over the ladder" into a mean over whichever
+        # rungs happened to survive, compared against a different set. That
+        # is the shape of the plateau misdiagnosis this file exists to stop.
+        return {"opponent": opponent, "margin": None, "error": why}
     lv = LEVELS.search(out)
     pr = PAIRS.search(out)
     at = ATTACK.search(out)
@@ -96,8 +101,24 @@ def main() -> int:
 
     out = RESEARCH_DIR / "runs" / f"ladder_{args.label}.json"
     out.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+
+    failed = [r["opponent"] for r in rows if r.get("margin") is None]
+    # A rung that ran but finished far short of the pairs asked for carries a
+    # much wider interval than the rest, and averaging it in unweighted lets
+    # one noisy rung quietly move the ladder's verdict.
+    short = [(r["opponent"], r["pairs"]) for r in rows
+             if r.get("margin") is not None and r.get("pairs") is not None
+             and r["pairs"] < 0.8 * args.pairs]
     print(f"\nwrote {out}")
-    return 0
+    if failed:
+        print(f"  {len(failed)} rung(s) produced no result: {', '.join(failed)}")
+    if short:
+        print("  rung(s) short of the requested pairs (wider intervals): "
+              + ", ".join(f"{o} {n}/{args.pairs}" for o, n in short))
+    if failed or short:
+        print("  -> do not average this ladder against another without "
+              "checking they cover the same rungs")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
