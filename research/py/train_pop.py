@@ -292,6 +292,7 @@ def main() -> None:
 
     iteration = 0
     rounds_base = 0
+    hands_base = 0
     if args.resume:
         state = torch.load(args.resume, map_location=device)
         for i, agent in enumerate(agents[:len(state["agents"])]):
@@ -312,6 +313,10 @@ def main() -> None:
             agent.trained = int(blob.get("trained", 0))
         iteration = int(state.get("iteration", 0))
         rounds_base = int(state.get("rounds", 0))
+        # Cumulative like rounds and iteration. Left out, a resume restarts
+        # the hand count at zero while rounds keeps climbing, and the two
+        # stop being comparable in the same log.
+        hands_base = int(state.get("hands", 0))
         # The archive is on local disk and is not carried in the checkpoint --
         # eight agents times twenty-four slots is over a gigabyte. A resume on
         # the same box recovers it from the index; a fresh box refills over
@@ -355,6 +360,7 @@ def main() -> None:
             "net_config": {"history": args.history},
             "iteration": iteration,
             "rounds": rounds_base + rounds,
+            "hands": hands_base + hands,
             "agents": [{
                 "model": a.net.state_dict(),
                 "acting": a.acting.state_dict(),
@@ -576,7 +582,7 @@ def main() -> None:
                     "elapsed_s": round(el, 1),
                     "rounds": rounds_base + rounds,
                     "iteration": iteration,
-                    "hands": hands,
+                    "hands": hands_base + hands,
                     "decisions": decisions,
                     "decisions_per_s": round(decisions / el, 1),
                     "archive": archive.size(),

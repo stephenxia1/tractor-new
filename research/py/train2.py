@@ -340,7 +340,7 @@ def main() -> None:
     rounds = decisions = trained_decisions = hands = 0
     # Per-phase counters, so each setting is scored on its own window rather
     # than on run-to-date totals.
-    phase_dec = phase_steps = 0
+    phase_dec = phase_steps = phase_trained = 0
     phase_start_step = 0
     last_checkpoint = time.perf_counter()
     recent_points: list[int] = []
@@ -429,6 +429,7 @@ def main() -> None:
             decisions += merged.num_decisions
             phase_dec += merged.num_decisions
             trained_decisions += rows_cur.shape[0]
+            phase_trained += rows_cur.shape[0]
 
             for local_w, batch in enumerate(batches):
                 w = group_workers[local_w].index
@@ -526,14 +527,14 @@ def main() -> None:
                 # Warm-up is not a data point: hold the clock until the
                 # buffer is full so every phase measures its own setting.
                 sweep_at = now
-                phase_dec = 0
+                phase_dec = phase_trained = 0
                 phase_start_step = learner.steps
             if sweep and now - sweep_at >= args.sweep_minutes * 60:
                 took = now - sweep_at
                 gained = learner.steps - phase_start_step
                 print(f"[sweep] steps_per_train={cfg.steps_per_train} "
                       f"dec/s {phase_dec/took:7.0f} steps/s {gained/took:6.2f} "
-                      f"replay {gained*cfg.batch_size/max(1,phase_dec*0.85):5.2f} "
+                      f"replay {gained*cfg.batch_size/max(1,phase_trained):5.2f} "
                       f"| q {learner.stats.get('loss_q')} "
                       f"resid {learner.stats.get('critic_residual_std')} "
                       f"belief {learner.stats.get('belief_acc')}", flush=True)
@@ -542,7 +543,7 @@ def main() -> None:
                 if async_learner is not None:
                     async_learner.cfg = cfg
                 sweep_at = now
-                phase_dec = 0
+                phase_dec = phase_trained = 0
                 phase_start_step = learner.steps
             if learner.steps > 0 and (
                 learner.steps % args.checkpoint_every == 0
