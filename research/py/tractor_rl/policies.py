@@ -204,9 +204,25 @@ class SearchPolicy:
         overridden = 0
         for parent, cand_scores in by_parent.items():
             n_cands = int(merged.cand_counts[real_rows[parent]])
-            # Only trust search where it evaluated every candidate: a
-            # partial set would be compared against nothing, and the
-            # network's own ranking already covers the rest.
+            # Only override where search evaluated *every* candidate. This
+            # looks over-cautious and is not, because of where the subset
+            # comes from: `buildLeaves` in search.ts searches
+            # `candidates[0 .. topCandidates)` in **enumeration order**. The
+            # worker is TypeScript and has no access to the network's Q
+            # values, so it cannot take the top K by prior. A partial set is
+            # therefore an arbitrary subset, and picking the best within it
+            # throws away the network's ranking over everything outside it.
+            #
+            # Measured, by removing this line: overrides rose from 65% of
+            # decisions to 84%, and the agent fell from +30 against smart-v2
+            # to **-4.83**. The guard is load-bearing.
+            #
+            # The way to make search cover more decisions is therefore not to
+            # relax this test but to raise `--search-top` until it reaches
+            # the candidate count -- at which point the subset is everything,
+            # enumeration order stops mattering, and this test passes on its
+            # own. Candidates per decision run mean 7.2, p90 19, max 32, so
+            # --search-top 48 covers 100%.
             if len(cand_scores) < n_cands:
                 continue
             best = max(cand_scores.items(), key=lambda kv: kv[1])[0]

@@ -968,3 +968,46 @@ around the in-place optimiser steps: `state_dict()` returns references to
 live tensors, so a checkpoint written while the learner stepped could
 capture parameters from two different steps -- a network that never existed,
 which a resume would then train from.
+
+## The search coverage guard is load-bearing (do not remove it)
+
+`SearchPolicy.pick` only overrides the network's choice where search
+evaluated **every** candidate. That looks over-cautious. It is not, and the
+reason is worth writing down because the comment did not say it.
+
+`buildLeaves` in `search.ts` searches `candidates[0 .. topCandidates)` in
+**enumeration order**. The worker is TypeScript and has no access to the
+network's Q values, so it cannot take the top K by prior. Any partial set is
+therefore an arbitrary subset, and choosing the best within it discards the
+network's ranking over everything outside it.
+
+Measured by removing the guard: overrides rose from 65% of decisions to 84%,
+and the agent fell from **+31.81 to -4.83** against `smart-v2`. Restored
+immediately.
+
+Candidates per decision run mean 7.2, median 5, p90 19, max 32. So the way
+to widen search coverage is to raise `--search-top` until it reaches the
+candidate count -- at 48 the subset is everything, enumeration order stops
+mattering, and the guard passes on its own. At the default 6 it covers 65%
+of decisions; at 24, 97%.
+
+### Search, re-measured after the config fix
+
+The recorded figure -- +0.82 [-4.52, +6.16], "i.e. nothing" -- was taken at
+`worlds=2, maxSearched=8` and was never re-run after the configuration was
+corrected. At `worlds=4, top=6`, 300 duplicate deals from base 424200,
+compared *paired* on the deals both runs saw:
+
+| | margin vs `smart-v2` |
+| --- | --- |
+| no search | +34.02 [+29.38, +38.65] |
+| search | +37.58 [+33.50, +41.67] |
+| **search - no search, paired** | **+3.57 [-0.90, +8.03]** |
+
+Search is better on 159 deals and worse on 123. Suggestive, not resolved:
+the interval still spans zero at 300 deals, and settling it needs ~1000.
+
+A caution recorded because I walked into it twice in one session: a
+120-pair run of the same configuration read **+44.38**, six points above the
+300-pair estimate on the same deal base. 120 pairs cannot resolve anything
+under ten points, and it will happily hand you a number that looks decisive.
