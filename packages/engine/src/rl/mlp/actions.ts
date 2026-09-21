@@ -18,9 +18,21 @@
 
 import { classifyCombo } from '../../classifier';
 import { findNKinds, findTractors } from '../../combos';
-import { validateFollow } from '../../follow';
+import {
+  canonicalFollow,
+  handTractorProfile,
+  leadObligations,
+  obligatoryCore,
+  validateFollow,
+  validateFollowThrow,
+  type Obligations,
+} from '../../follow';
 import { effectiveSuit, isTrump, compareCards } from '../../ordering';
-import { decomposeThrow, isThrowSafe } from '../../throws';
+import {
+  decomposeThrow,
+  isThrowSafe,
+  type ThrowDecomposition,
+} from '../../throws';
 import { handFor, nextToPlay } from '../../reducer';
 import { teamOf, type GameState, type Seat } from '../../state';
 import {
@@ -261,6 +273,17 @@ function enumerateFollows(
     ? leadCls.combo.effectiveSuit
     : effectiveSuit(leadCards[0]!, ctx);
 
+  // A throw lead carries the same §7.3 obligations as a combo lead,
+  // routed through rules.md §7.6 step 3. Both are derived from one
+  // place so enumeration and validation cannot disagree.
+  const leadThrowRes = leadCls.ok ? null : decomposeThrow(leadCards, ctx, n);
+  const leadThrow =
+    leadThrowRes !== null && leadThrowRes.ok ? leadThrowRes.throw : null;
+  const obligations = leadObligations(
+    leadCls.ok ? [leadCls.combo] : leadThrow === null ? [] : leadThrow.components,
+    n,
+  );
+
   const myInLed = myCards.filter((c) => effectiveSuit(c, ctx) === ledSuit);
 
   // ---- Single lead ------------------------------------------------------
@@ -293,6 +316,7 @@ function enumerateFollows(
   // Strategy: enumerate the "required core" set of led-suit cards
   // (per the led-suit + pair + tractor obligations of rules.md §7.3),
   // then enumerate fillers from the remaining hand.
+  const before = out.length;
   enumerateMultiCardFollows(
     seat,
     myCards,
@@ -300,11 +324,32 @@ function enumerateFollows(
     leadCount,
     ledSuit,
     leadCls.ok ? leadCls.combo : null,
+    leadThrow,
+    obligations,
     ctx,
     n,
     opts,
     out,
   );
+  // A legal follow always exists. Core and filler caps are heuristic
+  // budgets, so on a hand where every enumerated variant is dropped
+  // the floor below keeps the seat playable.
+  if (out.length === before) {
+    const cards = canonicalFollow(
+      leadCls.ok ? [leadCls.combo] : leadThrow === null ? [] : leadThrow.components,
+      leadCount,
+      ledSuit,
+      myCards,
+      ctx,
+      n,
+    );
+    out.push({
+      kind: 'play_cards',
+      seat,
+      cards,
+      tags: tagsFor(cards, ledSuit, ctx, leadCls.ok ? leadCls.combo : null, n),
+    });
+  }
 }
 
 function enumerateMultiCardFollows(
@@ -314,6 +359,8 @@ function enumerateMultiCardFollows(
   leadCount: number,
   ledSuit: EffectiveSuit,
   leadCombo: import('../../classifier').ClassifiedCombo | null,
+  leadThrow: ThrowDecomposition | null,
+  obligations: Obligations,
   ctx: TrumpContext,
   n: number,
   opts: Required<EnumerationOptions>,
@@ -324,7 +371,7 @@ function enumerateMultiCardFollows(
   const cores = enumerateRequiredCores(
     myInLed,
     leadCount,
-    leadCombo,
+    obligations,
     ctx,
     n,
     opts.maxFollowCores,
@@ -334,7 +381,17 @@ function enumerateMultiCardFollows(
     // Fillers = leadCount − core.length cards from non-core hand.
     const fillerCount = leadCount - core.length;
     if (fillerCount === 0) {
-      emitIfValid(seat, [...core], myCards, ledSuit, leadCombo, ctx, n, out);
+      emitIfValid(
+        seat,
+        [...core],
+        myCards,
+        ledSuit,
+        leadCombo,
+        leadThrow,
+        ctx,
+        n,
+        out,
+      );
       continue;
     }
     const remaining = myCards.filter((c) => !cardSetContains(core, c));
@@ -346,6 +403,7 @@ function enumerateMultiCardFollows(
       myCards,
       ledSuit,
       leadCombo,
+      leadThrow,
       ctx,
       n,
       opts,
@@ -354,12 +412,18 @@ function enumerateMultiCardFollows(
   }
 }
 
-// Enumerate candidate "required cores" — the led-suit cards that must
-// appear in the follow given the led-suit + pair + tractor obligations.
+// The led-suit cards a follow must contain, given what the lead demands.
+//
+// Driven entirely by `obligations`, which is the same value
+// `validateFollow` and `validateFollowThrow` check against, so a core
+// this function emits can never be rejected downstream for a structural
+// reason. The lead's combo kind is deliberately not consulted: a throw
+// imposes obligations through rules.md §7.6 step 3 exactly as a tractor
+// or pair lead does through §7.3.
 function enumerateRequiredCores(
   myInLed: ReadonlyArray<Card>,
   leadCount: number,
-  leadCombo: import('../../classifier').ClassifiedCombo | null,
+  obligations: Obligations,
   ctx: TrumpContext,
   n: number,
   maxCores: number,
@@ -367,70 +431,66 @@ function enumerateRequiredCores(
   const cores: Card[][] = [];
   const inLedCount = myInLed.length;
 
-  // Quick lookup of all led-suit pairs and tractors.
-  const ledPairs = findNKinds(myInLed, n);
-  const ledTractors = findTractors(myInLed, ctx, n);
+  // With no more led-suit cards than slots, every one of them is played
+  // and there is nothing to choose.
+  if (inLedCount <= leadCount) {
+    cores.push([...myInLed]);
+    return cores;
+  }
 
-  // Tractor lead.
-  if (leadCombo !== null && leadCombo.kind === 'tractor') {
-    const k = leadCombo.length;
-    const matching = ledTractors.filter((t) => t.length === k);
-    if (matching.length > 0) {
-      // Must include a length-k tractor in led suit.
-      // Each candidate core: one tractor, possibly extended with led-suit
-      // fillers up to leadCount cards.
-      for (const t of matching) {
-        const baseCore = [...t.cards];
-        if (baseCore.length >= leadCount) {
-          cores.push(baseCore.slice(0, leadCount));
+  const ledPairs = findNKinds(myInLed, n);
+  const needPairs = Math.min(ledPairs.length, obligations.pairs);
+
+  // A throw can demand several tractors at once. Enumerating windows for
+  // every slot multiplies out quickly and the case is rare, so the one
+  // canonical core carries it; the window enumeration below covers the
+  // common single-tractor lead.
+  if (obligations.tractors.length > 1) {
+    cores.push(obligatoryCore(obligations, leadCount, myInLed, ctx, n));
+    return cores;
+  }
+
+  const needTractor = handTractorProfile(obligations, myInLed, ctx, n)[0] ?? 0;
+
+  if (needTractor >= 2) {
+    // Every length-`needTractor` window, topped up with further pairs
+    // until the pair obligation is met. `units` holds a tractor's
+    // n-of-a-kinds in chain order, so windows are slices.
+    for (const t of findTractors(myInLed, ctx, n, needTractor)) {
+      for (let i = 0; i + needTractor <= t.length; i++) {
+        const window = t.units
+          .slice(i, i + needTractor)
+          .flatMap((u) => [...u.cards]);
+        const extra = needPairs - needTractor;
+        if (extra <= 0) {
+          cores.push(window);
         } else {
-          // Fill remaining slots with led-suit cards (any choice; we'll
-          // enumerate fill variants later via the filler step). For the
-          // core enumeration here, just emit the bare tractor — the
-          // filler step will add led-suit fillers preferentially.
-          cores.push(baseCore);
+          const rest = ledPairs.filter(
+            (p) => !p.cards.some((c) => cardSetContains(window, c)),
+          );
+          const take = Math.min(extra, rest.length);
+          for (const choice of chooseSubsets(rest, take, maxCores)) {
+            cores.push([...window, ...choice.flatMap((p) => [...p.cards])]);
+            if (cores.length >= maxCores) return cores;
+          }
         }
         if (cores.length >= maxCores) return cores;
       }
-      return cores;
     }
-    // No matching length-k tractor: must include all available pairs in
-    // led suit (up to leadCombo.length pairs), plus singles to fill.
-    // Enumerate which pair subsets to include.
-    const requiredPairs = Math.min(ledPairs.length, k);
-    const pairsToInclude = chooseSubsets(ledPairs, requiredPairs, maxCores);
-    for (const pairChoice of pairsToInclude) {
-      const baseCore = pairChoice.flatMap((p) => [...p.cards]);
-      // Include the pair cards as the core's required portion. The rest
-      // of the led-suit cards (singles) and any fillers come later.
-      cores.push(baseCore);
+    if (cores.length > 0) return cores;
+  }
+
+  if (needPairs > 0) {
+    for (const choice of chooseSubsets(ledPairs, needPairs, maxCores)) {
+      cores.push(choice.flatMap((p) => [...p.cards]));
       if (cores.length >= maxCores) return cores;
     }
-    if (cores.length === 0) {
-      // No pairs in led suit either — just need to play min(inLedCount,
-      // leadCount) led-suit cards. Enumerate which subset.
-      enumerateLedSuitSubsets(myInLed, leadCount, cores, maxCores);
-    }
-    return cores;
+    if (cores.length > 0) return cores;
   }
 
-  // Pair lead.
-  if (leadCombo !== null && leadCombo.kind === 'nkind' && leadCombo.n === 2) {
-    if (ledPairs.length > 0) {
-      // Must include one pair.
-      for (const p of ledPairs) {
-        cores.push([...p.cards]);
-        if (cores.length >= maxCores) return cores;
-      }
-      return cores;
-    }
-    // No pairs — must include min(inLedCount, 2) led-suit cards.
-    enumerateLedSuitSubsets(myInLed, Math.min(inLedCount, leadCount), cores, maxCores);
-    return cores;
-  }
-
-  // Throw lead or unclassified lead — fall back to "play all led-suit
-  // cards as required core" (the simplest safe interpretation).
+  // No structural demand the hand can meet: any led-suit subset of the
+  // right size will do, and the follow-suit count is enforced by the
+  // filler step.
   enumerateLedSuitSubsets(myInLed, Math.min(inLedCount, leadCount), cores, maxCores);
   return cores;
 }
@@ -513,6 +573,7 @@ function enumerateFillers(
   myCards: ReadonlyArray<Card>,
   ledSuit: EffectiveSuit,
   leadCombo: import('../../classifier').ClassifiedCombo | null,
+  leadThrow: ThrowDecomposition | null,
   ctx: TrumpContext,
   n: number,
   opts: Required<EnumerationOptions>,
@@ -536,14 +597,34 @@ function enumerateFillers(
     for (const ls of ledSubsets) {
       if (nonLedNeeded === 0) {
         const cards = [...core, ...ls];
-        emitIfValid(seat, cards, myCards, ledSuit, leadCombo, ctx, n, out);
+        emitIfValid(
+          seat,
+          cards,
+          myCards,
+          ledSuit,
+          leadCombo,
+          leadThrow,
+          ctx,
+          n,
+          out,
+        );
         if (out.length >= opts.maxCandidates) return;
         continue;
       }
       const nlSubsets = chooseSubsets(nonLedInPool, nonLedNeeded, localCap);
       for (const nls of nlSubsets) {
         const cards = [...core, ...ls, ...nls];
-        emitIfValid(seat, cards, myCards, ledSuit, leadCombo, ctx, n, out);
+        emitIfValid(
+          seat,
+          cards,
+          myCards,
+          ledSuit,
+          leadCombo,
+          leadThrow,
+          ctx,
+          n,
+          out,
+        );
         if (out.length >= opts.maxCandidates) return;
       }
     }
@@ -553,7 +634,17 @@ function enumerateFillers(
     const subsets = chooseSubsets(pool, fillerCount, localCap);
     for (const s of subsets) {
       const cards = [...core, ...s];
-      emitIfValid(seat, cards, myCards, ledSuit, leadCombo, ctx, n, out);
+      emitIfValid(
+        seat,
+        cards,
+        myCards,
+        ledSuit,
+        leadCombo,
+        leadThrow,
+        ctx,
+        n,
+        out,
+      );
       if (out.length >= opts.maxCandidates) return;
     }
   }
@@ -565,12 +656,16 @@ function emitIfValid(
   hand: ReadonlyArray<Card>,
   ledSuit: EffectiveSuit,
   leadCombo: import('../../classifier').ClassifiedCombo | null,
+  leadThrow: ThrowDecomposition | null,
   ctx: TrumpContext,
   n: number,
   out: EnumeratedAction[],
 ): void {
   if (leadCombo !== null) {
     const v = validateFollow(leadCombo, cards, hand, ctx, n);
+    if (!v.ok) return;
+  } else if (leadThrow !== null) {
+    const v = validateFollowThrow(leadThrow, cards, hand, ctx, n);
     if (!v.ok) return;
   }
   out.push({
@@ -615,10 +710,13 @@ function collectOpponentHands(
   leaderSeat: Seat,
 ): ReadonlyArray<ReadonlyArray<Card>> {
   if (state.currentHand === null) return [];
-  const leaderTeam = teamOf(state, leaderSeat);
   const out: ReadonlyArray<Card>[] = [];
   for (let s = 0; s < state.config.numPlayers; s++) {
-    if (teamOf(state, s) === leaderTeam) continue;
+    // rules.md §7.6: any single OTHER player can break a throw, the
+    // leader's teammate included. Excluding the whole team here made
+    // this enumerator offer throws that `reducer.playCards` then
+    // blocked, since `collectOpponentSeats` excludes only the leader.
+    if (s === leaderSeat) continue;
     out.push(handFor(state, s));
   }
   return out;

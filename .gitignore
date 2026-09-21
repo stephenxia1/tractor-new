@@ -11,3 +11,12 @@ coverage/
 .env*.local
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+
+# Agent worktrees: scratch copies of the repo, recreated on demand.
+.claude/worktrees/
+
+# Model checkpoints. `research/.gitignore` already covers its own tree;
+# this catches the ones under packages/, which reach 19 MB each and are
+# reproducible from a training run.
+*.pt
+**/checkpoints/

@@ -574,7 +574,7 @@ function playCards(
       if (!leadThrow.ok) {
         return err(state, `lead is malformed: ${leadThrow.reason}`);
       }
-      const v = validateFollowThrow(leadThrow.throw, event.cards, seatHand, ctx);
+      const v = validateFollowThrow(leadThrow.throw, event.cards, seatHand, ctx, n);
       if (!v.ok) return err(state, `invalid follow: ${v.error}`);
     }
   }
@@ -694,12 +694,27 @@ function resolveTrick(
 
   let winnerSeat: Seat = lead.seat;
   let winningDecomp: ThrowDecomposition = leadDecomp;
+  let bestRank: readonly [number, number] | null = null;
 
   for (let i = 1; i < trick.plays.length; i++) {
     const play = trick.plays[i]!;
     const playDecomp = decomposePlay(play.cards, ctx, n);
     if (playDecomp === null) continue;
-    if (decomposedBeats(playDecomp, winningDecomp, ctx, n)) {
+    // Each response is measured against the lead, not against whoever
+    // is currently winning. rules.md §7.6 step 3 makes the lead the
+    // standing play, and "covers" is not a total order once a response
+    // may be re-decomposed to the lead's shape: two responses can each
+    // cover the lead while neither covers the other. Chaining would
+    // then award the trick to whichever was played first rather than to
+    // the higher play.
+    if (!decomposedBeats(playDecomp, leadDecomp, ctx, n)) continue;
+    const rank = rankOfPlay(playDecomp);
+    if (
+      bestRank === null ||
+      rank[0] > bestRank[0] ||
+      (rank[0] === bestRank[0] && rank[1] > bestRank[1])
+    ) {
+      bestRank = rank;
       winnerSeat = play.seat;
       winningDecomp = playDecomp;
     }
@@ -717,6 +732,17 @@ function resolveTrick(
     winningCombo: null,
     throwCardCount: throwTotalCards(winningDecomp),
   };
+}
+
+// rules.md §7.4 step 2: trump beats non-trump, and within one effective
+// suit the higher combo by its highest card. Strict comparison at the
+// call site leaves ties with the earlier play, per rules.md §3.1.
+function rankOfPlay(d: ThrowDecomposition): readonly [number, number] {
+  let top = -1;
+  for (const c of d.components) {
+    if (c.topPosition > top) top = c.topPosition;
+  }
+  return [d.effectiveSuit === 'trump' ? 1 : 0, top];
 }
 
 function collectOpponentSeats(state: GameState, leaderSeat: Seat): Seat[] {

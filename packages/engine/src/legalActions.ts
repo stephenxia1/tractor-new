@@ -11,7 +11,7 @@
 import { availableDeclarationsFor } from './declareEnum';
 import { classifyCombo, comboBeats } from './classifier';
 import { findNKinds, findTractors } from './combos';
-import { validateFollow } from './follow';
+import { canonicalFollow, validateFollow, validateFollowThrow } from './follow';
 import { effectiveSuit, compareCards } from './ordering';
 import { decomposeThrow, isThrowSafe } from './throws';
 import { handFor, nextToPlay } from './reducer';
@@ -220,6 +220,12 @@ export function legalActions(
       if (leadClass.ok) {
         const v = validateFollow(leadClass.combo, cards, myCards, ctx, n);
         if (!v.ok) continue;
+      } else {
+        const decomp = decomposeThrow(leadCards, ctx, n);
+        if (decomp.ok) {
+          const v = validateFollowThrow(decomp.throw, cards, myCards, ctx, n);
+          if (!v.ok) continue;
+        }
       }
       const tags = classifyFollowTags(
         cards,
@@ -227,6 +233,30 @@ export function legalActions(
         ctx,
       );
       out.push({ kind: 'play_cards', seat, cards, tags });
+    }
+
+    // The heuristic shortlist above can be emptied by the structural
+    // obligations; a legal follow always exists, so fall back to one.
+    if (out.length === 0) {
+      const decomp = leadClass.ok ? null : decomposeThrow(leadCards, ctx, n);
+      const components = leadClass.ok
+        ? [leadClass.combo]
+        : decomp !== null && decomp.ok
+          ? decomp.throw.components
+          : [];
+      out.push({
+        kind: 'play_cards',
+        seat,
+        cards: canonicalFollow(
+          components,
+          leadCount,
+          ledSuit,
+          myCards,
+          ctx,
+          n,
+        ),
+        tags: ['follow-led-suit'],
+      });
     }
 
     return out;
