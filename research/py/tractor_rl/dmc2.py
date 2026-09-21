@@ -41,6 +41,7 @@ from .features2 import (
     Episode,
     action_features,
     belief_targets,
+    field_u8,
     history_features,
     privileged_features,
     state_features,
@@ -128,6 +129,21 @@ def hand_returns(episode: Episode, cfg: DMC2Config) -> tuple[np.ndarray, float]:
         running = rewards[t] + cfg.gamma * running
         out[t] = running
     return out, level
+
+
+def decision_signs(states: np.ndarray) -> np.ndarray:
+    """The multiplier taking `hand_returns` from attacker-POV to each seat's.
+
+    Both halves of that pair are scored from the attackers' side of the
+    table, because that is how §8 scores a hand. A defending seat's target
+    is the negation: the 20 points the attackers just took are worth -20 to
+    the seat that let them through. Flipping this trains half the seats on
+    an exactly inverted objective, and nothing shows it -- the loss curve
+    is unchanged, because each seat is still regressing onto a consistent
+    target. It lives here, named and tested, rather than inlined in each
+    trainer's collection loop, where it was untestable.
+    """
+    return np.where(field_u8(states, L.H_I_AM_ATTACKER) != 0, 1.0, -1.0).astype(np.float32)
 
 
 class ReplayBuffer2:
@@ -383,6 +399,17 @@ class Learner2:
         # with weights a fraction of a second old is the trade this class
         # exists to make and DMC tolerates it; saving a network that never
         # existed is not the same thing.
+        #
+        # Deliberately *not* reentrant. It was briefly an RLock, because a
+        # SIGTERM handler that checkpointed inline deadlocked against the
+        # main thread already holding this inside `.step()` -- but making
+        # the lock reentrant does not fix that, it only lets the handler
+        # walk straight into the window the lock exists to close and
+        # serialise a `state_dict()` from the middle of `opt.step()`. The
+        # trainers defer instead: the handler sets a flag, the main loop
+        # leaves, and the checkpoint is written from the `finally` with no
+        # step in flight. Nothing re-enters this on one thread any more, so
+        # a plain Lock is both correct and the stronger guarantee.
         self.weights_lock = threading.Lock()
         self._last_critic_loss_t: torch.Tensor | None = None
         # Featurising on the device only pays when the device is fast
@@ -393,7 +420,11 @@ class Learner2:
 
     def step(self, buffer: ReplayBuffer2, rng: np.random.Generator) -> dict[str, float] | None:
         cfg = self.cfg
-        if buffer.size < cfg.min_buffer:
+        # batch_size as well as min_buffer, for the reason BatchPrefetcher
+        # gives: sampling is with replacement, so a thin buffer yields a
+        # batch of duplicates, and min_buffer=0 would hand rng.integers an
+        # empty range and raise outright.
+        if buffer.size < max(cfg.min_buffer, cfg.batch_size):
             return None
         sample = buffer.sample(cfg.batch_size, rng)
         if self.device_featurise:

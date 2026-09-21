@@ -10,7 +10,9 @@ mirrored at fixed step counts, so both questions get separate answers:
   encoder buy more than one without it?
 * **matched wall clock** -> what a machine-hour is worth. The wall clock
   comes from S3's LastModified on each numbered upload, which survives the
-  resume that resets the in-process elapsed counter.
+  resume that resets the in-process elapsed counter. Both arms are placed
+  on a common origin of gradient step 0, extrapolated back from their own
+  mirrored checkpoints, so equal hours really are equal machine time.
 
 Every evaluation is 1000 duplicate pairs on one deal base, which gives a
 +/-2.5 point interval; 120 pairs gives +/-7 and cannot resolve anything
@@ -46,6 +48,54 @@ PAIRS = 1000
 MARGIN = re.compile(r"point margin: ([-+\d.]+) pts \[95% CI ([-+\d.]+), ([-+\d.]+)\]")
 
 
+def step_zero(arm: str, written: dict[int, float]) -> float:
+    """Epoch seconds at which this arm was at gradient step 0.
+
+    The matched-wall-clock table only says anything if both arms are
+    measured from the same instant, and measuring each from its own first
+    mirrored checkpoint does not do that: GRID[0] is 50,000 gradient
+    steps, not boot, and the arms reach it at different times. At the
+    measured 8.4 and 15.9 steps/s that is 1.653 h for h2attn against
+    0.874 h for h2none, so every h2attn row used to be credited about 47
+    free minutes -- and h2attn is the slower arm, i.e. exactly the one the
+    comparison exists to charge for its cost.
+
+    So extrapolate each arm back to step 0 at its own throughput, fitted
+    by least squares over its own (step, timestamp) points. That assumes
+    throughput is constant across the run; a resume or a busy host breaks
+    the assumption, and the boot itself is not measured at all. It is an
+    estimate -- but the same estimate for both arms, which is what a
+    comparison needs and what the per-arm origin never was.
+    """
+    pts = sorted(written.items())
+    if len(pts) >= 2:
+        n = len(pts)
+        mean_step = sum(s for s, _ in pts) / n
+        mean_ts = sum(t for _, t in pts) / n
+        sxx = sum((s - mean_step) ** 2 for s, _ in pts)
+        sxy = sum((s - mean_step) * (t - mean_ts) for s, t in pts)
+        if sxx > 0 and sxy > 0:
+            # sxy/sxx is seconds per gradient step; step 0 is that many
+            # seconds per step before the mean point.
+            return mean_ts - (sxy / sxx) * mean_step
+    if not pts:
+        return 0.0
+    # Either one checkpoint, which fixes no rate, or a non-positive slope,
+    # which means the timestamps do not increase with the step number --
+    # a re-upload, a clock skew, a mirror that copied out of order. Both
+    # leave nothing honest to extrapolate with, so fall back to this arm's
+    # own earliest upload rather than invent a throughput. Earliest by
+    # *timestamp*, not by step: in the non-monotone case the lowest-
+    # numbered checkpoint is not the first one written, and using it would
+    # put negative hours in the column.
+    origin = min(t for _, t in pts)
+    print(f"WARNING: no usable steps/hour for {arm} from its {len(pts)} "
+          f"mirrored checkpoint(s). Its hours column is measured from that "
+          f"arm's earliest mirrored checkpoint, not step 0, and is NOT "
+          f"comparable with the other arm.")
+    return origin
+
+
 def fetch() -> dict:
     """Download every mirrored checkpoint and record when it was written."""
     import boto3
@@ -54,7 +104,7 @@ def fetch() -> dict:
     meta: dict = {}
     for arm in ARMS:
         meta[arm] = {}
-        first = None
+        written: dict[int, float] = {}
         for step in GRID:
             key = f"results/{arm}_{step}.pt"
             try:
@@ -63,19 +113,22 @@ def fetch() -> dict:
                 continue
             out = CHECKPOINT_DIR / f"{arm}_{step}.pt"
             if not out.exists():
+                # checkpoints/ is gitignored, so it is absent on a tree where
+                # no trainer has run -- which is exactly the tree someone runs
+                # --fetch on.
+                out.parent.mkdir(parents=True, exist_ok=True)
                 s3.download_file(BUCKET, key, str(out))
             ts = head["LastModified"]
-            first = ts if first is None else min(first, ts)
+            written[step] = ts.timestamp()
             meta[arm][step] = {"path": str(out), "written": ts.isoformat()}
-        # Wall clock is measured from this arm's own first mirrored
-        # checkpoint, not from launch: boot and bootstrap are not training.
+        origin = step_zero(arm, written)
         for step, rec in meta[arm].items():
-            import datetime
-            t = datetime.datetime.fromisoformat(rec["written"])
-            rec["hours"] = (t - first).total_seconds() / 3600 if first else 0.0
+            rec["hours"] = (written[step] - origin) / 3600
         print(f"{arm}: {len(meta[arm])} checkpoints "
               f"{sorted(meta[arm])}")
-    (RUN_DIR / "hist2_grid.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    grid = RUN_DIR / "hist2_grid.json"
+    grid.parent.mkdir(parents=True, exist_ok=True)
+    grid.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
 
@@ -95,12 +148,19 @@ def arena(path: str, opponent: str) -> tuple[float, float, float] | None:
 
 def evaluate() -> None:
     meta = json.loads((RUN_DIR / "hist2_grid.json").read_text(encoding="utf-8"))
+    RESULTS.parent.mkdir(parents=True, exist_ok=True)
     out = json.loads(RESULTS.read_text(encoding="utf-8")) if RESULTS.exists() else {}
     for arm in ARMS:
         out.setdefault(arm, {})
         for step in sorted(int(s) for s in meta.get(arm, {})):
             rec = meta[arm][str(step)] if str(step) in meta[arm] else meta[arm][step]
-            out[arm].setdefault(str(step), {"hours": rec["hours"]})
+            # `hours` comes from the grid, not from an evaluation, so it is
+            # refreshed rather than set once: a results file written before
+            # the step-0 origin above would otherwise keep serving the old
+            # per-arm hours to --report forever, and the expensive arena
+            # runs beside it would make it look freshly computed.
+            out[arm].setdefault(str(step), {})
+            out[arm][str(step)]["hours"] = rec["hours"]
             for rung in RUNGS:
                 if rung in out[arm][str(step)]:
                     continue
@@ -130,7 +190,8 @@ def report() -> None:
             d = f"{b[0] - a[0]:+9.2f}" if (a and b) else " " * 9
             print(f"  {step:9,}{fa:>22s}{fb:>22s}{d}")
 
-        print("\nmatched wall clock (what a machine-hour buys)")
+        print("\nmatched wall clock (what a machine-hour buys; hours run "
+              "from each arm's own extrapolated step 0)")
         print(f"  {'arm':8s}{'hours':>7s}{'steps':>9s}{'margin':>22s}")
         for arm in ARMS:
             for step in GRID:

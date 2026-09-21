@@ -35,7 +35,8 @@ import torch
 
 from tractor_rl import layout as L
 from tractor_rl.dmc2 import (
-    AsyncLearner, BatchPrefetcher, DMC2Config, Learner2, ReplayBuffer2, hand_returns)
+    AsyncLearner, BatchPrefetcher, DMC2Config, Learner2, ReplayBuffer2,
+    decision_signs, hand_returns)
 from tractor_rl.features2 import (
     action_features,
     field_u8,
@@ -47,6 +48,7 @@ from tractor_rl.features2 import (
     split_per_worker,
     state_features,
 )
+from tractor_rl import wandb_log
 from tractor_rl.model2 import NetConfig, PrivilegedCritic, TractorNet
 from tractor_rl.protocol import WorkerConfig, WorkerPool
 
@@ -194,6 +196,7 @@ def main() -> None:
     ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
     ap.add_argument("--run-name", type=str, default="v2")
     ap.add_argument("--resume", type=str, default="")
+    wandb_log.add_arguments(ap)
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
@@ -220,6 +223,12 @@ def main() -> None:
     resumed_snapshots: list[dict] = []
     resumed_steps = 0
     hands_base = 0
+    # How many times this run has been restarted. A deal is a pure function
+    # of (--seed, worker, game, hand), so without an offset that grows with
+    # the resume count every segment replays the deals the last one already
+    # trained on -- distinct-deal coverage capped by the longest single
+    # segment rather than by their sum.
+    segment = 0
     resumed_state: dict | None = None
     if args.resume:
         state = torch.load(args.resume, map_location=device)
@@ -230,8 +239,12 @@ def main() -> None:
         resumed_snapshots = state.get("snapshots", [])
         resumed_steps = int(state.get("steps", 0))
         hands_base = int(state.get("hands", 0))
+        # Checkpoints written before the counter existed default to 0, so an
+        # old file on the volume still resumes -- it just re-runs segment 1's
+        # deals once more before the offsets start advancing.
+        segment = int(state.get("segment", 0)) + 1
         print(f"resumed from {args.resume} (step {resumed_steps}, "
-              f"{len(resumed_snapshots)} snapshots)")
+              f"{len(resumed_snapshots)} snapshots, segment {segment})")
     learner = Learner2(net, critic, cfg, device)
     if resumed_state is not None:
         # After the optimisers exist. Checkpoints written before this was
@@ -280,6 +293,12 @@ def main() -> None:
         AsyncLearner(learner, buffer, cfg, args.seed + 613)
         if args.async_learner else None)
     rng = np.random.default_rng(args.seed)
+    # The same replay problem as the worker seeds, on the python side: the
+    # exploration draws and the snapshot picks would otherwise repeat the
+    # previous segment's sequence exactly. Absent from older checkpoints,
+    # which then simply start the stream over.
+    if resumed_state is not None and resumed_state.get("rng_state") is not None:
+        rng.bit_generator.state = resumed_state["rng_state"]
 
     snapshot_net = TractorNet(net_cfg).to(device)
     snapshot_net.load_state_dict(net.state_dict())
@@ -304,9 +323,13 @@ def main() -> None:
         snapshot_net.load_state_dict(net.state_dict())
 
     matchups = assign_matchups(args.workers)
+    # The segment stride is far larger than `workers * 101` could ever reach,
+    # so no two segments can land on the same worker seed and re-deal a
+    # sequence already trained on.
     configs = [
         WorkerConfig(
-            games=args.games, seed=args.seed + i * 101, learner_seats=mask,
+            games=args.games, seed=args.seed + i * 101 + 7_919_000 * segment,
+            learner_seats=mask,
             baseline=bot, preplay="smart-v34", privileged=True)
         for i, (_, mask, _, bot) in enumerate(matchups)
     ]
@@ -323,6 +346,12 @@ def main() -> None:
     print(f"matchups: {counts}")
 
     log_file = (RUN_DIR / f"{args.run_name}.jsonl").open("a", encoding="utf-8")
+    # The same row the JSONL gets; the file stays the source of truth.
+    mirror = wandb_log.start(args, {
+        "trainer": "train2", "arch": "v2", "device": str(device),
+        "params_m": round(net.num_parameters() / 1e6, 3),
+        **vars(args), **asdict(cfg), **asdict(net_cfg),
+    })
 
     # Spot gives a termination notice and then SIGTERM; save on the way out
     # so the last minutes are not lost on top of whatever the periodic
@@ -330,12 +359,38 @@ def main() -> None:
     interrupted = {"flag": False}
 
     def on_term(signum, _frame):
-        interrupted["flag"] = True
-        try:
-            save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots, final=True)
-            print(f"caught signal {signum}; checkpointed at step {learner.steps}", flush=True)
-        finally:
+        # Record it and return. The loop below tests the flag each round
+        # and leaves through its `finally`, which closes the learner and
+        # the pool and then writes the final checkpoint -- one round of
+        # latency, against a reclaim notice measured in tens of seconds.
+        #
+        # Checkpointing inline from here, which is what this did, is two
+        # bugs. A signal landing during the *periodic* save is the first
+        # signal, so the guard below does not fire, and the handler starts
+        # a second save over the same deterministic `<run>_latest.tmp`:
+        # the inner one renames it into place and the outer `torch.save`
+        # then writes its end-of-zip record at a stale offset into the
+        # file that was just published. And the handler runs on the thread
+        # that, without --async-learner, is inside `opt.step()` holding
+        # `weights_lock` -- which is why that lock was made reentrant, and
+        # a reentrant lock there buys a checkpoint serialised from the
+        # middle of an optimiser step, the exact thing `save()` documents
+        # the lock as preventing.
+        # What deferring gives up: if the loop is wedged in `read_group`
+        # behind a hung worker it never reaches the test, and a reclaim
+        # that sends one SIGTERM and then SIGKILL takes the checkpoint
+        # with it, where saving inline would have written something. The
+        # periodic checkpoint bounds that loss to `--checkpoint-minutes`,
+        # and a checkpoint that is never written costs less than one that
+        # is silently wrong.
+        if interrupted["flag"]:
+            # A second signal is the operator being impatient. Leave now
+            # and give up the final checkpoint; `_atomic_save` renames, so
+            # the worst on disk is an orphan .tmp beside an intact one.
             raise SystemExit(0)
+        interrupted["flag"] = True
+        print(f"caught signal {signum} at step {learner.steps}; "
+              f"finishing the round and checkpointing", flush=True)
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
@@ -357,36 +412,51 @@ def main() -> None:
     # Watermarks rather than modulo tests; see the snapshot block below.
     next_snapshot_at = ((resumed_steps // args.snapshot_every) + 1) * args.snapshot_every
     next_archive_at = ((resumed_steps // args.checkpoint_every) + 1) * args.checkpoint_every
-    recent_points: list[int] = []
+    # Bounded, because only the last 500 are ever read: an untrimmed list
+    # grew to 165 MB over a 900-minute segment at 381 hands/s.
+    recent_points: deque[int] = deque(maxlen=500)
     t_env = t_feat = t_fwd = t_learn = t_book = 0.0
 
     def score(model, rows, merged, tokens_all, mask_all, sf_all, af_all):
         """Greedy candidate index for a subset of decisions, under `model`."""
         if rows.shape[0] == 0:
             return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
-        cand_mask, new_owner = subset_indices(rows, merged, merged.num_decisions)
+        counts_sub = merged.cand_counts[rows]
+        # A decision with one legal candidate has argmax 0 whatever the
+        # network scores it, and the caller's exploration branch draws the
+        # same 0, so the forward pass cannot change the action. Dropping
+        # those rows leaves every other row's score untouched -- nothing
+        # in this network mixes rows -- so the saving is exact. Measured
+        # at 9.6% of decisions on a 30k-record sample.
+        multi = counts_sub > 1
+        best = np.zeros(rows.shape[0], dtype=np.int64)
+        if not multi.any():
+            return best, counts_sub
+        sub = rows[multi]
+        cand_mask, new_owner = subset_indices(sub, merged, merged.num_decisions)
         # inference_mode rather than no_grad: it also skips version-counter
         # and view tracking, measured 12% faster on a realistic actor round.
         with torch.inference_mode():
             out = model(
-                sf_all[rows], af_all[cand_mask],
+                sf_all[sub], af_all[cand_mask],
                 torch.from_numpy(new_owner).to(device),
                 torch.from_numpy(
-                    merged.states[rows, L.H_ROLE].astype(np.int64)).to(device),
-                None if tokens_all is None else tokens_all[rows],
-                None if mask_all is None else mask_all[rows],
+                    merged.states[sub, L.H_ROLE].astype(np.int64)).to(device),
+                None if tokens_all is None else tokens_all[sub],
+                None if mask_all is None else mask_all[sub],
                 want="q")
         q = out["q"].cpu().numpy()
-        counts_sub = merged.cand_counts[rows]
-        offsets_sub = np.cumsum(counts_sub) - counts_sub
-        max_k = int(counts_sub.max())
-        padded = np.full((rows.shape[0], max_k), -np.inf, dtype=np.float32)
-        within = np.arange(q.shape[0]) - offsets_sub[new_owner]
+        counts_x = merged.cand_counts[sub]
+        offsets_x = np.cumsum(counts_x) - counts_x
+        max_k = int(counts_x.max())
+        padded = np.full((sub.shape[0], max_k), -np.inf, dtype=np.float32)
+        within = np.arange(q.shape[0]) - offsets_x[new_owner]
         padded[new_owner, within] = q
-        return padded.argmax(axis=1), counts_sub
+        best[multi] = padded.argmax(axis=1)
+        return best, counts_sub
 
     try:
-        while time.perf_counter() < deadline:
+        while not interrupted["flag"] and time.perf_counter() < deadline:
             t0 = time.perf_counter()
             group = pool.next_group()
             group_workers = pool.workers_of(group)
@@ -435,11 +505,11 @@ def main() -> None:
             game_ids = field_u16(merged.states, L.H_GAME_ID)
             hand_ids = field_u32(merged.states, L.H_HAND_ID)
             trick_idx = field_u8(merged.states, L.H_TRICK_INDEX)
-            attacker = field_u8(merged.states, L.H_I_AM_ATTACKER)
+            signs = decision_signs(merged.states)
             for local_i, i in enumerate(rows_cur):
                 key = (int(worker_ids[i]), int(game_ids[i]), int(hand_ids[i]))
                 pending.setdefault(key, []).append(
-                    (store, local_i, int(trick_idx[i]), 1.0 if attacker[i] else -1.0))
+                    (store, local_i, int(trick_idx[i]), float(signs[i])))
             decisions += merged.num_decisions
             phase_dec += merged.num_decisions
             trained_decisions += rows_cur.shape[0]
@@ -536,7 +606,7 @@ def main() -> None:
                     "buffer": buffer.size, "learner_steps": learner.steps,
                     "snapshots": len(snapshots),
                     "attacker_points_mean": (
-                        round(float(np.mean(recent_points[-500:])), 1) if recent_points else None),
+                        round(float(np.mean(recent_points)), 1) if recent_points else None),
                     "pct_env": round(100 * t_env / el, 1),
                     "pct_features": round(100 * t_feat / el, 1),
                     "pct_forward": round(100 * t_fwd / el, 1),
@@ -549,6 +619,7 @@ def main() -> None:
                     **{k: round(v, 5) for k, v in learner.stats.items()},
                 }
                 log_file.write(json.dumps(row) + "\n"); log_file.flush()
+                mirror.log(row)
                 # lambda only earns a column while it is actually moving.
                 lam = (f" lam {row.get('lambda_mc')}"
                        if cfg.lambda_mc_final is not None else "")
@@ -592,7 +663,7 @@ def main() -> None:
                 # opponent pool inside, every one of those is a large
                 # file nobody reads.
                 save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots,
-                     archive=archive_due)
+                     archive=archive_due, segment=segment, rng=rng)
                 if archive_due:
                     next_archive_at = ((learner.steps // args.checkpoint_every) + 1
                                        ) * args.checkpoint_every
@@ -603,8 +674,11 @@ def main() -> None:
         if prefetch is not None:
             prefetch.close()
         pool.close()
-        save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots, final=True)
+        save(net, critic, learner, cfg, net_cfg, args, hands_base + hands, snapshots,
+             final=True, segment=segment, rng=rng)
         log_file.close()
+        mirror.summary(final_steps=learner.steps, final_hands=hands_base + hands)
+        mirror.finish()
 
     el = time.perf_counter() - started
     print(f"done: {hands} hands, {decisions} decisions ({trained_decisions} trained) "
@@ -634,7 +708,7 @@ def _atomic_save(payload: dict, path: Path) -> None:
 
 
 def save(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
-         final=False, archive=True) -> None:
+         final=False, archive=True, segment=0, rng=None) -> None:
     """Write a checkpoint, holding the weights lock for the whole write.
 
     `state_dict()` hands back references to the live tensors, not copies, so
@@ -648,11 +722,11 @@ def save(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
     """
     with learner.weights_lock:
         _save_locked(net, critic, learner, cfg, net_cfg, args, hands,
-                     snapshots, final, archive)
+                     snapshots, final, archive, segment, rng)
 
 
 def _save_locked(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
-                 final=False, archive=True) -> None:
+                 final=False, archive=True, segment=0, rng=None) -> None:
     payload = {
         "arch": "v2",
         "model": net.state_dict(),
@@ -661,6 +735,12 @@ def _save_locked(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
         "config": asdict(cfg),
         "steps": learner.steps,
         "hands": hands,
+        # Which restart this is, and where the python RNG had got to. Both
+        # exist so the next segment deals hands this run has not already
+        # seen -- a deal is a pure function of the worker seed, so a resume
+        # that does not move the seeds trains twice on one deal stream.
+        "segment": segment,
+        "rng_state": None if rng is None else rng.bit_generator.state,
         # The opponent pool is training state, not a by-product. Left out,
         # a resume restarts self-play against copies of the current net
         # and needs snapshot_every * snapshot_pool steps -- 100k at the

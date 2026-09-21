@@ -96,7 +96,17 @@ def main() -> int:
 
     print(f"{'config':<40}{'ms/step':>10}{'steps/s':>10}")
     print("-" * 60)
+    # Seeded so the whole benchmark is reproducible between invocations
+    # and not merely self-consistent within one.
+    torch.manual_seed(0)
     base_state = TractorNet(NetConfig()).state_dict()
+    # The critic has to be pinned exactly as the net is. critic_residual_std
+    # is a purely critic-side quantity and it is the number the precision
+    # comparison turns on, so a freshly initialised critic per configuration
+    # makes those rows differ in the critic's random weights as well as in
+    # precision -- which is why the two fp32 rows, identical in arithmetic,
+    # weights and batch, did not agree with each other either.
+    base_critic_state = PrivilegedCritic().state_dict()
     results = {}
     for label, on_device, tf32, amp in [
         ("host featurise, fp32", False, False, None),
@@ -112,7 +122,9 @@ def main() -> int:
             continue
         net = TractorNet(NetConfig()).to(dev)
         net.load_state_dict(base_state)
-        learner = Learner2(net, PrivilegedCritic().to(dev), cfg, dev)
+        critic = PrivilegedCritic().to(dev)
+        critic.load_state_dict(base_critic_state)
+        learner = Learner2(net, critic, cfg, dev)
         learner.device_featurise = on_device and dev.type == "cuda"
         learner.amp_dtype = amp
 
@@ -145,7 +157,9 @@ def main() -> int:
     if dev.type == "cuda":
         net = TractorNet(NetConfig()).to(dev)
         net.load_state_dict(base_state)
-        learner = Learner2(net, PrivilegedCritic().to(dev), cfg, dev)
+        critic = PrivilegedCritic().to(dev)
+        critic.load_state_dict(base_critic_state)
+        learner = Learner2(net, critic, cfg, dev)
         learner.device_featurise = True
         b = learner.featurise_on_device(RawBatch(*sample))
         owner = torch.arange(b.sf.shape[0], device=dev)

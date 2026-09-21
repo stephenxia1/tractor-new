@@ -25,11 +25,55 @@ def check(ok: bool, msg: str) -> None:
         FAILS.append(msg)
 
 
+def newest_run(rows: list[dict]) -> list[dict]:
+    """Only the rows the most recent invocation appended.
+
+    train_pop opens runs/<name>.jsonl in append mode so that --resume
+    continues one logical run, which means a rerun under the same name
+    inherits every earlier invocation's rows. Read whole, the file makes a
+    run that collapsed early look like one that trained for hours: the row
+    count, the first row the "kept collecting" check below diffs against,
+    and the archive and iteration numbers all come from someone else's run.
+
+    `rounds` only ever grows within one invocation and a fresh rerun starts
+    it over, so the last place it fails to grow is where the newest one
+    began. Not "the last place it drops": train_pop logs on
+    `rounds % --log-every == 0`, so every fresh invocation's *first* row
+    carries exactly --log-every rounds. A previous invocation that wrote a
+    single row and then died therefore left a row holding the same number
+    the next invocation's first row holds, and a strict `<` reads those two
+    equal values as one continuous run -- the one case where the stale rows
+    are also the ones most likely to be mistaken for a healthy start. Within
+    an invocation the logged value is strictly increasing (one row per
+    distinct multiple of --log-every), so `<=` cannot split a run in half.
+
+    Two reruns stay invisible to that, and both would need a run-instance id
+    in the rows, which lives on the trainer side: one that appended *nothing
+    at all* -- the --agents mismatch SystemExit fires before the log file is
+    even opened -- and a --resume, which carries `rounds` on from the
+    checkpoint instead of restarting it, so its rows stay joined to the
+    invocation they continue.
+    """
+    start = 0
+    for i in range(1, len(rows)):
+        if rows[i]["rounds"] <= rows[i - 1]["rounds"]:
+            start = i
+    return rows[start:]
+
+
 def main(path: str) -> int:
     rows = [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
     if not rows:
         print("no metrics at all -- the run produced nothing")
         return 1
+    dropped = len(rows)
+    rows = newest_run(rows)
+    if not rows:
+        print("no metrics from the newest run -- the file holds only older ones")
+        return 1
+    dropped -= len(rows)
+    if dropped:
+        print(f"ignoring {dropped} row(s) from earlier invocations of this run name")
     last = rows[-1]
     n = len(last["steps"])
     print(f"{len(rows)} metric rows, {n} agents, "
@@ -71,6 +115,11 @@ def main(path: str) -> int:
           f"the archive filled after burn-in ({last['archive']} entries)")
 
     # Every agent should have been seated over the run, not just at the start.
+    # Diffed from the newest invocation's own first row: buffers start empty
+    # on every invocation, so measuring from an earlier one's first row
+    # compares a fresh buffer against a full one and reports growth nobody
+    # observed. A --resume is the boundary newest_run cannot see, so there
+    # this check still spans it.
     first = rows[0]
     grew = [b - a for a, b in zip(first["buffers"], last["buffers"])]
     check(all(g > 0 for g in grew), f"every agent kept collecting: {grew}")

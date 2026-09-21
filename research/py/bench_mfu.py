@@ -55,6 +55,11 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--agents", type=int, default=4)
+    ap.add_argument("--cands", type=float, default=8.0,
+                    help="mean legal moves per decision, the actor's candidate "
+                         "rows; the measured mean is about 8, and the engine "
+                         "caps enumeration at 48, so pass --cands 48 for the "
+                         "worst case rather than a typical round")
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
@@ -91,7 +96,22 @@ def main() -> int:
           f"   MFU {100*gflops/peak:4.1f}%")
 
     with torch.inference_mode():
-        C = int(26 * B / 26)
+        # The actor scores every legal move of every state, so candidate
+        # rows outnumber states by the mean legal-move count -- which is the
+        # whole reason for the owner gather below. This used to read
+        # `26 * B / 26`, i.e. exactly B, so the row re-measured the learner's
+        # own shape and `policy_macs(C / B)` collapsed to `policy_macs(1.0)`.
+        # The trunk is 4.36M of the 4.59M MACs, so that understated the work
+        # by 1.35x at the measured mean of about 8, not 26x. The stray 26
+        # outlived the bug as the --cands default, where it was neither the
+        # measured mean nor the engine's 48-candidate cap -- the default is
+        # the mean now, so this row describes a typical round unless asked
+        # for something else.
+        # On --device cuda policy_macs undercounts the per-candidate term by
+        # a further ~3x on top of this, because model2 runs all three role
+        # q-heads over every candidate row there rather than masking, to keep
+        # the output shape static and the queue unstalled.
+        C = int(args.cands * B)
         af_act = torch.randn(C, ACTION_DIM, device=dev)
         own_act = torch.from_numpy(np.sort(np.random.randint(0, B, C))).to(dev)
         net(sf, af_act, own_act, roles, tok, msk, want="q")

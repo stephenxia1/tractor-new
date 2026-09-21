@@ -1011,3 +1011,255 @@ A caution recorded because I walked into it twice in one session: a
 120-pair run of the same configuration read **+44.38**, six points above the
 300-pair estimate on the same deal base. 120 pairs cannot resolve anything
 under ten points, and it will happily hand you a number that looks decisive.
+
+## Which card, measured (2026-09-17)
+
+Three Modal containers, `py/bench_gpu_configs.py --fixture --reps 30`, the
+same 5k-record fixture batch and the same initial weights on each, and
+**`cpu=8` / `threads=8` forced identical** so only the card varies. ms per
+learner step, lower is better:
+
+| config | T4 | L4 | A10G |
+| --- | --- | --- | --- |
+| host featurise, fp32 | 37.63 | 34.15 | 22.31 |
+| **device featurise, fp32** | **23.51** | **23.22** | **13.48** |
+| device featurise, fp32 + TF32 | 20.50 | 22.00 | 13.96 |
+| device featurise, bf16 | 28.67 | 25.87 | 16.26 |
+| device featurise, bf16 + TF32 | 28.50 | 26.43 | 15.87 |
+
+`Learner2` sets `device_featurise = device.type == "cuda"`, so the bolded
+row is the one a real CUDA run takes.
+
+**The A10G wins by 1.74x and the L4 ties the T4.** That is the opposite of
+the ordering the price list suggests, and the reason is bandwidth rather
+than FLOPs: the L4 is a much newer card with roughly twice the T4's tensor
+throughput, but *lower* memory bandwidth (~300 vs 320 GB/s). At 3.13M
+parameters almost nothing here is compute-bound, so the newer card buys
+nothing. The A10G's 600 GB/s is what shows up. (That count read 0.74M
+here, which is v1's -- the figure from the table at the top of this file.
+`bench_gpu_configs.py` builds `TractorNet(NetConfig())` from `model2`, so
+the net being timed is the 3.13M-parameter v2 recorded above. The argument
+is unchanged: 3.13M is still nowhere near enough to make a step
+compute-bound.)
+
+It is also cheaper per step despite the higher hourly rate: including the
+8 cores and 16 GiB, roughly 167k steps/$ against the T4's 140k and the L4's
+119k. There is no axis on which the L4 is the right choice.
+
+**How much of a difference is real here.** The T4 has no TF32 path at all --
+it is Turing -- so its TF32 row is the same computation as the row above
+it, and the 23.51 -> 20.50 gap is pure measurement noise: **13% at 30
+reps**. Nothing below that is resolvable without more reps. The L4-vs-T4
+"win" of 1% is a tie; the A10G's 42% is real.
+
+**bf16 is slower, so leave `--amp off`.** It costs 22% on the T4 (23.51
+-> 28.67) and 21% on the A10G (13.48 -> 16.26), because a model this
+small is launch-bound and autocast only adds casts. On the L4 it is 11%
+(23.22 -> 25.87), which is inside the 13% noise floor this section
+establishes above -- directionally the same, not separately resolvable.
+Two cards out of three clear the floor and none goes the other way, so
+the recommendation holds. That is the whole of the case, and it stands on
+its own: a wall-clock measurement does not care how the critic was
+initialised.
+
+*The accuracy half of that verdict is withdrawn.* This paragraph also read
+"it moves the number the docstring warns about: `critic_residual_std` goes
+0.409 (fp32) -> 0.493 (bf16) against a target spread of ~0.59. Slower
+*and* less accurate." The comparison was confounded.
+`bench_gpu_configs.py` pins the *policy* net across configs by loading one
+`base_state` into each, but it built a fresh, unseeded
+`PrivilegedCritic()` for every row -- and `critic_residual_std` is a
+purely critic-side quantity. So every pair of rows in that table differs
+in critic initialisation as well as in precision, the two fp32 rows
+included, and 0.409 vs 0.493 cannot be attributed to bf16. The benchmark
+now pins the critic too, so the numerics question can be put again;
+until it is, nothing here is known about what bf16 costs in accuracy.
+
+**Device featurisation is worth 32-40%** -- T4 37.5%, A10G 39.6%
+(22.31 -> 13.48), L4 32.0%. The range first written here was 34-40%,
+which excluded the L4, one of the three rows it was read off. Either way
+it is a prerequisite for GPU work rather than a later optimisation.
+
+The caveat: this measures learner steps only. The full loop is roughly half
+learner, so the end-to-end gain will be smaller than 1.74x. Confirm with
+`py/tune_learner.py` on the size before committing a long run to it.
+
+### What a Modal A10G container actually delivers
+
+A 3-minute run and a 2-minute resume, `a10g` (A10G + 16 cores),
+`--games 32 --groups 1`, threads/workers split 8/8:
+
+| | dec/s | hands/s | steps/s | replay |
+| --- | --- | --- | --- | --- |
+| laptop (i7-1270P) | 1,900 | 26 | 5 | -- |
+| **Modal a10g, 16 cores, 8thr/8wrk** | **11,920** | **149.9** | **22.8** | **1.25** |
+| Modal a10g, 4thr/12wrk | 15,537 | 196.1 | 20.0 | 0.81 |
+| Modal cpu32, 16thr/16wrk | 2,068 | 25.7 | 1.8 | 0.56 |
+| c7i.8xlarge spot, 32 vCPU | 24,300 | 381 | 36 | -- |
+
+*The replay column is itself a correction.* It first read 0.98 / 0.66 /
+0.44, computed as steps/s x batch over *every* decision the box generated.
+But only the decisions the current network took are ever stored --
+`train2.py` keeps `rows_cur` and discards the snapshot's picks -- so the
+denominator is the stored share, not the generated one. Under the
+`MATCHUPS` shares that share is 25/32 = 0.781 at 8 workers, 39/48 = 0.813
+at 12 and 50/64 = 0.781 at 16; dividing through gives the column above.
+`py/tune_learner.py` computed the ratio the same wrong way and has been
+fixed with it.
+
+**Two corrections this table forced.**
+
+*Shifting cores from torch to actors is a trap here.* Reading `pct_learn
+34.1` against 60.7% actor-side as "actor-bound" led to a 4-thread /
+12-worker split, which does buy 30% more decisions per second -- and loses
+12.5% of the gradient steps while dropping the replay ratio to 0.81, i.e.
+never sampling about a fifth of the experience it just paid to store. At
+the even split replay sits at 1.25: each stored sample is used about one
+and a quarter times. Fixing the denominator moved both numbers up without
+moving them past each other, so the recommendation is unchanged -- the
+even split still uses its data far better than 4/12, and that comparison
+was always the argument, not either number on its own.
+`tune_learner.py` already says this: once the environment is not the
+bottleneck the objective is steps/s at a sane replay ratio, and decisions/s
+stops being informative. A low learner share means the actors are cheap,
+not that more of them would help. The even split is what ships.
+
+*Modal's CPU sizes are not a substitute for a spot box.* `cpu32` -- 32
+reserved cores -- delivered 2,068 dec/s, the dev laptop's decision rate,
+but only 1.8 steps/s against the laptop's 5, and roughly a twelfth of the
+c7i.8xlarge's 24,300 dec/s at the same core count. It is worse than the
+laptop on the axis this document calls the objective. Its profile is 52.9% learner / 37.4% forward, so it is torch on
+CPU that is slow, not the actors. Whatever the cause (host generation,
+AVX-512, the reservation being a scheduling weight rather than a
+guarantee), the operational conclusion is firm: on Modal use a GPU size for
+training, and keep the CPU sizes for evaluation only -- where they should
+themselves be timed before a big ladder is committed to them.
+
+So the GPU container is **about half a 32-vCPU spot box** at roughly three
+times the hourly cost. That is not a contradiction of the card benchmark
+above -- it is the same finding from the other side: what a 16-core GPU
+size is short of is **cores, not card**. The loop profile on that run was
+`env 12.2 / features 22.4 / forward 26.1 / learn 34.1`, which reads as
+actor-bound -- and that reading is exactly the trap above, since the 4/12
+split it argues for pays 12.5% of the gradient steps for decisions the
+learner never consumes. So the injected split stays an even 8 threads / 8
+workers on a GPU size; more throughput on Modal means more cores, not a
+different division of the same sixteen.
+
+The conclusion for sizing is unchanged and now has numbers behind it: use
+Modal for arms in parallel and for ladders, where the win is wall clock and
+zero operations; use an AWS spot box for one long grind, where the win is
+throughput per dollar.
+
+Resume was verified in the same run: the second invocation picked up at
+step 4,095 with hands cumulative (26,882 -> 45,014), so `--resume` restores
+the step counter, the hand count and the optimiser state off the volume.
+
+## Pre-registration: does population play break the 966k plateau? (2026-09-18)
+
+Written before the run is launched, so the analysis cannot be chosen to
+suit the numbers.
+
+**The plateau is the reason.** `train2.py` from random init reached
++31.81 against `smart-v2` at 966k steps and then stopped: 966k -> 1104k
+measured **-0.78 mean over 9 ladder rungs, better on 5 of 9** -- scatter
+with no direction, which is what re-measuring one agent looks like. More
+steps of this recipe are not the answer, and that is the one experiment
+this file has already ruled out.
+
+**Why now and not earlier.** The population loop is not new; what changed
+is that it is affordable. `train_pop.py` has only ever run on a CPU box,
+where it managed 0.99 agent-steps/s against the 28.2 aggregate that N=8
+needs. Since then: a plain Python loop over 8 agents on a T4 measured
+73.9 agent-steps/s, so N=8 fits on one GPU with no batching at all, and
+the A10G is a further 1.74x. The card, the container and the segment
+chaining were all measured this week.
+
+**Design.** One arm, no control arm: the control is `v2_966k` itself,
+already measured on every rung. All 8 agents are seeded from it with
+`--init-from`, so the population starts *at* the plateau and the question
+is only whether cross-play moves it. `--history attn` (kept, see above),
+`--amp off` (bf16 measured 21-22% slower), Modal `a10g` with the injected
+even 8-thread / 8-worker split.
+
+Evaluation is `py/arena.py --dump-pairs` for the population's best agent
+and for `v2_966k` against the *same* opponent, deal base and preplay,
+joined by `py/compare_runs.py` -- which now refuses a mismatched
+`--opponent` or `--preplay` rather than pairing on the deal digest alone
+and calling that proof. 1000 pairs: this file's own caution is that 120
+pairs "cannot resolve anything under ten points, and it will happily hand
+you a number that looks decisive", and 300 left the search question open
+at +3.57 [-0.90, +8.03]. Breadth comes from `py/ladder.py` over the
+fair-play rungs only -- `smart-v13` and up, since every rung below it
+reads the real hands -- because a single opponent already produced one
+confident wrong conclusion here.
+
+**Pre-registered readings:**
+
+| outcome | conclusion |
+| --- | --- |
+| best agent beats `v2_966k` by >= 5 pts, paired, and on a majority of fair-play rungs | population play breaks the plateau; it is the recipe, not the ceiling |
+| beats it by a margin whose interval spans zero | no effect at this budget; do not run it longer on this evidence |
+| level on the paired test but wins on some rungs and loses on others | the population diversified without improving; report as a null |
+| loses to `v2_966k` | cross-play is destructive from a converged seed; investigate before believing it |
+
+The third row is the one to watch: eight agents drifting apart produces
+rung-by-rung scatter that reads as movement and is not.
+
+**What would invalidate the run rather than answer it:** a segment chain
+that re-seeds instead of resuming (guarded now, see `modal_app.py`), an
+archive whose `a*.pt` files are deleted under a live reference (fixed
+today), or a throughput below 28.2 aggregate agent-steps/s, which would
+mean the agents are too starved for the comparison to mean anything. The
+shakedown below checks all three before the real run is committed to.
+
+### Shakedown before that run (2026-09-18)
+
+Three segments on a Modal `a10g`, 8 agents seeded from `v2_966k`
+(step 966632), ~18 GPU-minutes and about $0.63 total. Its job was the
+operational checklist above, not the hypothesis.
+
+**Resume works, across two segment boundaries.** Read off
+`runs/popshake.jsonl`, which is the authoritative record -- `modal app
+logs <app-id>` returns only the most recent task's output, so segment
+boundaries are invisible there and the run looks like one segment:
+
+| boundary | iteration | steps/agent | hands (cumulative) |
+| --- | --- | --- | --- |
+| seg 1 -> 2 | 100 -> 107 | 968 -> 1009 | 39,069 -> 41,852 |
+| seg 2 -> 3 | 152 -> 157 | 1457 -> 1479 | 59,378 -> 61,384 |
+
+No counter resets, no loss discontinuity at either boundary (mean
+`loss_q` 0.045 -> 0.054 -> 0.037 across the first, inside the run's own
+0.034-0.054 range), the archive held at its full 192 entries -- 8 agents
+x 24 reservoir slots -- through both, and no orphan `.tmp` was left
+behind. Per-agent throughput was flat across all three segments at
+2.08-2.15 steps/s, so nothing degrades over a chain.
+
+**Two bugs it caught, both of which would have cost real money.** The
+first chain died after segment 1 with `chain spawn failed (Secret 'wandb'
+not found)`: `train_segment` re-resolved the secret name itself at spawn
+time, hardcoded, so a workspace whose secret is called `wandb-secret` ran
+one segment and silently dropped the rest -- on the planned 4 x 12h run
+that is three segments of GPU time bought and thrown away, reported as a
+successful first segment. The resolved name is now threaded through the
+chain instead of re-derived. The second was the reverse: `--init-from`
+passed through `--args` on a chain re-seeds every segment, so N segments
+buy one segment of progress. That one is now refused outright, locally,
+before a container starts.
+
+**The throughput criterion above was the wrong test, and this is the
+amendment.** It asked for >= 28.2 aggregate agent-steps/s. The run
+delivered **16.8**, and the pre-registration as written would call that
+invalid. It is not: `--target-replay 3.0` throttled the learner 2,010
+times and the replay ratio sat at exactly 3.00 on all eight agents, so
+the learner was held at the data rate on purpose and 28.2 was never
+reachable at 5,500 decisions/s no matter how fast the card is. The bar
+measured the card when the binding constraint is actor supply. What the
+profile actually says is that `forward` is 48.7% of the loop, because
+`--archive-budget 4` puts 12 distinct models on the board every
+iteration; the levers are archive budget, target replay and cores, not
+the GPU. **The amended criterion is a replay ratio at or near its target
+with a stable per-agent step rate**, both of which held. Recorded here
+rather than quietly edited above: the experiment's four-row decision
+table is untouched, and only this operational check moved.

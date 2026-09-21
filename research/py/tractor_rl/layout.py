@@ -1,9 +1,12 @@
 """Wire-layout constants, loaded from the spec.json that TypeScript emits.
 
 Nothing here is hand-copied: `research/src/record.ts` is the single source
-of truth and `npm run spec` regenerates spec.json. If the TS layout changes
-without regenerating, LAYOUT_VERSION stops matching and this module raises
-at import instead of silently misreading records.
+of truth and `npm run spec` regenerates spec.json. The version check below
+raises at import when spec.json has moved ahead of this module. It cannot
+see the opposite failure -- a record.ts edit that skipped `npm run spec`,
+which leaves spec.json stale and still matching LAYOUT_VERSION -- so the
+records themselves are checked against LAYOUT_VERSION as they arrive; see
+features2._check_wire_layout.
 """
 
 from __future__ import annotations

@@ -110,10 +110,38 @@ class Archive:
         for agent, iteration, payload in entries:
             if 0 <= agent < self.n_agents and len(self._slots[agent]) < self.capacity:
                 self._slots[agent].append((iteration, payload))
-        self._offered = [int(n) for n in offered[:self.n_agents]]
-        while len(self._offered) < self.n_agents:
-            self._offered.append(0)
+        saved = [int(n) for n in offered[:self.n_agents]]
+        while len(saved) < self.n_agents:
+            saved.append(0)
+        # The counter has to describe the same history the sample does. Kept
+        # verbatim against a sample that lost entries, the empty slots refill
+        # with one contiguous block of post-resume iterations and are then
+        # evicted at only capacity/n -- so the archive stops averaging over
+        # the history and the population is back to the iterated best
+        # response it exists to prevent, with nothing in the logs to show it.
+        # Scaling to what survived is exact when nothing was dropped, since
+        # a full reservoir means len(slots) == capacity and a partial one was
+        # never offered more than it holds.
+        self._offered = [
+            max(len(self._slots[a]),
+                int(saved[a] * len(self._slots[a]) / self.capacity))
+            for a in range(self.n_agents)
+        ]
         return self.size()
+
+    def discard(self, ref: ModelRef) -> bool:
+        """Forget one entry whose payload turned out to be unusable.
+
+        The offered counter is deliberately left alone: the publication was
+        still offered, and lowering it would raise every later acceptance
+        probability and bias the sample toward what comes after the loss.
+        """
+        slots = self._slots[ref.agent]
+        for i, (iteration, _) in enumerate(slots):
+            if iteration == ref.iteration:
+                del slots[i]
+                return True
+        return False
 
     def refs(self, agent: int) -> list[ModelRef]:
         return [ModelRef(agent, it) for it, _ in self._slots[agent]]

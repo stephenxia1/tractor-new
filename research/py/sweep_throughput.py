@@ -127,8 +127,14 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    configs = build_configs(args.cores or os.cpu_count() or 8)
-    print(f"sweeping {len(configs)} configurations on {os.cpu_count()} logical cores\n")
+    # os.cpu_count() reports the host's cores inside a Modal container, not
+    # the reservation -- measured 24 in a cpu=8 container, with no cgroup
+    # quota and sched_getaffinity agreeing. A sweep sized for 24 cores would
+    # hand back a split that starves the actors on the 8 it actually has.
+    # OMP_NUM_THREADS is the one number Modal sets from the reservation.
+    cores = args.cores or int(os.environ.get("OMP_NUM_THREADS") or 0) or os.cpu_count() or 8
+    configs = build_configs(cores)
+    print(f"sweeping {len(configs)} configurations on {cores} logical cores\n")
     results = []
     for workers, games, threads, groups in configs:
         started = time.perf_counter()

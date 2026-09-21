@@ -65,6 +65,15 @@ export type Leaf = {
   // positive when its side gained, negative when the other side did.
   readonly points: number;
   // Position after the trick resolved, to be scored by the value head.
+  // The simulation may have run the hand out, in which case there is no
+  // continuation and V's answer is meaningless -- it only ever saw "my
+  // turn" positions in training. Such a leaf is still emitted, because
+  // dropping it would leave the last decision of a hand with no leaves for
+  // any candidate and so no search at all, exactly where the kitty bonus
+  // is decided. The learner recognises it instead: a leaf is a position
+  // where the searching seat is about to move, so an empty hand can only
+  // mean the hand is over, and `SearchPolicy` scores those on the settled
+  // points alone.
   readonly state: GameState;
 };
 
@@ -130,10 +139,17 @@ function simulate(
     if (nextToPlay(state) === seat) break; // back to a state V understands
     const next = nextToPlay(state);
     if (next === null) break;
+    // A rollout the bot or the reducer refuses drops the whole leaf, as in
+    // the trick-completion loop above. Breaking here instead would hand
+    // back the position as it stands -- some other seat still on lead --
+    // and `buildLeaves` would emit it, which is exactly the
+    // out-of-distribution leaf the block comment above blames for search
+    // once playing worse than no search at all. One lost sample is cheap;
+    // a leaf V cannot read poisons the candidate's whole average.
     const action = pickBotAction(state, next, opponentModel);
-    if (action.kind !== 'play_cards') break;
+    if (action.kind !== 'play_cards') return null;
     const r = applyEvent(state, { kind: 'play_cards', seat: next, cards: action.cards });
-    if (!r.ok) break;
+    if (!r.ok) return null;
     state = r.state;
   }
   return { state, points };

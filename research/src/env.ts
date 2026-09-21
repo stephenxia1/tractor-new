@@ -226,7 +226,7 @@ export class GameSlot {
         if (this.opts.learnerSeats[seat] === true) {
           const candidates = enumerateCandidates(this.state, seat, {
             maxCandidates: this.opts.maxCandidates,
-            myKitty: this.buriedKitty,
+            myKitty: this.kittyFor(seat),
           });
           if (candidates.length > 0) {
             this.pending = { seat, candidates };
@@ -275,7 +275,7 @@ export class GameSlot {
       this.state,
       pending.seat,
       pending.candidates,
-      this.buriedKitty,
+      this.kittyFor(pending.seat),
       { trumpRank: hand.trumpRank, trumpSuit: hand.trumpSuit },
       opts,
     );
@@ -290,6 +290,17 @@ export class GameSlot {
 
   private nextSeed(): number {
     return Math.floor(this.rng() * 0x7fffffff);
+  }
+
+  // The buried kitty is knowledge the landlord alone holds. Candidate
+  // generation subtracts `myKitty` from the unseen-card pool to sharpen
+  // throw safety, so handing it to a non-landlord seat would offer that
+  // seat components that read as unbeatable only because of cards it has
+  // no way of knowing are out of play -- hidden information leaking into
+  // the action set itself, which is what generating throws from public
+  // information alone exists to prevent.
+  private kittyFor(seat: Seat): ReadonlyArray<Card> {
+    return seat === this.state.currentHand?.landlord ? this.buriedKitty : [];
   }
 
   private startHand(): void {

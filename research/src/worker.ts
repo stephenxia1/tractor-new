@@ -22,6 +22,22 @@ import {
   FRAME_HEADER_BYTES,
 } from './record';
 
+// The 32-bit mixer src/env.ts uses to address a deal by coordinate, kept
+// here rather than imported because the two uses are independent: this one
+// addresses a *search* by (worker seed, game+hand, decision), and nothing
+// requires the two streams to stay in lockstep if either changes.
+function mix32(a: number, b: number, c: number): number {
+  let x = (a ^ 0x9e3779b9) >>> 0;
+  x = Math.imul(x ^ ((b + 0x85ebca6b) >>> 0), 0xcc9e2d51) >>> 0;
+  x = (((x << 15) | (x >>> 17)) >>> 0) ^ ((c + 0xc2b2ae35) >>> 0);
+  x = Math.imul(x, 0x1b873593) >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0;
+  x = Math.imul(x, 0x85ebca6b) >>> 0;
+  x = (x ^ (x >>> 13)) >>> 0;
+  x = Math.imul(x, 0xc2b2ae35) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
+}
+
 type Args = {
   games: number;
   seed: number;
@@ -205,7 +221,12 @@ async function main(): Promise<void> {
 
   const reader = new FrameReader(process.stdin);
   const writer = new ByteWriter(1 << 20);
-  const pendingSeat = new Map<number, number>(); // gameId -> pending index guard
+  // gameId -> candidates offered this round, consumed as the replies come
+  // back. A reply carries only (gameId, candidateIndex), so a learner that
+  // answers a slot which had nothing pending -- or answers the same slot
+  // twice -- otherwise surfaces as GameSlot's bare 'no pending decision',
+  // with nothing saying which game or how the two sides fell out of step.
+  const pendingCandidates = new Map<number, number>();
 
   for (;;) {
     writer.reset();
@@ -215,7 +236,7 @@ async function main(): Promise<void> {
 
     let nDecisions = 0;
     const episodes: Array<Parameters<typeof writeEpisode>[1]> = [];
-    pendingSeat.clear();
+    pendingCandidates.clear();
 
     for (const slot of slots) {
       const { episodes: finished, pending } = slot.advance();
@@ -233,17 +254,41 @@ async function main(): Promise<void> {
         },
         pending.candidates,
       );
-      pendingSeat.set(slot.gameId, pending.candidates.length);
+      pendingCandidates.set(slot.gameId, pending.candidates.length);
       nDecisions += 1;
 
       // Leaves ride the same frame as ordinary records with no candidates,
-      // tagged with the candidate they inform.
+      // tagged with the candidate they inform. That only holds if they
+      // carry the same privileged flag: `parse_frame` resolves the state
+      // block's width once, from the first record of the frame, and then
+      // derives every record's candidate count by subtracting that one
+      // width. A leaf written without the block under `--privileged 1`
+      // makes the subtraction negative ((768 - 984) // 20 = -11) and the
+      // learner dies in np.repeat, so the flag is `args.privileged` here
+      // exactly as it is above rather than a hardcoded false. Note what
+      // the block then holds for a leaf: the *sampled* world, not the real
+      // hands. `SearchPolicy` only ever reads the policy view off a leaf,
+      // so that is inert today -- but anything that starts feeding leaf
+      // rows to the privileged critic would be teaching it on guesses.
       if (args.searchWorlds > 0) {
+        // `buildLeaves` seeds a fresh RNG on every call, so the seed has to
+        // name the *decision*. Keyed on the hand alone, all ~25 decisions
+        // of a hand replay the identical uniform prefix over a
+        // canonically-ordered shrinking pool -- and every worker holding
+        // the same (game, hand) replays it too, since neither the worker's
+        // own seed nor the position in the hand appeared in the key.
+        const live = slot.gameState.currentHand;
+        const trickIndex = live?.tricks.length ?? 0;
+        const ply = live?.currentTrick?.plays.length ?? 0;
         const result = slot.searchLeaves({
           worlds: args.searchWorlds,
           topCandidates: args.searchTop,
           opponentModel: args.searchOpponent,
-          seed: (slot.gameId + 1) * 7919 + slot.handId,
+          seed: mix32(
+            args.seed,
+            (slot.gameId + 1) * 7919 + slot.handId,
+            trickIndex * slot.gameState.config.numPlayers + ply,
+          ),
         });
         if (result !== null) {
           for (const leaf of result.leaves) {
@@ -255,7 +300,7 @@ async function main(): Promise<void> {
                 handId: slot.handId,
                 seat: pending.seat,
                 myKitty: slot.kitty,
-                privileged: false,
+                privileged: args.privileged,
                 leafOf: leaf.candidateIndex,
                 leafPoints: leaf.points,
               },
@@ -285,6 +330,18 @@ async function main(): Promise<void> {
       off += 3;
       const slot = slots[gameId];
       if (slot === undefined) throw new Error(`unknown gameId ${gameId}`);
+      const offered = pendingCandidates.get(gameId);
+      if (offered === undefined) {
+        throw new Error(
+          `reply names game ${gameId}, which had no decision pending this round`,
+        );
+      }
+      pendingCandidates.delete(gameId);
+      if (candidateIndex >= offered) {
+        throw new Error(
+          `reply picks candidate ${candidateIndex} for game ${gameId}, which offered ${offered}`,
+        );
+      }
       slot.choose(candidateIndex);
     }
   }

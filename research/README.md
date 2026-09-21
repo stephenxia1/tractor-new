@@ -84,7 +84,10 @@ PYTHONPATH=py python py/train_dmc.py --workers 4 --games 96 --minutes 60
 ```
 
 Checkpoints land in `checkpoints/<run>_latest.pt`; per-round metrics stream
-to `runs/<run>.jsonl`.
+to `runs/<run>.jsonl`. The v2 trainers — `py/train2.py` and
+`py/train_pop.py` — also take `--wandb`, which mirrors those same rows to
+Weights & Biases (`--wandb-mode offline` needs no key); the JSONL stays the
+source of truth.
 
 ---
 
@@ -112,6 +115,21 @@ starting, so a broken image fails in seconds rather than after an hour.
 a GPU. `research/scripts/publish_progress.sh <run>` pushes metrics and the
 latest checkpoint to a `training-progress` branch so another machine can
 pull them.
+
+A third way, and the one to use for anything that is a *set* of arms rather
+than one long run:
+
+```sh
+# one container per arm, launched together, artifacts on a shared volume
+modal run --detach research/modal_app.py::sweep \
+    --run-prefix spt --minutes 300 --size a10g \
+    --arms "one:--steps-per-train 1;two:--steps-per-train 2"
+```
+
+See [MODAL.md](MODAL.md). It answers A/B questions in one arm's wall clock
+instead of the sum, puts every arm on the same declared shape, and resumes
+itself after a preemption. The AWS path stays for long single-agent runs,
+where a spot box is cheaper per core-hour.
 
 **Sizing.** The tuned loop splits roughly 50% learner / 40% acting forward
 pass / 6% featurisation / 2% environment, so it is torch-bound, and a GPU

@@ -49,7 +49,8 @@ import numpy as np
 import torch
 
 from tractor_rl import layout as L
-from tractor_rl.dmc2 import DMC2Config, Learner2, ReplayBuffer2, hand_returns
+from tractor_rl.dmc2 import (
+    DMC2Config, Learner2, ReplayBuffer2, decision_signs, hand_returns)
 from tractor_rl.features2 import (
     action_features,
     field_u8,
@@ -61,6 +62,7 @@ from tractor_rl.features2 import (
     split_per_worker,
     state_features,
 )
+from tractor_rl import wandb_log
 from tractor_rl.model2 import NetConfig, PrivilegedCritic, TractorNet
 from tractor_rl.population import (
     Archive,
@@ -135,8 +137,23 @@ def atomic_save(payload: dict, path: Path) -> None:
     tmp.replace(path)
 
 
+def archive_path(arch_dir: Path, stored: str) -> Path:
+    """Where an archive entry's weights actually live.
+
+    Entries are stored relative to the archive directory so that an archive
+    copied to another box -- the `modal volume get` resume -- still resolves
+    them; stored absolute, every entry would vanish on a cross-box resume
+    while the reservoir counter stayed in the hundreds. Checkpoints written
+    before that change hold absolute container paths, which are taken as
+    written so an in-place resume keeps working.
+    """
+    path = Path(stored)
+    return path if path.is_absolute() else arch_dir / path
+
+
 def build_slots(seating, agents: list[Agent], archive: Archive,
-                scratch: list[TractorNet], device) -> tuple[list[Slot], np.ndarray]:
+                scratch: list[TractorNet], device,
+                arch_dir: Path) -> tuple[list[Slot], np.ndarray]:
     """One Slot per distinct set of weights, and a [table, seat] index into them.
 
     Distinct weights cost one forward pass per round each, so this is where
@@ -154,9 +171,25 @@ def build_slots(seating, agents: list[Agent], archive: Archive,
                 raise RuntimeError(
                     "more archived opponents seated than scratch nets exist; "
                     "raise --archive-budget or lower the seating's demand")
-            net = spare.pop()
-            net.load_state_dict(to_float(torch.load(
-                archive.payload(ref), map_location=device)))
+            net = spare[-1]
+            try:
+                net.load_state_dict(to_float(torch.load(
+                    archive_path(arch_dir, archive.payload(ref)),
+                    map_location=device)))
+            except Exception as err:  # noqa: BLE001
+                # A checkpoint can name an archive file that is truncated or
+                # missing, and a torn torch.save surfaces as anything from
+                # UnpicklingError to EOFError depending on where the write
+                # stopped -- hence the wide net. Losing the whole run over
+                # one frozen opponent is the wrong trade on a spot box, so
+                # forget the entry and seat that agent's own current weights
+                # until the next iteration re-plans.
+                print(f"dropping archive entry {ref}: "
+                      f"{' '.join(str(err).split())[:140]}", flush=True)
+                archive.discard(ref)
+                slots.append(Slot(ref, agents[ref.agent].acting))
+                continue
+            spare.pop()
             net.eval()
         slots.append(Slot(ref, net))
     return slots, table
@@ -216,6 +249,12 @@ def main() -> None:
     ap.add_argument("--tf32", action="store_true")
     ap.add_argument("--log-every", type=int, default=500)
     ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
+    ap.add_argument("--checkpoint-every", type=int, default=0,
+                    help="learner steps per agent between numbered archives "
+                         "(<run>_<steps>.pt); 0 disables. train2.py's "
+                         "equivalent defaults to 100000, but a population "
+                         "payload is eight agents and their optimisers, so "
+                         "this stays opt-in.")
     ap.add_argument("--run-name", type=str, default="pop")
     ap.add_argument("--resume", type=str, default="")
     # Seed every agent from one trained single-agent checkpoint. From random
@@ -226,6 +265,7 @@ def main() -> None:
     # competent ancestor rather than from noise.
     ap.add_argument("--init-from", type=str, default="",
                     help="a train2.py checkpoint to copy into every agent")
+    wandb_log.add_arguments(ap)
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
@@ -294,6 +334,12 @@ def main() -> None:
     iteration = 0
     rounds_base = 0
     hands_base = 0
+    # How many times this run has been restarted. A deal is a pure function
+    # of (--seed, worker, game, hand), so without an offset that grows with
+    # the resume count every segment replays the deals the last one already
+    # trained on -- distinct-deal coverage capped by the longest single
+    # segment rather than by their sum.
+    segment = 0
     if args.resume:
         state = torch.load(args.resume, map_location=device)
         saved = len(state["agents"])
@@ -327,19 +373,33 @@ def main() -> None:
         # the hand count at zero while rounds keeps climbing, and the two
         # stop being comparable in the same log.
         hands_base = int(state.get("hands", 0))
+        # Checkpoints written before the counter existed default to 0, so an
+        # old file on the volume still resumes -- it just re-runs segment 1's
+        # deals once more before the offsets start advancing.
+        segment = int(state.get("segment", 0)) + 1
+        # The same replay problem on the python side: the exploration draws
+        # and the seating plan would otherwise repeat the previous segment's
+        # sequence exactly. Absent from older checkpoints, which then simply
+        # start the stream over.
+        if state.get("rng_state") is not None:
+            rng.bit_generator.state = state["rng_state"]
         # The archive is on local disk and is not carried in the checkpoint --
         # eight agents times twenty-four slots is over a gigabyte. A resume on
         # the same box recovers it from the index; a fresh box refills over
         # the burn-in, playing pure population self-play until it does.
         surviving = [(e["agent"], e["iteration"], e["path"])
                      for e in state.get("archive", [])
-                     if Path(e["path"]).exists()]
+                     if archive_path(arch_dir, e["path"]).exists()]
         kept = archive.restore(surviving, state.get("archive_offered", []))
-        print(f"resumed {args.resume}: iteration {iteration}, "
+        print(f"resumed {args.resume}: iteration {iteration}, segment {segment}, "
               f"steps {[a.learner.steps for a in agents]}, archive {kept} entries")
 
+    # The segment stride is far larger than `workers * 101` could ever reach,
+    # so no two segments can land on the same worker seed and re-deal a
+    # sequence already trained on.
     configs = [
-        WorkerConfig(games=args.games, seed=args.seed + i * 101,
+        WorkerConfig(games=args.games,
+                     seed=args.seed + i * 101 + 7_919_000 * segment,
                      learner_seats=0b1111, baseline="smart-v34",
                      preplay="smart-v34", privileged=True)
         for i in range(args.workers)
@@ -348,7 +408,7 @@ def main() -> None:
 
     seating = plan_seating(rng, args.agents, args.workers, args.live_per_table,
                            choose_archive_refs(rng, archive, args.archive_budget))
-    slots, slot_table = build_slots(seating, agents, archive, scratch, device)
+    slots, slot_table = build_slots(seating, agents, archive, scratch, device, arch_dir)
 
     print(f"net {agents[0].net.num_parameters()/1e6:.2f}M params, "
           f"critic {agents[0].critic.num_parameters()/1e6:.2f}M | device {device}")
@@ -360,17 +420,30 @@ def main() -> None:
     print(f"{len(slots)} distinct models on the board")
 
     log_file = (RUN_DIR / f"{args.run_name}.jsonl").open("a", encoding="utf-8")
+    # Per-agent lists in the row are expanded to agentN/<metric>
+    # series plus mean/min/max by wandb_log.flatten.
+    mirror = wandb_log.start(args, {
+        "trainer": "train_pop", "arch": "v2", "device": str(device),
+        "agents": args.agents, **vars(args),
+    }, step_metric="steps/max")  # agents step at their own pace
     # Defined before `save`, which closes over `rounds`: a SIGTERM arriving
     # during start-up would otherwise checkpoint into a NameError.
     rounds = decisions = hands = train_cursor = throttled = 0
 
-    def save(final: bool = False) -> None:
+    def save(final: bool = False, archive_steps: int | None = None) -> None:
         payload = {
             "arch": "pop",
             "net_config": {"history": args.history},
             "iteration": iteration,
             "rounds": rounds_base + rounds,
             "hands": hands_base + hands,
+            # Which restart this is, and where the python RNG had got to.
+            # Both exist so the next segment deals hands this run has not
+            # already seen -- a deal is a pure function of the worker seed,
+            # so a resume that does not move the seeds trains twice on one
+            # deal stream.
+            "segment": segment,
+            "rng_state": rng.bit_generator.state,
             "agents": [{
                 "model": a.net.state_dict(),
                 "acting": a.acting.state_dict(),
@@ -392,14 +465,43 @@ def main() -> None:
         atomic_save(payload, CHECKPOINT_DIR / f"{args.run_name}_latest.pt")
         if final:
             atomic_save(payload, CHECKPOINT_DIR / f"{args.run_name}_final.pt")
+        if archive_steps is not None:
+            # A numbered, immutable copy at a step watermark, which
+            # `<run>_latest.pt` cannot be: it is overwritten every
+            # `--checkpoint-minutes` and so only ever answers "where is the
+            # run now", never "what did it look like at 50k". A matched-step
+            # comparison between two runs needs the latter, and train2.py
+            # has had it as `--checkpoint-every` throughout.
+            atomic_save(payload, CHECKPOINT_DIR / f"{args.run_name}_{archive_steps}.pt")
+
+    # Spot gives a termination notice and then SIGTERM; save on the way out
+    # so the last minutes are not lost on top of whatever the periodic
+    # checkpoint missed.
+    interrupted = {"flag": False}
 
     def on_term(signum, _frame):
-        try:
-            save(final=True)
-            print(f"caught signal {signum}; checkpointed at iteration {iteration}",
-                  flush=True)
-        finally:
+        # Record it and return; the loop below tests the flag each round
+        # and leaves through its `finally`, which writes the final
+        # checkpoint with nothing else in flight.
+        #
+        # Saving inline from here, which is what this did, re-enters
+        # `save()`. The guard below only catches a *second* signal, and
+        # the dangerous one is the first: arriving during the periodic
+        # save it finds the flag clear, and both calls then write the
+        # same deterministic `<run>_latest.pt.tmp` -- the inner one
+        # renames it into place and the outer `torch.save` writes its
+        # end-of-zip record at a stale offset into the file just
+        # published. `atomic_save` at the iteration boundary is exposed
+        # the same way and is the more expensive one to corrupt: a torn
+        # `a*.pt` is loaded by every later boot whose seeded draw
+        # includes it. (train2.py's handler had a second failure this
+        # file does not share -- it re-entered `weights_lock`; `save`
+        # here takes no lock, because the learners step on this thread.)
+        if interrupted["flag"]:
             raise SystemExit(0)
+        interrupted["flag"] = True
+        print(f"caught signal {signum} at iteration {iteration}; "
+              f"finishing the round and checkpointing", flush=True)
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
@@ -408,39 +510,69 @@ def main() -> None:
         """Greedy candidate index for a subset of decisions, under `model`."""
         if rows.shape[0] == 0:
             return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+        counts_sub = merged.cand_counts[rows]
+        # A decision with one legal candidate has argmax 0 whatever the
+        # network scores it, and the caller's exploration branch draws the
+        # same 0 out of `rng.random() * 1`, so the forward pass cannot
+        # change the action. Dropping those rows from the batch leaves
+        # every other row's score untouched -- nothing in this network
+        # mixes rows, the normalisations being per-row and the candidate
+        # gather per-decision -- so this is an exact saving, not an
+        # approximation. Measured at 9.6% of decisions on a 30k-record
+        # sample, and they are the cheapest rows to lose only in
+        # candidate work: each still carries the full fixed cost of the
+        # trunk and the history encoder.
+        multi = counts_sub > 1
+        best = np.zeros(rows.shape[0], dtype=np.int64)
+        if not multi.any():
+            return best, counts_sub
+        sub = rows[multi]
         keep = np.zeros(merged.num_decisions, dtype=bool)
-        keep[rows] = True
+        keep[sub] = True
         cand_mask = keep[merged.owner]
         pos = np.full(merged.num_decisions, -1, dtype=np.int64)
-        pos[rows] = np.arange(rows.shape[0])
+        pos[sub] = np.arange(sub.shape[0])
         new_owner = pos[merged.owner[cand_mask]]
         with torch.inference_mode():
             out = model(
-                sf_all[rows], af_all[cand_mask],
+                sf_all[sub], af_all[cand_mask],
                 torch.from_numpy(new_owner).to(device),
                 torch.from_numpy(
-                    merged.states[rows, L.H_ROLE].astype(np.int64)).to(device),
-                None if tokens_all is None else tokens_all[rows],
-                None if mask_all is None else mask_all[rows],
+                    merged.states[sub, L.H_ROLE].astype(np.int64)).to(device),
+                None if tokens_all is None else tokens_all[sub],
+                None if mask_all is None else mask_all[sub],
                 want="q")
         q = out["q"].cpu().numpy()
-        counts_sub = merged.cand_counts[rows]
-        offsets_sub = np.cumsum(counts_sub) - counts_sub
-        max_k = int(counts_sub.max())
-        padded = np.full((rows.shape[0], max_k), -np.inf, dtype=np.float32)
-        within = np.arange(q.shape[0]) - offsets_sub[new_owner]
+        counts_x = merged.cand_counts[sub]
+        offsets_x = np.cumsum(counts_x) - counts_x
+        max_k = int(counts_x.max())
+        padded = np.full((sub.shape[0], max_k), -np.inf, dtype=np.float32)
+        within = np.arange(q.shape[0]) - offsets_x[new_owner]
         padded[new_owner, within] = q
-        return padded.argmax(axis=1), counts_sub
+        best[multi] = padded.argmax(axis=1)
+        return best, counts_sub
 
     pending: dict[tuple[int, int, int], list] = {}
     started = time.perf_counter()
     deadline = started + args.minutes * 60
     last_checkpoint = started
+    # The grid is keyed on the slowest agent, so a file named `_50000.pt`
+    # is one in which *every* agent has taken at least 50,000 steps. The
+    # eight drift apart by a handful of steps (measured: 1952 to 1954 at
+    # iteration 204), which is immaterial here but would make a label read
+    # off agent 0 a small overstatement for the rest.
+    def reached_steps() -> int:
+        return min(a.learner.steps for a in agents)
+
+    next_archive_at = 0
+    if args.checkpoint_every > 0:
+        next_archive_at = ((reached_steps() // args.checkpoint_every) + 1
+                           ) * args.checkpoint_every
     recent_points: deque[int] = deque(maxlen=500)
     t_env = t_feat = t_fwd = t_book = t_learn = 0.0
 
     try:
-        while time.perf_counter() < deadline:
+        while not interrupted["flag"] and time.perf_counter() < deadline:
             t0 = time.perf_counter()
             group = pool.next_group()
             group_workers = pool.workers_of(group)
@@ -504,12 +636,11 @@ def main() -> None:
             game_ids = field_u16(merged.states, L.H_GAME_ID)
             hand_ids = field_u32(merged.states, L.H_HAND_ID)
             trick_idx = field_u8(merged.states, L.H_TRICK_INDEX)
-            attacker = field_u8(merged.states, L.H_I_AM_ATTACKER)
+            signs = decision_signs(merged.states)
             for local_i, i in enumerate(live_rows):
                 key = (int(table_of[i]), int(game_ids[i]), int(hand_ids[i]))
                 pending.setdefault(key, []).append(
-                    (store, local_i, int(trick_idx[i]),
-                     1.0 if attacker[i] else -1.0))
+                    (store, local_i, int(trick_idx[i]), float(signs[i])))
             decisions += merged.num_decisions
 
             for local_w, batch in enumerate(batches):
@@ -565,22 +696,48 @@ def main() -> None:
             rounds += 1
 
             if rounds % args.iteration_rounds == 0:
+                # Names already spoken for before this burst. `iteration`
+                # is incremented *after* the burst, so a run checkpointed
+                # inside one resumes onto the same boundary and re-derives
+                # the same `a{idx}_{iteration}.pt` for entries the restored
+                # archive still references. Rewriting one silently changes
+                # which weights that entry means, and the declined-publish
+                # unlink below then deletes it outright -- after which every
+                # later boot whose seeded draw includes it dies on the load.
+                # Distinct `idx` keeps the names apart within a burst, so
+                # this is read once rather than per agent.
+                already = {archive.payload(r) for r in archive.all_refs()}
                 for agent in agents:
                     agent.publish()
                     path = arch_dir / f"a{agent.idx}_{iteration:05d}.pt"
-                    if archive.publish(agent.idx, iteration, str(path), rng):
-                        torch.save(to_half(agent.acting.state_dict()), path)
+                    if path.name in already or str(path) in already:
+                        continue
+                    # Written, and written atomically, before anything
+                    # references it. A reference committed first -- by a
+                    # signal landing inside this burst, or by an ENOSPC
+                    # unwinding into the final save -- names a file that is
+                    # torn or was never written at all, and every later boot
+                    # whose seeded draw includes it dies on the load. The
+                    # stale sweep below cannot clean that up either, since a
+                    # registered path counts as live.
+                    atomic_save(to_half(agent.acting.state_dict()), path)
+                    if not archive.publish(agent.idx, iteration, path.name, rng):
+                        # The reservoir declined it, so nothing will ever
+                        # reference the file.
+                        path.unlink(missing_ok=True)
                 # Reservoir eviction leaves files nothing references.
+                # Pre-relative-path checkpoints hold absolute payloads, so a
+                # resumed archive can still be naming files either way.
                 live_paths = {archive.payload(r) for r in archive.all_refs()}
                 for stale in arch_dir.glob("a*.pt"):
-                    if str(stale) not in live_paths:
+                    if stale.name not in live_paths and str(stale) not in live_paths:
                         stale.unlink(missing_ok=True)
                 iteration += 1
                 seating = plan_seating(
                     rng, args.agents, args.workers, args.live_per_table,
                     choose_archive_refs(rng, archive, args.archive_budget))
                 slots, slot_table = build_slots(
-                    seating, agents, archive, scratch, device)
+                    seating, agents, archive, scratch, device, arch_dir)
                 print(f"[iter {iteration:4d}] archive {archive.size():3d} entries, "
                       f"{len(slots)} models | seats/agent "
                       f"{live_seat_counts(seating, args.agents).tolist()}",
@@ -590,6 +747,14 @@ def main() -> None:
                 el = time.perf_counter() - started
                 row = {
                     "elapsed_s": round(el, 1),
+                    # Which invocation wrote this row. `elapsed_s` restarts
+                    # every segment while `rounds`, `iteration` and `hands`
+                    # carry over, so without this a reader has to infer the
+                    # boundaries from a clock going backwards -- which is
+                    # exactly what auditing the first chained run required,
+                    # because `modal app logs` returns only the last task's
+                    # output and shows a three-segment run as one.
+                    "segment": segment,
                     "rounds": rounds_base + rounds,
                     "iteration": iteration,
                     "hands": hands_base + hands,
@@ -621,6 +786,7 @@ def main() -> None:
                 }
                 log_file.write(json.dumps(row) + "\n")
                 log_file.flush()
+                mirror.log(row)
                 print(f"[{el:7.1f}s] iter {iteration:4d} hands {hands:7d} "
                       f"dec/s {row['decisions_per_s']:7.0f} "
                       f"steps {min(row['steps'])}-{max(row['steps'])} "
@@ -629,8 +795,18 @@ def main() -> None:
                       f"belief {_mean(row['belief_acc']):.3f}", flush=True)
 
             now = time.perf_counter()
-            if now - last_checkpoint >= args.checkpoint_minutes * 60:
-                save()
+            # A watermark, not `steps % every == 0`: the counter strides by
+            # `steps_per_train` and is only sampled once a round, so a
+            # modulo test skips any grid point it happens to jump over.
+            # That exact bug cost this project two experiments.
+            archive_at = None
+            if args.checkpoint_every > 0 and reached_steps() >= next_archive_at:
+                archive_at = next_archive_at
+                next_archive_at = ((reached_steps() // args.checkpoint_every) + 1
+                                   ) * args.checkpoint_every
+            if (archive_at is not None
+                    or now - last_checkpoint >= args.checkpoint_minutes * 60):
+                save(archive_steps=archive_at)
                 last_checkpoint = now
     finally:
         save(final=True)
@@ -639,6 +815,9 @@ def main() -> None:
         print(f"done: {hands} hands, {decisions} decisions, {iteration} iterations "
               f"in {el/60:.1f} min; steps {[a.learner.steps for a in agents]}")
         log_file.close()
+        mirror.summary(final_steps=[a.learner.steps for a in agents],
+                       final_hands=hands_base + hands)
+        mirror.finish()
 
 
 if __name__ == "__main__":

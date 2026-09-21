@@ -36,7 +36,9 @@ def main() -> int:
             if m.num_decisions:
                 states.append(m.states)
                 cands.append(m.cands)
-                owners.append(m.owner)
+                # Owners index into their own round's states, so each round's
+                # have to move past every decision joined ahead of them.
+                owners.append(m.owner + total)
                 counts.append(m.cand_counts)
                 total += m.num_decisions
             pool.write_round(bs, [np.zeros(b.num_decisions, dtype=np.int64) for b in bs])
@@ -44,14 +46,29 @@ def main() -> int:
         pool.close()
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
+    all_states = np.concatenate(states)[: args.decisions]
+    kept = all_states.shape[0]
+    all_owner = np.concatenate(owners)
+    # Candidates from every round, not just the first. Round 0 is every
+    # game's trick-0 lead, where candidates.ts leaves FLAG_ALL_LED_SUIT
+    # unset (there is no led suit yet) and FLAG_BEATS_WINNER unset (nobody
+    # is winning yet), so a fixture carrying only round 0 hands its
+    # consumers two action-feature columns that are zero on every row --
+    # and test_torch_features compared those columns against each other and
+    # called it a match. Owners are non-decreasing across the join, so the
+    # truncation above cuts the candidate rows at a decision boundary too.
+    keep = all_owner < kept
     np.savez_compressed(
         OUT,
-        states=np.concatenate(states)[: args.decisions],
-        # Keep one batch's candidates intact: shapes must stay consistent
-        # with their owners, so slicing across the join would corrupt them.
-        cands=cands[0],
-        owner=owners[0],
-        cand_counts=counts[0],
+        states=all_states,
+        cands=np.concatenate(cands)[keep],
+        owner=all_owner[keep],
+        cand_counts=np.concatenate(counts)[:kept],
+        # How many of the states above carry candidates. Every one of them
+        # now does, but the field stays: a consumer reading a fixture
+        # written before this change still has to learn from somewhere that
+        # its candidates cover the leading block alone.
+        n_cand_states=kept,
     )
     z = np.load(OUT)
     print(f"wrote {OUT}")

@@ -33,16 +33,19 @@ export type World = {
   readonly relaxed: boolean;
 };
 
-function cardFromSlot(slot: number): Card {
-  if (slot === 52) return { kind: 'joker', rank: 'small', deckId: 0 };
-  if (slot === 53) return { kind: 'joker', rank: 'big', deckId: 0 };
+// One bit per deck copy in the seen-mask below, which is a Uint32Array.
+const MAX_TRACKED_DECKS = 32;
+
+function cardFromSlot(slot: number, deckId: number): Card {
+  if (slot === 52) return { kind: 'joker', rank: 'small', deckId };
+  if (slot === 53) return { kind: 'joker', rank: 'big', deckId };
   const suits = ['spades', 'hearts', 'diamonds', 'clubs'] as const;
   const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'] as const;
   return {
     kind: 'standard',
     suit: suits[Math.floor(slot / 13)]!,
     rank: ranks[slot % 13]!,
-    deckId: 0,
+    deckId,
   };
 }
 
@@ -71,17 +74,50 @@ export function knownVoids(
 
 // Every card the acting seat has not seen: the deck minus its own hand,
 // minus everything played, minus its own buried kitty.
+//
+// *Which* copy is unseen matters, not merely how many. `cardEquals` is
+// full identity including `deckId`, and it is what `containsAll`,
+// `removeCards` and the legality check in `legalActions.ts` compare with,
+// while combo detection (`validateFollow`, `findNKinds`) compares by
+// `cardKey` and ignores `deckId` entirely. Deal a rollout bot two copies
+// of a slot that both say `deckId: 0` and the two views disagree about
+// the same hand: the bot sees a pair, builds a follow out of it, and the
+// reducer then rejects the move it was just asked for ("invalid follow:
+// must include 1 pair(s) of hearts: 0 given"), which kills the
+// simulation. So track which deck copies of a slot have been seen and
+// emit exactly the ones that have not -- that gives every world card a
+// distinct identity, and keeps it from colliding with a card the acting
+// seat can already see.
 export function unseenCards(
   state: GameState,
   seat: Seat,
   myKitty: ReadonlyArray<Card>,
 ): Card[] {
-  const counts = new Uint8Array(NUM_SLOTS).fill(state.config.numDecks);
+  const numDecks = state.config.numDecks;
+  if (numDecks > MAX_TRACKED_DECKS) {
+    // Silently emitting only the first eight copies of every slot would
+    // hand the sampler a pool smaller than the hands it has to fill.
+    throw new Error(`unseenCards tracks at most ${MAX_TRACKED_DECKS} decks, got ${numDecks}`);
+  }
+  // Bit d of `seen[slot]` marks deck copy d of that slot as accounted for.
+  const seen = new Uint32Array(NUM_SLOTS);
   const hand = state.currentHand;
   if (hand === null) return [];
   const drop = (c: Card): void => {
+    // Every card reaching here came out of a deck this config built, so a
+    // deckId outside 0..numDecks-1 is a programming error rather than an
+    // input. Absorbing it quietly goes wrong in both directions depending
+    // on the value: a shift still inside the mask marks a copy nobody
+    // holds, leaving the real card in the pool as a phantom, while a
+    // shift past the mask's width wraps onto bit 0 and deletes a copy
+    // that is genuinely unseen. Either way the sampler gets a pool that
+    // cannot fill the hands it has to fill, and nothing says so until the
+    // worlds come out quietly wrong.
+    if (!Number.isInteger(c.deckId) || c.deckId < 0 || c.deckId >= numDecks) {
+      throw new Error(`card ${cardKey(c)} has deckId ${c.deckId}, outside 0..${numDecks - 1}`);
+    }
     const s = cardSlot(c);
-    if (counts[s]! > 0) counts[s] = counts[s]! - 1;
+    seen[s] = seen[s]! | (1 << c.deckId);
   };
   for (const c of hand.hands[seat] ?? []) drop(c);
   for (const t of hand.tricks) for (const p of t.plays) for (const c of p.cards) drop(c);
@@ -91,7 +127,10 @@ export function unseenCards(
   for (const c of myKitty) drop(c);
   const out: Card[] = [];
   for (let slot = 0; slot < NUM_SLOTS; slot++) {
-    for (let i = 0; i < counts[slot]!; i++) out.push(cardFromSlot(slot));
+    const mask = seen[slot]!;
+    for (let d = 0; d < numDecks; d++) {
+      if ((mask & (1 << d)) === 0) out.push(cardFromSlot(slot, d));
+    }
   }
   return out;
 }
@@ -130,7 +169,12 @@ export function sampleWorld(
 
   const hands: Card[][] = [];
   for (let s = 0; s < numPlayers; s++) hands.push(s === seat ? [...(hand.hands[s] ?? [])] : []);
-  const kitty: Card[] = [];
+  // Seed the kitty with the cards we buried ourselves. `unseenCards`
+  // already dropped them from the pool, so nothing left to place can ever
+  // land here: starting empty leaves every simulated hand with a kitty of
+  // zero points, which deletes the last-trick kitty bonus (rules.md §8.2)
+  // -- the largest single swing in the game -- from the whole search.
+  const kitty: Card[] = [...myKitty];
   let relaxed = false;
   let kittyLeft = kittyNeed;
 

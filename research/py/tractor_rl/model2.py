@@ -95,29 +95,78 @@ class CausalHistoryEncoder(nn.Module):
             })
             for _ in range(cfg.hist_layers)
         ])
-        causal = torch.triu(torch.ones(HISTORY_STEPS, HISTORY_STEPS, dtype=torch.bool), 1)
-        self.register_buffer("causal_mask", causal, persistent=False)
+        self.heads = cfg.hist_heads
+        self.head_dim = cfg.hist_model // cfg.hist_heads
         self.out_dim = cfg.hist_model
+
+    def _split(self, attn: nn.MultiheadAttention):
+        """q, k, v weights and biases out of the packed projection.
+
+        The parameters stay `nn.MultiheadAttention`'s, so a checkpoint
+        written before this rewrite still loads: only the arithmetic is
+        reorganised, not the state dict.
+        """
+        d = self.out_dim
+        wq, wk, wv = attn.in_proj_weight.split(d, 0)
+        bq, bk, bv = attn.in_proj_bias.split(d, 0)
+        return (wq, bq), (wk, bk), (wv, bv)
+
+    def _heads(self, t: torch.Tensor, n: int) -> torch.Tensor:
+        return t.view(t.shape[0], n, self.heads, self.head_dim).transpose(1, 2)
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # tokens [B, W, D], mask [B, W] with 1 for real steps.
+        #
+        # Two things make this cheaper than the obvious loop over layers,
+        # and neither changes the result. First, history is left-aligned
+        # (`encode.ts` fills slots 0..L-1 and zeroes the rest), the output
+        # is read at L-1, and the causal mask already stops that position
+        # attending past itself -- so a key-padding mask cannot affect
+        # anything downstream of it, and omitting it lets the non-final
+        # layers use plain `is_causal` attention. Second, only one output
+        # position is ever read, so the final layer needs keys and values
+        # everywhere but a query, output projection and feed-forward at
+        # just that position: 15/16 of the most expensive layer's
+        # position-wise work is otherwise computed and discarded.
+        b, w, _ = tokens.shape
         x = self.proj(tokens) + self.pos
-        pad = mask < 0.5
-        # A row with no history at all would make every key padded, which
-        # makes attention undefined; let such rows attend to themselves and
-        # zero the result afterwards instead.
-        empty = pad.all(dim=1)
-        pad = torch.where(empty[:, None], torch.zeros_like(pad), pad)
-        for layer in self.layers:
-            h = layer["norm1"](x)
-            attn, _ = layer["attn"](
-                h, h, h, attn_mask=self.causal_mask, key_padding_mask=pad, need_weights=False)
-            x = x + attn
-            x = x + layer["ff"](layer["norm2"](x))
-        # Summarise with the most recent real step.
+        real = mask > 0.5
+        empty = ~real.any(dim=1)
         lengths = mask.sum(dim=1).clamp(min=1).long() - 1
-        summary = x[torch.arange(x.shape[0], device=x.device), lengths]
-        return torch.where(empty[:, None], torch.zeros_like(summary), summary)
+        rows = torch.arange(b, device=x.device)
+        last = len(self.layers) - 1
+
+        for i, layer in enumerate(self.layers):
+            attn = layer["attn"]
+            (wq, bq), (wk, bk), (wv, bv) = self._split(attn)
+            h = layer["norm1"](x)
+            if i < last:
+                q = self._heads(F.linear(h, wq, bq), w)
+                k = self._heads(F.linear(h, wk, bk), w)
+                v = self._heads(F.linear(h, wv, bv), w)
+                o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                o = o.transpose(1, 2).reshape(b, w, self.out_dim)
+                x = x + attn.out_proj(o)
+                x = x + layer["ff"](layer["norm2"](x))
+            else:
+                # One query, at the read position. `is_causal` is wrong
+                # here: with a single query PyTorch aligns it to the *last*
+                # key, which would let a short row see the whole window, so
+                # the reachable keys are named explicitly instead.
+                hl = h[rows, lengths]
+                q = F.linear(hl, wq, bq).view(b, self.heads, 1, self.head_dim)
+                k = self._heads(F.linear(h, wk, bk), w)
+                v = self._heads(F.linear(h, wv, bv), w)
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=real[:, None, None, :])
+                o = o.transpose(1, 2).reshape(b, self.out_dim)
+                summary = x[rows, lengths] + attn.out_proj(o)
+                summary = summary + layer["ff"](layer["norm2"](summary))
+                # A row with no history attends to nothing meaningful; the
+                # clamp above kept the gather in range, and this discards
+                # whatever it produced.
+                return torch.where(empty[:, None], torch.zeros_like(summary), summary)
+
+        raise AssertionError("encoder configured with zero layers")
 
 
 class TractorNet(nn.Module):

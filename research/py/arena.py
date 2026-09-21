@@ -49,7 +49,7 @@ from tractor_rl.features2 import (
     parse_episodes,
     split_per_worker,
 )
-from tractor_rl.policies import SearchPolicy, load_policy
+from tractor_rl.policies import PolicyV2, SearchPolicy, load_policy
 from tractor_rl import layout as L
 from tractor_rl.protocol import WorkerConfig, WorkerPool
 
@@ -95,15 +95,31 @@ def score_pair(ep_a: Episode, ep_b: Episode) -> PairResult:
     """Compare the same deal played with the agent on each team.
 
     Exactly one of the two runs has the agent attacking, because the
-    landlord seat is a property of the deal and does not move between runs.
+    landlord seat is a property of the deal and does not move between
+    runs. That is not something this function can check: {0,2} and {1,3}
+    are exact complements over four seats, so given one landlord seat
+    `a_defends` and `b_defends` always disagree no matter what the workers
+    did. The check worth making is that the two halves agree on the
+    landlord at all -- the pairing invariant the arithmetic below rests
+    on. Whether the halves really swapped the agent's seats is checked
+    where the worker configurations are built, which is the only place
+    that knows.
     """
+    if ep_a.landlord_seat != ep_b.landlord_seat:
+        # Everything below decides which half had the agent attacking from
+        # the landlord seat alone, so halves that disagree about it would
+        # have both margins taken from the wrong side. The caller only
+        # pairs episodes whose deal digests match and the landlord is one
+        # of the fields the digest covers, so this fires if the digest ever
+        # stops covering it, or if two genuinely different deals collide on
+        # one FNV-32 value.
+        raise AssertionError(
+            f"the two halves of a pair report different landlord seats "
+            f"({ep_a.landlord_seat} and {ep_b.landlord_seat}); the same deal "
+            f"must produce the same landlord"
+        )
     a_defends = agent_defends(ep_a.landlord_seat, SIDE_A_LIST)
     b_defends = agent_defends(ep_b.landlord_seat, SIDE_B_LIST)
-    if a_defends == b_defends:
-        raise AssertionError(
-            "the agent attacked in both runs or defended in both; the seat "
-            "swap did not take effect"
-        )
     if a_defends:
         agent_attack, opponent_attack = ep_b.attacker_points, ep_a.attacker_points
     else:
@@ -204,8 +220,30 @@ def main() -> None:
             # convention measurement, so refuse rather than get it subtly wrong.
             raise SystemExit("--agent-b and --search-worlds cannot be combined")
         model_b = load_agent(args.agent_b, device)
+        if model_b is None:
+            # load_agent answers None for a bot: path, which would leave the
+            # seat override below unreached -- one model on all four learner
+            # seats, reported under the mixed-team banner as if two had
+            # played. A solo margin filed as a convention measurement.
+            raise SystemExit(
+                "--agent-b must be a checkpoint, not a bot:<name>; arena has no "
+                "flag for a bot partner (--agent bot:<name> puts a heuristic on "
+                "both of the agent's seats)"
+            )
         print(f"mixed team: {args.agent} partnered with {args.agent_b} "
               f"(B takes seats {AGENT_B_SEATS[0]}/{AGENT_B_SEATS[1]})")
+    if args.search_worlds > 0 and model is not None and not isinstance(model, PolicyV2):
+        # Search scores the leaves of each determinized world with V(s), which
+        # a v1 checkpoint has no head for. `SearchPolicy.__init__` refuses the
+        # same thing and is the real backstop -- it runs below, still before
+        # any worker is spawned, so nothing here is racing a crash. This one
+        # is for the message: it can name `--agent` and `--search-worlds`,
+        # the two flags the operator actually typed, where the constructor
+        # only knows it was handed the wrong class.
+        raise SystemExit(
+            f"--search-worlds needs a v2 checkpoint; {args.agent} is a v1 "
+            f"network and search evaluates its leaves with V(s)"
+        )
     if agent_bot is not None:
         print(f"agent: bot {agent_bot}")
     print(f"opponent: {args.opponent}")
@@ -246,6 +284,32 @@ def main() -> None:
                     deal_seed_base=pair_base,
                 )
             configs.append(cfg)
+    # Both halves of every pair are built from the same two constants, so
+    # this is a property of the constants and is checked once rather than
+    # per pair. The duplicate design needs the agent to hold one whole
+    # team in each half: overlapping masks mean it partners itself, and
+    # masks that miss a seat mean the deal is played by three players.
+    if SIDE_A_SEATS & SIDE_B_SEATS or (SIDE_A_SEATS ^ SIDE_B_SEATS) != 0b1111:
+        raise AssertionError(
+            f"side masks {SIDE_A_SEATS:#06b}/{SIDE_B_SEATS:#06b} are not "
+            f"complementary teams; the seat swap cannot be a clean swap"
+        )
+    # What the old score_pair assertion claimed to catch and could not, in
+    # the one place the information exists. Its example was the first
+    # --agent-b, which pinned a fixed partner seat: with the agent on
+    # {0,2} in one half and {1,3} in the other, a partner seat that does
+    # not move sides with it puts B on the opponents' team for half the
+    # pairs, and the margin then reads as the agent's. Nothing downstream
+    # can see that -- `Episode` carries no record of who sat where.
+    if args.agent_b:
+        for mask, label in ((SIDE_A_SEATS, "A"), (SIDE_B_SEATS, "B")):
+            on_side = [s for s in AGENT_B_SEATS if mask & (1 << s)]
+            if len(on_side) != 1:
+                raise AssertionError(
+                    f"--agent-b seats {AGENT_B_SEATS} put {len(on_side)} of the "
+                    f"partner's seats on side {label} ({mask:#06b}); exactly one "
+                    f"is needed, or B does not swap sides with the agent"
+                )
 
     if args.search_worlds > 0 and model is not None:
         model = SearchPolicy(model)
@@ -346,6 +410,19 @@ def main() -> None:
                     "digest": r.deal_digest,
                     "points": r.point_margin,
                     "levels": r.level_margin,
+                    # The digest is FNV over the dealt cards, so it is a
+                    # pure function of the deal seed and says nothing
+                    # about who filled the other seats. Two runs against
+                    # *different* opponents join on it exactly as cleanly
+                    # as two against the same one, and compare_runs.py
+                    # would then report the opponent change as a policy
+                    # difference. Stamp the run's identity on every row so
+                    # it can refuse instead. A thousand short rows is
+                    # nothing; the repetition is the point, because it
+                    # also catches a file built by concatenating dumps.
+                    "opponent": args.opponent,
+                    "preplay": args.preplay,
+                    "base": args.base,
                 }) + "\n")
         print(f"  wrote {len(results)} pair margins to {args.dump_pairs}")
 

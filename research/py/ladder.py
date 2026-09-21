@@ -92,15 +92,22 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"{args.label}  ({args.checkpoint})  base {args.base}, {args.pairs} pairs")
+    out = RESEARCH_DIR / "runs" / f"ladder_{args.label}.json"
+    # runs/ is gitignored, so it is absent on a tree where no trainer has run
+    # -- a fresh clone whose checkpoint arrived by `modal volume get`. Created
+    # before the rungs play, because the write below used to fail after the
+    # whole ladder had already cost its two hours.
+    out.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     for opponent in args.rungs:
         row = run_one(args.checkpoint, opponent, args.pairs, args.base,
                       args.seconds, args.threads)
         if row is not None:
             rows.append(row)
-
-    out = RESEARCH_DIR / "runs" / f"ladder_{args.label}.json"
-    out.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        # Rewritten after every rung: the determinization rungs at the tail
+        # cost orders of magnitude more than the head ones, so a preemption
+        # inside one must not take the cheap rungs already played with it.
+        out.write_text(json.dumps(rows, indent=1), encoding="utf-8")
 
     failed = [r["opponent"] for r in rows if r.get("margin") is None]
     # A rung that ran but finished far short of the pairs asked for carries a

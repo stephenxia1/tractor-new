@@ -82,15 +82,25 @@ function runSlot(opts: {
   return seen;
 }
 
-function dealEquals(a: DealtCards, b: DealtCards): boolean {
-  if (a.landlord !== b.landlord) return false;
-  if (a.trumpRank !== b.trumpRank) return false;
+// Cards only: the kitty and all four hands, with landlord and trump rank
+// deliberately excluded. A negative control must use this one, because
+// landlord and trumpRank come off the same dealRng stream as the shuffle
+// and so differ first; comparing them would let the control pass without a
+// single card ever being looked at, turning "different base differs" into a
+// statement about two bytes of metadata.
+function cardsEqual(a: DealtCards, b: DealtCards): boolean {
   if (a.kitty.join(',') !== b.kitty.join(',')) return false;
   if (a.hands.length !== b.hands.length) return false;
   for (let s = 0; s < a.hands.length; s++) {
     if (a.hands[s]!.join(',') !== b.hands[s]!.join(',')) return false;
   }
   return true;
+}
+
+function dealEquals(a: DealtCards, b: DealtCards): boolean {
+  if (a.landlord !== b.landlord) return false;
+  if (a.trumpRank !== b.trumpRank) return false;
+  return cardsEqual(a, b);
 }
 
 function describe(d: DealtCards): string {
@@ -174,7 +184,7 @@ function main(): void {
   });
   let identical = 0;
   for (let i = 0; i < other.length; i++) {
-    if (dealEquals(other[i]!.deal, reference[i]!.deal)) identical += 1;
+    if (cardsEqual(other[i]!.deal, reference[i]!.deal)) identical += 1;
   }
   if (identical > 0) {
     throw new Error(
@@ -194,7 +204,7 @@ function main(): void {
     slotSeed: 777,
     hands: 1,
   })[0]!.deal;
-  if (dealEquals(g0, g1)) {
+  if (cardsEqual(g0, g1)) {
     throw new Error('game 0 and game 1 were dealt the same cards');
   }
 
@@ -206,10 +216,12 @@ function main(): void {
     );
   }
 
-  console.log(`paired deals verified   ${checkedHands} (${GAMES} game slots x ${HANDS} hands)`);
+  console.log(
+    `paired deals verified   ${checkedHands} (${GAMES} game slots x ${HANDS} hands, cards + landlord + trump)`,
+  );
   console.log(`cards compared          ${checkedCards}`);
-  console.log(`different base differs   yes (0/${other.length} identical)`);
-  console.log(`different game differs   yes`);
+  console.log(`different base differs   yes (0/${other.length} identical on cards alone)`);
+  console.log(`different game differs   yes (cards alone)`);
   console.log(`digests unique           ${digests.size}/${reference.length}`);
   console.log('dupcheck OK');
 }

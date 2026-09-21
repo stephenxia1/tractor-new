@@ -88,12 +88,46 @@ class Batch:
         return int(self.states.shape[0])
 
 
+def _check_wire_layout(payload: bytes, first_rec: int, rec_bytes: int, state_bytes: int) -> None:
+    """Fail loudly when the actor wrote a layout other than the one we parse.
+
+    layout.py's import-time check compares spec.json against LAYOUT_VERSION, so
+    it can only catch "spec regenerated, layout.py not updated": a record.ts
+    edit that skipped `npm run spec` leaves both artifacts stale and agreeing
+    with each other, and a field inserted past the header then shifts every
+    plane, history step and candidate by a few bytes with nothing raising. The
+    version byte the actor stamps into each record is the only witness of the
+    layout a frame was actually written with, and the record size is the only
+    witness of a size drift that the floor division in parse_frame would
+    otherwise absorb. Checked once per frame, on the first record, because a
+    frame comes from one worker running one build; raised rather than asserted
+    because `python -O` strips asserts and this must never be optional.
+    """
+    version = payload[first_rec + L.H_VERSION]
+    if version != L.LAYOUT_VERSION:
+        raise ValueError(
+            f"records were written with wire layout version {version} but this "
+            f"build parses version {L.LAYOUT_VERSION}; regenerate spec.json with "
+            f"`npm run spec` and update LAYOUT_VERSION in layout.py."
+        )
+    if rec_bytes < state_bytes or (rec_bytes - state_bytes) % L.CANDIDATE_BYTES:
+        raise ValueError(
+            f"record is {rec_bytes} bytes, which is not {state_bytes} state bytes "
+            f"plus a whole number of {L.CANDIDATE_BYTES}-byte candidates; "
+            f"regenerate spec.json with `npm run spec` and update layout.py."
+        )
+
+
 def parse_frame(payload: bytes) -> Batch:
     """Split one actor frame into decisions + episodes.
 
-    Record size depends on whether the privileged block is present, which
-    is uniform within a frame (one worker, one setting), so the layout is
-    resolved once and the rest is vectorised.
+    Record size depends on whether the privileged block is present. One
+    worker runs one setting, so the layout is resolved once from the first
+    record and the rest is vectorised -- but nothing on the wire forced
+    that uniformity, and search leaves once hardcoded the flag to false
+    while the ordinary records beside them followed ``--privileged``. The
+    loop below therefore checks every record's flag against the resolved
+    one instead of taking the uniformity on trust.
     """
     buf = np.frombuffer(payload, dtype=np.uint8)
     n_dec = int.from_bytes(payload[0:2], "little")
@@ -109,16 +143,43 @@ def parse_frame(payload: bytes) -> Batch:
         first_rec = off + 2
         has_priv = bool(payload[first_rec + L.H_HAS_PRIVILEGED])
         state_bytes = L.STATE_BYTES_PRIVILEGED if has_priv else L.STATE_BYTES
+        _check_wire_layout(
+            payload, first_rec, int.from_bytes(payload[off : off + 2], "little"), state_bytes
+        )
         starts = np.empty(n_dec, dtype=np.int64)
         counts = np.empty(n_dec, dtype=np.int64)
         for i in range(n_dec):
             rec_bytes = int.from_bytes(payload[off : off + 2], "little")
             starts[i] = off + 2
+            rec_priv = bool(payload[off + 2 + L.H_HAS_PRIVILEGED])
+            if rec_priv != has_priv:
+                raise ValueError(
+                    f"record {i} of {n_dec} says has_privileged={rec_priv} but the frame "
+                    f"was resolved as has_privileged={has_priv} from record 0; every "
+                    f"record in a frame must agree, because the {state_bytes}-byte state "
+                    f"block is subtracted from all of them to count candidates and a "
+                    f"narrower record makes that count negative. Check that the actor "
+                    f"writes the same privileged flag for search leaves as for ordinary "
+                    f"decisions."
+                )
             counts[i] = (rec_bytes - state_bytes) // L.CANDIDATE_BYTES
             off += 2 + rec_bytes
 
     if n_dec:
-        states = buf[starts[:, None] + np.arange(state_bytes)]
+        # A slice-and-copy loop, not the obvious `buf[starts[:, None] +
+        # arange(state_bytes)]`. That form materialises an
+        # [n_dec, state_bytes] int64 index -- 8 bytes of index per byte
+        # fetched, so 0.5 MB of scratch to move 63 KB at a typical 64
+        # decisions a worker -- and then takes the slow fancy-indexing
+        # path over it. Each record's bytes are contiguous, so a plain
+        # slice assignment per row is a memcpy, and the loop overhead is
+        # amortised over 984 bytes. Measured 8.5x faster at 64 records
+        # and 4.7x at 1024; the crossover where fancy indexing would win
+        # is far above any frame this protocol produces.
+        states = np.empty((n_dec, state_bytes), dtype=np.uint8)
+        for i in range(n_dec):
+            begin = int(starts[i])
+            states[i] = buf[begin:begin + state_bytes]
         total = int(counts.sum())
         owner = np.repeat(np.arange(n_dec, dtype=np.int64), counts)
         within = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)

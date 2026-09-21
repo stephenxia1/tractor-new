@@ -9,12 +9,25 @@ import { mulberry32, sumPoints, type Card } from '@tractor/engine';
 
 import { NUM_SLOTS } from './cards';
 import { GameSlot } from './env';
-import { writeDecision, writeEpisode } from './encode';
+import { writeDecision, writeEpisode, type EpisodeSummary } from './encode';
 import {
   ByteWriter,
   CANDIDATE_BYTES,
+  E_ATTACKER_POINTS,
+  E_DEAL_DIGEST,
+  E_DEFENDERS_WON,
+  E_GAME_ID,
+  E_HAND_ID,
+  E_KITTY_POINTS,
+  E_LANDLORD_SEAT,
+  E_LEVEL_DELTA,
+  E_NUM_TRICKS,
+  E_TRICKS_BASE,
+  E_TRUMP_RANK,
+  E_TRUMP_SUIT,
   EPISODE_BYTES,
   HISTORY_BYTES,
+  HISTORY_STEPS,
   H_HISTORY_LEN,
   H_HAND_SIZE,
   H_IS_LEAD,
@@ -23,6 +36,7 @@ import {
   H_TRICK_INDEX,
   H_VERSION,
   HEADER_BYTES,
+  MAX_TRICKS,
   PLANES_BYTES,
   RECORD_VERSION,
   SHAPE_THROW,
@@ -34,6 +48,18 @@ const PREPLAY = (process.env['PREPLAY'] ?? 'smart-v34') as never;
 const SEED = Number(process.env['SEED'] ?? 12345);
 
 function main(): void {
+  // The episode layout has no slack at all: the per-trick array ends on the
+  // byte E_KITTY_POINTS occupies. Nothing else guards that, and it would not
+  // show up at runtime -- writeEpisode writes into a claim()'d subarray,
+  // where an out-of-range index is a silent no-op and an in-range one
+  // quietly overwrites a neighbouring field, in both cases leaving the byte
+  // count at EPISODE_BYTES.
+  if (E_TRICKS_BASE + MAX_TRICKS * 2 > E_KITTY_POINTS) {
+    throw new Error(
+      `episode tricks (${E_TRICKS_BASE} + ${MAX_TRICKS}*2) overrun E_KITTY_POINTS ${E_KITTY_POINTS}`,
+    );
+  }
+
   const rng = mulberry32(SEED);
   const slot = new GameSlot({
     gameId: 0,
@@ -79,9 +105,7 @@ function main(): void {
       kittyPointsTotal += e.kittyPoints;
       writer.reset();
       writeEpisode(writer, e);
-      if (writer.length !== EPISODE_BYTES) {
-        throw new Error(`episode record is ${writer.length} bytes, expected ${EPISODE_BYTES}`);
-      }
+      checkEpisode(writer.taken(), e);
     }
     if (pending === null) continue;
 
@@ -130,6 +154,42 @@ function main(): void {
   console.log('selftest OK');
 }
 
+// Reads every field back out of the encoded 72 bytes. A byte-count check
+// cannot catch anything here -- writeEpisode makes exactly one claim of
+// EPISODE_BYTES, so the length is 72 whatever it then writes -- whereas a
+// field that lands on the wrong offset, or on top of another field, shows
+// up immediately as a value that does not match the summary it came from.
+function checkEpisode(buf: Uint8Array, e: EpisodeSummary): void {
+  if (buf.length !== EPISODE_BYTES) {
+    throw new Error(`episode record is ${buf.length} bytes, expected ${EPISODE_BYTES}`);
+  }
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const same = (field: string, got: number, want: number): void => {
+    if (got !== want) {
+      throw new Error(`episode ${field} read back as ${got}, wrote ${want}`);
+    }
+  };
+  same('handId', view.getUint32(E_HAND_ID, true), e.handId);
+  same('gameId', view.getUint16(E_GAME_ID, true), e.gameId);
+  same('dealDigest', view.getUint32(E_DEAL_DIGEST, true), e.dealDigest >>> 0);
+  same('landlordSeat', buf[E_LANDLORD_SEAT]!, e.landlordSeat);
+  same('numTricks', buf[E_NUM_TRICKS]!, e.numTricks);
+  same('attackerPoints', view.getUint16(E_ATTACKER_POINTS, true), e.attackerPoints);
+  same('levelDelta', view.getInt8(E_LEVEL_DELTA), e.levelDelta);
+  same('defendersWon', buf[E_DEFENDERS_WON]!, e.defendersWon ? 1 : 0);
+  same('trumpRank', buf[E_TRUMP_RANK]!, e.trumpRankIdx);
+  same('trumpSuit', buf[E_TRUMP_SUIT]!, e.trumpSuitIdx);
+  same('kittyPoints', buf[E_KITTY_POINTS]!, e.kittyPoints);
+  for (let i = 0; i < e.numTricks; i++) {
+    same(`trick ${i} points`, buf[E_TRICKS_BASE + i * 2]!, e.trickPoints[i] ?? 0);
+    same(
+      `trick ${i} attackersWonIt`,
+      buf[E_TRICKS_BASE + i * 2 + 1]!,
+      e.trickAttackerWon[i] === true ? 1 : 0,
+    );
+  }
+}
+
 function checkRecord(
   buf: Uint8Array,
   seat: number,
@@ -159,9 +219,19 @@ function checkRecord(
   const handSize = (handState.hands[seat] ?? []).length;
   if (header[H_HAND_SIZE] !== handSize) throw new Error('hand size mismatch');
 
-  // History length must never exceed the window.
-  if (header[H_HISTORY_LEN]! > 16) {
-    throw new Error(`history length ${header[H_HISTORY_LEN]} exceeds the window`);
+  // Every reader treats this byte as the sole attention mask over the
+  // history block and never recomputes it, so an *under*-reported length is
+  // the damaging direction: it silently hides real moves from the encoder.
+  // Check the exact value rather than only the window bound, which
+  // steps.slice(-HISTORY_STEPS) satisfies by construction.
+  let totalPlays = 0;
+  for (const t of handState.tricks) totalPlays += t.plays.length;
+  if (handState.currentTrick !== null) totalPlays += handState.currentTrick.plays.length;
+  const expectedHistory = Math.min(totalPlays, HISTORY_STEPS);
+  if (header[H_HISTORY_LEN] !== expectedHistory) {
+    throw new Error(
+      `history length ${header[H_HISTORY_LEN]}, expected ${expectedHistory} from ${totalPlays} plays`,
+    );
   }
   // Plane 0 must be exactly the acting seat's hand.
   const planes = buf.subarray(2 + HEADER_BYTES, 2 + HEADER_BYTES + PLANES_BYTES);

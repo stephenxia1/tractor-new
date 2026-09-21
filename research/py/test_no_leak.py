@@ -31,14 +31,25 @@ def one_frame(privileged: bool) -> F.Batch:
         WorkerConfig(games=24, seed=99, preplay="lowball", privileged=privileged),
     )
     try:
-        for _ in range(3):  # let a few hands get going, so history is non-empty
+        # Enough rounds to fill the history window, and a guard that waits
+        # for it. Full self-play advances every game by exactly one play per
+        # round, so the frame read on round i carries min(i, HISTORY_STEPS)
+        # history steps and a 16-slot window is only full on round 16 --
+        # hence the bound. The guard used to be H_TRICK_INDEX > 0, which is
+        # already true on round 4 and returned a frame with 12 of its 16
+        # slots still empty: a leak confined to later history steps would
+        # have gone unseen. Every game moves in lockstep, so the round that
+        # fills the window fills it for every decision in the frame, not
+        # just for the one `max` finds.
+        for _ in range(L.HISTORY_STEPS + 1):
             batches = pool.read_round()
             batch = batches[0]
             picks = np.zeros(batch.num_decisions, dtype=np.int64)
             pool.write_round(batches, [picks])
-            if batch.num_decisions > 0 and int(F.field_u8(batch.states, L.H_TRICK_INDEX).max()) > 0:
+            if batch.num_decisions > 0 and int(
+                    F.field_u8(batch.states, L.H_HISTORY_LEN).max()) >= L.HISTORY_STEPS:
                 return batch
-        return batch
+        raise AssertionError("never reached a frame with a full history window")
     finally:
         pool.close()
 

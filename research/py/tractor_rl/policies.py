@@ -117,10 +117,35 @@ def load_policy(path: str, device: torch.device) -> tuple[Policy, str]:
     """Returns (policy, description). Architecture comes from the file."""
     state = torch.load(path, map_location=device, weights_only=False)
     arch = state.get("arch")
+    if arch == "pop":
+        # A population payload keeps its weights under "agents", not
+        # "model", so every loader below dies on a missing key -- and the
+        # operator still has to be told *which* member to evaluate, which
+        # no default here could guess.
+        raise SystemExit(
+            f"{path} is a population checkpoint ({len(state['agents'])} agents); "
+            f"extract one first: python py/extract_agent.py {path} --agent N"
+        )
     if arch is None:
         # v1 predates the tag; its trunk is a plain Sequential.
+        if "model" not in state:
+            # A bare state dict -- an fp16 archive, or a torch.save of
+            # net.state_dict() -- carries neither the tag nor the wrapper,
+            # and sniffing it raises KeyError rather than naming the file.
+            raise SystemExit(
+                f"{path} has no 'arch' tag and no 'model' payload; "
+                "it is not a checkpoint this can load"
+            )
         arch = "v2" if any(k.startswith("blocks.") for k in state["model"]) else "v1"
-    policy = PolicyV2(state, device) if arch == "v2" else PolicyV1(state, device)
+    if arch == "v2":
+        policy: Policy = PolicyV2(state, device)
+    elif arch == "v1":
+        policy = PolicyV1(state, device)
+    else:
+        # Falling through to v1 on an unknown tag loads the wrong network
+        # or crashes on a key mismatch, both of which read as a corrupt
+        # checkpoint rather than as an unsupported one.
+        raise SystemExit(f"{path} has an unrecognised arch tag {arch!r}")
     desc = (
         f"{path} [{arch}] steps={state.get('steps', '?')} hands={state.get('hands', '?')}"
     )
@@ -145,6 +170,15 @@ class SearchPolicy:
     """
 
     def __init__(self, base: PolicyV2, gamma: float = 0.995, point_scale: float = 100.0) -> None:
+        if not isinstance(base, PolicyV2):
+            # v1's QNet is a single Q head with no value output, so there is
+            # nothing to score a leaf with. Unchecked, the run gets as far
+            # as the first search frame -- four node workers already
+            # spawned -- and dies on an AttributeError for `state_values`.
+            raise SystemExit(
+                "search needs a v2 checkpoint: the v1 network has no value head, "
+                f"so its leaves cannot be scored (got {type(base).__name__})"
+            )
         self.base = base
         self.gamma = gamma
         self.point_scale = point_scale
@@ -178,7 +212,17 @@ class SearchPolicy:
         values = self.base.state_values(leaf_states)
         self.leaves_seen += leaf_rows.shape[0]
         points = _int16(leaf_states, L.H_LEAF_POINTS).astype(np.float32) / self.point_scale
-        scores = points + self.gamma * values
+        # A leaf whose simulation ran the hand out has no continuation, so
+        # its gamma*V term is 0 -- but V does not say 0. It never saw a
+        # finished hand in training (only "my turn" states become records)
+        # and answers those positions with a small positive number, which
+        # lands on top of the settled points of the last trick, kitty bonus
+        # and all. The record carries no terminal flag and cannot grow one
+        # without changing the wire format, but it does not need one: a
+        # leaf is a position where the searching seat is about to move, so
+        # an empty hand can only mean the hand is already over.
+        over_rows = leaf_states[:, L.H_HAND_SIZE] == 0
+        scores = points + self.gamma * np.where(over_rows, 0.0, values)
         cand_of = leaf_states[:, L.H_LEAF_OF].astype(np.int64)
 
         # Leaves belong to the decision from the same game slot in the same
