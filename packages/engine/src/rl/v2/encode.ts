@@ -179,8 +179,15 @@ export function writeDecision(
   header[H_TABLE_POINTS] = Math.min(tablePoints, 255);
 
   let cardsSeen = 0;
-  for (const t of hand.tricks) for (const p of t.plays) cardsSeen += p.cards.length;
-  if (trick !== null) for (const p of trick.plays) cardsSeen += p.cards.length;
+  let totalPlays = 0;
+  for (const t of hand.tricks) {
+    totalPlays += t.plays.length;
+    for (const p of t.plays) cardsSeen += p.cards.length;
+  }
+  if (trick !== null) {
+    totalPlays += trick.plays.length;
+    for (const p of trick.plays) cardsSeen += p.cards.length;
+  }
 
   const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
   view.setUint16(H_ATTACKER_POINTS, Math.min(hand.attackerPoints, 65535), true);
@@ -199,6 +206,15 @@ export function writeDecision(
   }
   view.setUint16(H_GAME_ID, meta.gameId, true);
   view.setUint32(H_HAND_ID, meta.handId, true);
+
+  // These two describe blocks written further down, but they must be
+  // written now: `header` is a view over the buffer as it stands, and the
+  // claims below can grow the writer, which allocates a fresh buffer and
+  // leaves this view pointing at the discarded one. Written late, they
+  // would land nowhere and the record would ship claim's zero fill --
+  // silently, and only for the records that straddle a doubling.
+  header[H_HISTORY_LEN] = Math.min(totalPlays, HISTORY_STEPS);
+  header[H_HAS_PRIVILEGED] = meta.privileged === true ? 1 : 0;
 
   // ---- planes ----
   const planes = w.claim(PLANES_BYTES);
@@ -254,10 +270,8 @@ export function writeDecision(
     const off = i * HISTORY_STEP_BYTES;
     for (let c = 0; c < HISTORY_MAX_CARDS; c++) historyBuf[off + 4 + c] = NO_CARD;
   }
-  header[H_HISTORY_LEN] = recent.length;
 
   // ---- privileged block (training only) ----
-  header[H_HAS_PRIVILEGED] = meta.privileged === true ? 1 : 0;
   if (meta.privileged === true) {
     const priv = w.claim(PRIVILEGED_BYTES);
     for (let rel = 1; rel < numPlayers; rel++) {

@@ -82,8 +82,8 @@ export const HISTORY_BYTES = HISTORY_STEPS * HISTORY_STEP_BYTES; // 192
 export const PRIVILEGED_PLANES = 4; // three opponents (relative) + kitty
 export const PRIVILEGED_BYTES = PRIVILEGED_PLANES * NUM_SLOTS; // 216
 
-export const STATE_BYTES = HEADER_BYTES + PLANES_BYTES + HISTORY_BYTES; // 764
-export const STATE_BYTES_PRIVILEGED = STATE_BYTES + PRIVILEGED_BYTES; // 980
+export const STATE_BYTES = HEADER_BYTES + PLANES_BYTES + HISTORY_BYTES; // 768
+export const STATE_BYTES_PRIVILEGED = STATE_BYTES + PRIVILEGED_BYTES; // 984
 
 // ---- Candidate encoding ----------------------------------------------------
 

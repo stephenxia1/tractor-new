@@ -123,10 +123,17 @@ export function simulateCandidate(
     if (nextToPlay(state) === seat) break; // back to a state V understands
     const next = nextToPlay(state);
     if (next === null) break;
+    // A rollout the bot or the reducer refuses drops the whole leaf, as in
+    // the trick-completion loop above. Breaking here instead would hand
+    // back the position as it stands -- some other seat still on lead --
+    // and the caller would score it with V, which is exactly the
+    // out-of-distribution leaf the block comment above blames for search
+    // once playing worse than no search at all. One lost sample is cheap;
+    // a leaf V cannot read poisons the candidate's whole average.
     const action = pickBotAction(state, next, opponentModel);
-    if (action.kind !== 'play_cards') break;
+    if (action.kind !== 'play_cards') return null;
     const r = applyEvent(state, { kind: 'play_cards', seat: next, cards: action.cards });
-    if (!r.ok) break;
+    if (!r.ok) return null;
     state = r.state;
   }
   return { state, points };

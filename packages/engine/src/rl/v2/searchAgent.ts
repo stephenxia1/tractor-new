@@ -23,7 +23,7 @@
 import { pickBotAction, type BotAction, type BotType } from '../../bot';
 import { nextToPlay } from '../../reducer';
 import type { GameState, Seat } from '../../state';
-import type { TrumpContext } from '../../types';
+import { NATURAL_RANKS, SUITS, type TrumpContext } from '../../types';
 
 import {
   DEFAULT_BELIEF_WEIGHTS,
@@ -31,6 +31,7 @@ import {
   type BeliefWeightOptions,
 } from './beliefSampler';
 import { enumerateCandidates, type Candidate } from './candidates';
+import { cardSlot } from './cards';
 import { makeRng, sampleWorld, stateWithWorld, type PlacementWeight } from './determinize';
 import { writeDecision } from './encode';
 import { actionFeatures, historyFeatures, stateFeatures } from './features';
@@ -135,7 +136,12 @@ export function makeV2SearchAgent(
 
     const totals = new Float64Array(candidates.length);
     const counts = new Int32Array(candidates.length);
-    const rand = makeRng(((seat + 1) * 7919 + candidates.length * 31 + hand!.tricks.length) >>> 0);
+    // Seed from the whole position, not just its shape. The old key --
+    // seat, candidate count and trick index -- collides across deals: any
+    // two hands that reached trick 3 as seat 1 with 5 candidates drew the
+    // identical world sequence, so their determinization error was the
+    // same error twice over instead of two draws that average out.
+    const rand = makeRng(positionSeed(state, seat));
 
     for (let w = 0; w < cfg.worlds; w++) {
       const world = sampleWorld(state, seat, myKitty, ctx, rand, weightOf);
@@ -144,10 +150,22 @@ export function makeV2SearchAgent(
       for (let c = 0; c < candidates.length; c++) {
         const sim = simulateCandidate(hypothetical, seat, candidates[c]!.cards, cfg.opponentModel);
         if (sim === null) continue;
-        const leaf = encodeLeaf(sim.state, seat);
-        if (leaf === null) continue;
-        const lz = encodeState(weights, leaf.state, leaf.tokens, leaf.mask);
-        totals[c]! += sim.points / POINT_SCALE + GAMMA * stateValue(weights, lz);
+        // A simulation that ran the hand out has no continuation to value,
+        // and V does not know that: it was trained only on "my turn"
+        // positions and answers a finished hand with a small positive
+        // number, which lands on top of the points the last trick settled.
+        // Score those on the settled points alone. Dropping them instead
+        // would cost more than the bug does -- the final decision of a hand
+        // is terminal for *every* candidate, so `complete` would fail and
+        // search would never reach the trick the kitty bonus rides on.
+        let continuation = 0;
+        if (sim.state.phase === 'play') {
+          const leaf = encodeLeaf(sim.state, seat, myKitty);
+          if (leaf === null) continue;
+          const lz = encodeState(weights, leaf.state, leaf.tokens, leaf.mask);
+          continuation = stateValue(weights, lz);
+        }
+        totals[c]! += sim.points / POINT_SCALE + GAMMA * continuation;
         counts[c]! += 1;
         stats.leaves += 1;
       }
@@ -175,6 +193,30 @@ function argmax(xs: Float32Array | Float64Array): number {
   let best = 0;
   for (let i = 1; i < xs.length; i++) if (xs[i]! > xs[best]!) best = i;
   return best;
+}
+
+// FNV-1a over what identifies this deal and the point reached inside it,
+// in the style of the deal digest in `research/src/env.ts`. This agent is
+// handed a state and nothing else -- no game or hand id to key on -- so
+// the acting seat's own cards stand in for the deal, being the cheapest
+// thing on hand that two deals reliably differ in, and the trick index
+// and ply separate the decisions within one hand. Still a pure function
+// of the position, so replaying a game samples the same worlds.
+function positionSeed(state: GameState, seat: Seat): number {
+  const hand = state.currentHand!;
+  let h = 0x811c9dc5;
+  const push = (v: number): void => {
+    h = Math.imul(h ^ (v & 0xff), 0x01000193) >>> 0;
+  };
+  push(seat);
+  push(hand.trumpRank === null ? 255 : NATURAL_RANKS.indexOf(hand.trumpRank));
+  push(hand.trumpSuit === null ? 255 : SUITS.indexOf(hand.trumpSuit));
+  push(hand.landlord ?? 255);
+  push(hand.tricks.length);
+  push(hand.currentTrick?.plays.length ?? 0);
+  const slots = (hand.hands[seat] ?? []).map(cardSlot).sort((a, b) => a - b);
+  for (const slot of slots) push(slot);
+  return h >>> 0;
 }
 
 type Encoded = {
@@ -218,17 +260,26 @@ function encodeDecision(
 }
 
 // A leaf carries no candidates; only the state embedding is wanted. The
-// hand can have ended inside the simulation, in which case there is no
-// position to value and the leaf is dropped.
+// landlord's buried kitty still has to be passed even though there is
+// nothing here to score: `stateFeatures` derives the unseen pool as
+// capacity - myHand - played - kitty, so an empty kitty plane on a
+// landlord leaf reports the eight buried cards as still outstanding. That
+// is a state the training data never contains, and because the distortion
+// depends on what each leaf holds it tilts the comparison between
+// candidates rather than cancelling out of it. Null when the position
+// cannot be encoded at all -- no trump or no landlord, which
+// `writeDecision` refuses. Positions where the hand has already ended
+// never get here; the caller scores those on points alone.
 function encodeLeaf(
   state: GameState,
   seat: Seat,
+  myKitty: ReadonlyArray<import('../../types').Card>,
 ): { state: Float32Array; tokens: Float32Array; mask: Float32Array } | null {
   const hand = state.currentHand;
   if (hand === null || hand.trumpRank === null || hand.landlord === null) return null;
   try {
     const writer = new ByteWriter(1 << 16);
-    writeDecision(writer, state, { gameId: 0, handId: 0, seat, myKitty: [], privileged: false }, []);
+    writeDecision(writer, state, { gameId: 0, handId: 0, seat, myKitty, privileged: false }, []);
     const framed = writer.taken();
     const recordBytes = framed[0]! + framed[1]! * 256;
     const block = framed.subarray(2, 2 + recordBytes).subarray(0, STATE_BYTES);
