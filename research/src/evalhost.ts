@@ -148,7 +148,30 @@ async function playHand(
   let playStart: string | null = null;
 
   for (;;) {
-    const { episodes, pending } = slot.advance();
+    let advanced;
+    try {
+      advanced = slot.advance();
+    } catch (err) {
+      // A move the engine refused. Report the position rather than the
+      // message alone: which seat, what was led, and what the refused
+      // play held is the whole of the diagnosis.
+      const hs = slot.gameState.currentHand;
+      const trick = hs?.currentTrick ?? null;
+      const lead = trick?.plays?.[0];
+      process.stderr.write(
+        'evalhost: rejected move. ' +
+          JSON.stringify({
+            leader: trick?.leader ?? null,
+            plays: trick?.plays?.length ?? 0,
+            leadCards: lead ? lead.cards.map((c: any) => cardSlot(c)) : null,
+            leadSize: lead ? lead.cards.length : null,
+            trumpSuit: hs?.trumpSuit ?? null,
+            trumpRank: hs?.trumpRank ?? null,
+          }) + String.fromCharCode(10),
+      );
+      throw err;
+    }
+    const { episodes, pending } = advanced;
     if (episodes.length > 0) {
       const episode = episodes[0]!;
       if (playStart === null) throw new Error('hand ended with no learner decision');
