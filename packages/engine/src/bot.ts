@@ -16,7 +16,18 @@ import { applyEvent, nextToPlay } from './reducer';
 import { legalEvents } from './legalActions';
 import { buildDeck } from './deck';
 import { mulberry32, shuffle } from './prng';
-import { decomposePlay, decomposedBeats } from './throws';
+import {
+  decomposePlay,
+  decomposedBeats,
+  decomposeThrow,
+  type ThrowDecomposition,
+} from './throws';
+import {
+  canonicalFollow,
+  leadObligations,
+  validateFollow,
+  validateFollowThrow,
+} from './follow';
 import {
   NATURAL_RANKS,
   cardEquals,
@@ -605,15 +616,19 @@ function fillFollow(
   const leadCount = lead.cards.length;
   const leadClass = classifyCombo(lead.cards, ctx, n);
 
-  let leadIsPair = false;
-  let leadTractorLen = 0;
-  if (leadClass.ok) {
-    if (leadClass.combo.kind === 'nkind' && leadClass.combo.n === 2) {
-      leadIsPair = true;
-    } else if (leadClass.combo.kind === 'tractor') {
-      leadTractorLen = leadClass.combo.length;
-    }
-  }
+  // What the lead demands, read from the same function the validator
+  // reads it from. A throw fails `classifyCombo`, and deriving the
+  // obligations from that alone left a throw demanding nothing: a
+  // thrown pair could be followed with no pair at all, which the
+  // validator refuses (rules.md 7.6 step 3 -- a throw's obligations are
+  // the union of its components').
+  const decomposed = leadClass.ok ? null : decomposeThrow(lead.cards, ctx, n);
+  const thrown =
+    decomposed !== null && decomposed.ok ? decomposed.throw : null;
+  const leadParts: ReadonlyArray<ClassifiedCombo> = leadClass.ok
+    ? [leadClass.combo]
+    : (thrown?.components ?? []);
+  const obligations = leadObligations(leadParts, n);
 
   const myInLed = pool.filter((c) => effectiveSuit(c, ctx) === ledSuit);
   const chosen: Card[] = [];
@@ -622,51 +637,50 @@ function fillFollow(
     if (!isUsed(c)) chosen.push(c);
   };
 
-  // Obligation: tractor match for tractor leads.
-  if (leadTractorLen >= 2) {
-    const matching = findTractors(myInLed, ctx, n).filter(
-      (t) => t.length === leadTractorLen,
+  // Tractor obligations, longest slot first. A single combo demands at
+  // most one; a throw can demand several, which is why this walks a
+  // multiset rather than a single length.
+  let pairsHeld = 0;
+  for (const want of obligations.tractors) {
+    if (chosen.length + want * 2 > leadCount) continue;
+    const free = myInLed.filter((c) => !isUsed(c));
+    const matching = findTractors(free, ctx, n, want).filter(
+      (t) => t.length >= want,
     );
-    if (matching.length > 0) {
-      const sorted = matching
-        .slice()
-        .sort((a, b) =>
-          compareCards(
-            a.cards[a.cards.length - 1]!,
-            b.cards[b.cards.length - 1]!,
-            ctx,
-          ),
-        );
-      const pick =
-        preference === 'high' ? sorted[sorted.length - 1]! : sorted[0]!;
-      for (const c of pick.cards) addCard(c);
-    } else {
-      // No matching tractor — must include as many pairs in led suit as we can.
-      const pairs = findNKinds(myInLed, 2);
-      const sortedPairs = pairs
-        .slice()
-        .sort((a, b) => compareCards(a.cards[0]!, b.cards[0]!, ctx));
-      const ordered =
-        preference === 'high' ? [...sortedPairs].reverse() : sortedPairs;
-      let added = 0;
-      for (const p of ordered) {
-        if (added >= leadTractorLen) break;
-        if (chosen.length + p.cards.length > leadCount) break;
-        for (const c of p.cards) addCard(c);
-        added++;
-      }
-    }
-  } else if (leadIsPair) {
-    const pairs = findNKinds(myInLed, 2);
-    if (pairs.length > 0) {
-      const sortedPairs = pairs
-        .slice()
-        .sort((a, b) => compareCards(a.cards[0]!, b.cards[0]!, ctx));
-      const picked =
-        preference === 'high'
-          ? sortedPairs[sortedPairs.length - 1]!
-          : sortedPairs[0]!;
-      for (const c of picked.cards) addCard(c);
+    if (matching.length === 0) continue;
+    const sorted = matching
+      .slice()
+      .sort((a, b) =>
+        compareCards(
+          a.cards[a.cards.length - 1]!,
+          b.cards[b.cards.length - 1]!,
+          ctx,
+        ),
+      );
+    const pick =
+      preference === 'high' ? sorted[sorted.length - 1]! : sorted[0]!;
+    // A longer tractor than the slot needs covers it; take the slot's
+    // worth of it and leave the rest free.
+    for (const c of pick.cards.slice(0, want * 2)) addCard(c);
+    pairsHeld += want;
+  }
+
+  // Pair obligation: as many as the lead demands, bounded by what the
+  // hand can supply, and counting the pairs the tractors already gave.
+  const heldPairs = findNKinds(myInLed, 2);
+  const needPairs = Math.min(heldPairs.length, obligations.pairs);
+  if (pairsHeld < needPairs) {
+    const sortedPairs = heldPairs
+      .slice()
+      .sort((a, b) => compareCards(a.cards[0]!, b.cards[0]!, ctx));
+    const ordered =
+      preference === 'high' ? [...sortedPairs].reverse() : sortedPairs;
+    for (const p of ordered) {
+      if (pairsHeld >= needPairs) break;
+      if (p.cards.some((c) => isUsed(c))) continue;
+      if (chosen.length + p.cards.length > leadCount) break;
+      for (const c of p.cards) addCard(c);
+      pairsHeld++;
     }
   }
 
@@ -683,7 +697,7 @@ function fillFollow(
   }
 
   if (chosen.length >= leadCount) {
-    return { kind: 'play_cards', cards: chosen };
+    return legalOrCanonical(chosen, leadParts, leadClass, thrown, leadCount, ledSuit, pool, ctx, n);
   }
 
   // Non-led-suit fillers.
@@ -706,7 +720,37 @@ function fillFollow(
     if (chosen.length >= leadCount) break;
     addCard(c);
   }
-  return { kind: 'play_cards', cards: chosen };
+  return legalOrCanonical(chosen, leadParts, leadClass, thrown, leadCount, ledSuit, pool, ctx, n);
+}
+
+// The heuristics above choose *which* legal follow to play; this is the
+// guarantee that what they chose is one. A bot that hands the engine a
+// move it refuses takes the whole game down, and the shapes that reach
+// here -- throws carrying several components, holdings that can supply
+// one obligation but not another -- are the ones a hand-written
+// selection is most likely to get wrong. `canonicalFollow` is the
+// engine's own answer and is always legal.
+function legalOrCanonical(
+  chosen: ReadonlyArray<Card>,
+  leadParts: ReadonlyArray<ClassifiedCombo>,
+  leadClass: ReturnType<typeof classifyCombo>,
+  thrown: ThrowDecomposition | null,
+  leadCount: number,
+  ledSuit: ReturnType<typeof effectiveSuit>,
+  hand: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  n: number,
+): BotAction {
+  const verdict = leadClass.ok
+    ? validateFollow(leadClass.combo, chosen, hand, ctx, n)
+    : thrown !== null
+      ? validateFollowThrow(thrown, chosen, hand, ctx, n)
+      : { ok: true as const };
+  if (verdict.ok) return { kind: 'play_cards', cards: [...chosen] };
+  return {
+    kind: 'play_cards',
+    cards: canonicalFollow(leadParts, leadCount, ledSuit, hand, ctx, n),
+  };
 }
 
 // =========================================================================
