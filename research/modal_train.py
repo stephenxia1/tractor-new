@@ -132,6 +132,42 @@ def smoke() -> None:
 
 
 @app.local_entrypoint()
+def launch(steps: int = 2500, hands: int = 128, name: str = "run",
+           gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
+           eval_every: int = 250, eval_deals: int = 96,
+           checkpoint_every: int = 125, keep_last: int = 24,
+           anneal_steps: int = 400) -> None:
+    """Submit a run and return, rather than waiting on it.
+
+    `main` waits for the function to finish, which ties a run measured
+    in hours to the lifetime of the terminal that started it: the
+    client cancels its input when it is interrupted, and it does so
+    even under `--detach`, which stops the app from being torn down but
+    does not stop the client from asking. `spawn` hands the work to
+    Modal and exits, so nothing local can end it. Watch it with
+    `modal app logs`, or on the run's Weights and Biases page.
+    """
+    fn = {"a10g": train_a10g, "a100": train_a100}[gpu.lower()]
+    call = fn.spawn(
+        steps,
+        hands,
+        name,
+        wandb_on,
+        resume,
+        {
+            "eval_every": eval_every,
+            "eval_deals": eval_deals,
+            "checkpoint_every": checkpoint_every,
+            "keep_last": keep_last,
+            "anneal_steps": anneal_steps,
+        },
+    )
+    print(f"submitted {name}: call {call.object_id}")
+    print(f"  logs:  modal app logs {app.app_id}")
+    print(f"  wandb: https://wandb.ai/xia-stephen-1/tractor-rl/runs/{name}")
+
+
+@app.local_entrypoint()
 def main(steps: int = 1000, hands: int = 64, name: str = "run",
          gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
          eval_every: int = 0, eval_deals: int = 64,
