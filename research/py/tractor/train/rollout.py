@@ -157,7 +157,11 @@ class _InFlight:
 
 
 def _pack(
-    hand: _InFlight, cache: Cache, cfg: ModelConfig, spans: Any = None
+    hand: _InFlight,
+    cache: Cache,
+    cfg: ModelConfig,
+    spans: Any = None,
+    moves: MoveSet | None = None,
 ) -> _Decision:
     """Encode the seat to act and enumerate what it may play.
 
@@ -165,6 +169,14 @@ def _pack(
     the batched forward exists to amortise, but they are different
     work with different remedies, and one span over the pair cannot
     say which of them is worth attention.
+
+    ``moves`` replaces the enumeration for a caller that already holds
+    the action set. ``eval/bots.py`` is the one: there the TypeScript
+    environment owns the game and its candidate list is the authority,
+    so re-deriving one here would offer the network moves the other side
+    is not prepared to play. It routes through this function anyway,
+    because a position becoming network input in two places is how an
+    evaluation ends up measuring a policy training never produced.
     """
     state = hand.state
     seat = int(state.to_act)
@@ -173,8 +185,9 @@ def _pack(
     # Capped at the tensor width: anything the enumerator produced past
     # this would be dropped when the batch is padded, and a candidate the
     # policy cannot see is worse than one that was never offered.
-    with _span(spans, "enumerate"):
-        moves = state.legal_moves(cap=cfg.max_candidates)
+    if moves is None:
+        with _span(spans, "enumerate"):
+            moves = state.legal_moves(cap=cfg.max_candidates)
     kept = min(len(moves.moves), cfg.max_candidates)
     if kept == 0:
         raise RuntimeError(f"seat {seat} has no legal move")

@@ -17,15 +17,21 @@ Evaluation plays one decision at a time, because the duplicate harness
 owns the game loop and hands out positions singly. That is far below
 the device's efficient batch, which is why it runs on a schedule and
 over a few hundred deals rather than continuously.
+
+`evaluate_against_bots` answers the same question against the
+TypeScript engine's heuristic bots instead, through
+``tractor.eval.bots``. The reference opponent here has no judgement in
+it; those do, and they are what the shipped game plays with.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
 
+from ..eval.bots import play_against_bot
 from ..eval.duplicate import Policy, PolicyFactory, compare, uniform_random_policy
 from ..nn.features import Cache
 from ..nn.model import ModelConfig
@@ -137,3 +143,48 @@ def evaluate(
         # question a training chart is actually being asked.
         "ahead": float(result.ci_low > 0.0),
     }
+
+
+def evaluate_against_bots(
+    net: Any,
+    bots: Sequence[str],
+    device: torch.device | str = "cpu",
+    cfg: ModelConfig | None = None,
+    *,
+    num_deals: int = 64,
+    seed: int = 0,
+    max_candidates: int = 128,
+    node: str | Sequence[str] | None = None,
+    workers: int = 1,
+) -> dict[str, float]:
+    """Score ``net`` against each of the engine's heuristic ``bots``.
+
+    The reference opponent `evaluate` uses has no judgement in it, which
+    is what makes it a reference and also what makes it uninformative
+    past the first hour of training. These are the bots the shipped game
+    plays with, so a margin against them is the quantity the project is
+    actually asking about.
+
+    Keys are namespaced by bot -- ``vs_smart-v34/levels`` and so on --
+    so several bots merge into one metrics row without colliding, and a
+    chart keeps them apart.
+
+    Each bot costs a subprocess and ``2 * num_deals`` hands played one
+    decision at a time, so this belongs on the same schedule as
+    `evaluate` rather than beside it every step.
+    """
+    out: dict[str, float] = {}
+    for bot in bots:
+        scores = play_against_bot(
+            net,
+            bot,
+            device=device,
+            cfg=cfg,
+            num_deals=num_deals,
+            seed=seed,
+            max_candidates=max_candidates,
+            node=node,
+            workers=workers,
+        )
+        out.update({f"vs_{bot}/{key}": value for key, value in scores.items()})
+    return out

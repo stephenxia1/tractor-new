@@ -26,7 +26,7 @@ import torch
 from ..nn.model import ActorCritic, ModelConfig
 from ..telemetry import Spans, memory_snapshot
 from .buffer import RolloutBuffer
-from .evaluate import evaluate
+from .evaluate import evaluate, evaluate_against_bots
 from .gae import compute_gae
 from .ppo import PPOConfig, PPOLearner
 from .rollout import collect
@@ -66,6 +66,23 @@ class TrainConfig:
     eval_every: int = 0
     eval_deals: int = 64
     eval_seed: int = 12345
+
+    # Heuristic bots from the TypeScript engine to play on the same
+    # schedule, e.g. ``("smart-v34",)``. Empty is off. Each one spawns a
+    # Node subprocess and plays `2 * eval_deals` hands a decision at a
+    # time, so it costs roughly what the reference evaluation does, per
+    # bot -- and unlike the reference it needs Node in the image.
+    eval_bots: tuple[str, ...] = ()
+    # Hosts run at once when measuring against a bot. The heuristics
+    # search -- a decision costs better than half a second from the
+    # strong ones -- so a measurement worth taking needs several.
+    eval_bot_workers: int = 8
+    # Deals per bot, separate from `eval_deals`: a bot costs a hundred
+    # times what the reference opponent does per decision, and the
+    # interval on a duplicate-paired score closes quickly enough that a
+    # smaller set still separates one policy from another.
+    eval_bot_deals: int = 24
+
     checkpoint_dir: str = "checkpoints"
     keep_last: int = 3
 
@@ -215,6 +232,22 @@ def train(
                     # by the policy and not by which deals were drawn.
                     seed=cfg.eval_seed,
                 )
+                # Merged into the same dict, and so into the same row as
+                # the reference evaluation and the iteration that
+                # produced it. A second row would put two points at one
+                # step on every chart that reads this run.
+                if cfg.eval_bots:
+                    scores.update(
+                        evaluate_against_bots(
+                            net,
+                            tuple(cfg.eval_bots),
+                            device=device,
+                            cfg=model_cfg,
+                            num_deals=cfg.eval_bot_deals,
+                            seed=cfg.eval_seed,
+                            workers=cfg.eval_bot_workers,
+                        )
+                    )
 
         now = time.perf_counter()
         elapsed = now - started

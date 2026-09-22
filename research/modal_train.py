@@ -6,6 +6,11 @@ file supplies a GPU, a volume for checkpoints, and the wandb secret.
 
     modal run modal_train.py::smoke                 # a few steps, cheap
     modal run modal_train.py::main --steps 2000
+    modal run modal_train.py::launch --steps 2500 --eval-bots smart-v34
+
+`--eval-bots` is a comma-separated list of engine bot names. It turns on
+the duplicate-deal match of `tractor.eval.bots`, which is why this
+image carries Node and the npm workspace as well as torch.
 """
 
 from __future__ import annotations
@@ -22,18 +27,65 @@ VOLUME = "/vol"
 app = modal.App("tractor-train")
 volume = modal.Volume.from_name("tractor-rl", create_if_missing=True)
 
+# Node as well as torch, because `eval_bots` measures the network against
+# the engine's heuristic bots and those are TypeScript: `tractor.eval.bots`
+# spawns `npx tsx research/src/evalhost.ts`, which needs the npm workspace
+# installed. The layer order mirrors research/modal_app.py -- manifests,
+# `npm ci`, then source -- so editing a source file rebuilds in seconds
+# instead of re-running the install.
+#
+# A Python-only image would still train; it would fail at the first
+# scheduled evaluation, hours in, which is the wrong place to find out.
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("curl", "ca-certificates")
+    .run_commands(
+        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+        "apt-get install -y --no-install-recommends nodejs",
+    )
     .pip_install("numpy>=1.26", "torch==2.6.0", "wandb>=0.17")
+    # Every workspace member's package.json must be present for `npm ci`,
+    # even the ones training never imports.
+    .add_local_file(LOCAL_REPO / "package.json", f"{REPO}/package.json", copy=True)
+    .add_local_file(LOCAL_REPO / "package-lock.json",
+                    f"{REPO}/package-lock.json", copy=True)
+    .add_local_file(LOCAL_REPO / "tsconfig.base.json",
+                    f"{REPO}/tsconfig.base.json", copy=True)
+    .add_local_file(LOCAL_REPO / "apps/ws/package.json",
+                    f"{REPO}/apps/ws/package.json", copy=True)
+    .add_local_file(LOCAL_REPO / "apps/web/package.json",
+                    f"{REPO}/apps/web/package.json", copy=True)
+    .add_local_file(LOCAL_REPO / "packages/engine/package.json",
+                    f"{REPO}/packages/engine/package.json", copy=True)
+    .add_local_file(LOCAL_REPO / "packages/protocol/package.json",
+                    f"{REPO}/packages/protocol/package.json", copy=True)
+    .run_commands(f"cd {REPO} && npm ci --include=dev")
     .add_local_dir(
-        LOCAL_REPO / "research/py",
-        f"{RESEARCH}/py",
+        LOCAL_REPO / "packages/engine", f"{REPO}/packages/engine", copy=True,
+        ignore=["**/node_modules", "**/dist", "**/__pycache__", "**/*.pt", "python"],
+    )
+    .add_local_dir(
+        LOCAL_REPO / "packages/protocol", f"{REPO}/packages/protocol", copy=True,
+        ignore=["**/node_modules", "**/dist"],
+    )
+    .add_local_dir(
+        LOCAL_REPO / "research",
+        RESEARCH,
         copy=True,
-        ignore=["**/__pycache__", "**/*.pt", "**/fixtures/games.jsonl"],
+        ignore=["**/node_modules", "**/__pycache__", "**/*.pt",
+                "**/fixtures/games.jsonl", "checkpoints", "runs", "wandb"],
     )
     .env({"PYTHONPATH": f"{RESEARCH}/py", "PYTHONUNBUFFERED": "1"})
     .workdir(RESEARCH)
+    # Fail on a broken image in seconds rather than an hour into a run.
+    # Only re-runs when a layer above it changes.
+    .run_commands(f"cd {RESEARCH} && npx tsx src/dupcheck.ts --hands 3 --games 1")
 )
+
+
+def _bot_list(spec: str) -> tuple[str, ...]:
+    """`--eval-bots smart-v34,smart-v18` -> a tuple. Empty means off."""
+    return tuple(name.strip() for name in spec.split(",") if name.strip())
 
 # `Secret.from_name` is lazy, so a wrong name raises at deploy time and
 # takes down every function in the app, not only the ones that wanted
@@ -135,8 +187,9 @@ def smoke() -> None:
 def launch(steps: int = 2500, hands: int = 128, name: str = "run",
            gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
            eval_every: int = 250, eval_deals: int = 96,
-           checkpoint_every: int = 125, keep_last: int = 24,
-           anneal_steps: int = 400) -> None:
+           eval_bots: str = "", eval_bot_deals: int = 24,
+           eval_bot_workers: int = 8, checkpoint_every: int = 125,
+           keep_last: int = 24, anneal_steps: int = 400) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `main` waits for the function to finish, which ties a run measured
@@ -157,6 +210,11 @@ def launch(steps: int = 2500, hands: int = 128, name: str = "run",
         {
             "eval_every": eval_every,
             "eval_deals": eval_deals,
+            "eval_bots": _bot_list(eval_bots),
+        "eval_bot_deals": eval_bot_deals,
+        "eval_bot_workers": eval_bot_workers,
+            "eval_bot_deals": eval_bot_deals,
+            "eval_bot_workers": eval_bot_workers,
             "checkpoint_every": checkpoint_every,
             "keep_last": keep_last,
             "anneal_steps": anneal_steps,
@@ -170,7 +228,8 @@ def launch(steps: int = 2500, hands: int = 128, name: str = "run",
 @app.local_entrypoint()
 def main(steps: int = 1000, hands: int = 64, name: str = "run",
          gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
-         eval_every: int = 0, eval_deals: int = 64,
+         eval_every: int = 0, eval_deals: int = 64, eval_bots: str = "",
+         eval_bot_deals: int = 24, eval_bot_workers: int = 8,
          checkpoint_every: int = 50, keep_last: int = 3,
          anneal_steps: int = 400) -> None:
     import json
@@ -179,6 +238,7 @@ def main(steps: int = 1000, hands: int = 64, name: str = "run",
     overrides = {
         "eval_every": eval_every,
         "eval_deals": eval_deals,
+        "eval_bots": _bot_list(eval_bots),
         "checkpoint_every": checkpoint_every,
         "keep_last": keep_last,
         "anneal_steps": anneal_steps,
