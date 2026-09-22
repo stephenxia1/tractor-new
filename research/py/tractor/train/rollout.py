@@ -156,20 +156,25 @@ class _InFlight:
     )
 
 
-def _pack(hand: _InFlight, cache: Cache, cfg: ModelConfig) -> _Decision:
+def _pack(
+    hand: _InFlight, cache: Cache, cfg: ModelConfig, spans: Any = None
+) -> _Decision:
     """Encode the seat to act and enumerate what it may play.
 
-    Enumeration is counted as part of encoding: both are the per-decision
-    CPU work that the batched forward is there to amortise, and splitting
-    them into two spans would only measure the loop's own bookkeeping.
+    The two are timed apart. They are both per-decision host work that
+    the batched forward exists to amortise, but they are different
+    work with different remedies, and one span over the pair cannot
+    say which of them is worth attention.
     """
     state = hand.state
     seat = int(state.to_act)
-    obs = encode(state, seat, cache)
+    with _span(spans, "encode"):
+        obs = encode(state, seat, cache)
     # Capped at the tensor width: anything the enumerator produced past
     # this would be dropped when the batch is padded, and a candidate the
     # policy cannot see is worse than one that was never offered.
-    moves = state.legal_moves(cap=cfg.max_candidates)
+    with _span(spans, "enumerate"):
+        moves = state.legal_moves(cap=cfg.max_candidates)
     kept = min(len(moves.moves), cfg.max_candidates)
     if kept == 0:
         raise RuntimeError(f"seat {seat} has no legal move")
@@ -441,8 +446,7 @@ def collect(
                 if not active:
                     break
 
-                with _span(spans, "encode"):
-                    packed = [_pack(hand, cache, cfg) for hand in active]
+                packed = [_pack(hand, cache, cfg, spans) for hand in active]
 
                 obs = obs_batch_from_arrays(
                     np.stack([d.history for d in packed]),

@@ -342,6 +342,9 @@ def test_history_is_capped_at_the_token_budget() -> None:
     ]
     total = tricks * NUM_SEATS
     assert total > F.MAX_HISTORY
+    # The simulator maintains its play log as plays happen; a state
+    # assembled by setting `tricks` directly has to say so.
+    state.rebuild_log()
 
     obs = F.encode(state, 0)
     assert obs.history.shape == (F.MAX_HISTORY, F.HISTORY_DIM)
@@ -403,6 +406,63 @@ def main() -> int:
             print(f"ok    {fn.__name__}  ({time.time() - started:.1f}s)")
     print(f"{len(fns) - failed}/{len(fns)} passed")
     return 1 if failed else 0
+
+
+def test_a_rebuilt_log_leaves_room_for_the_rest_of_the_hand() -> None:
+    """`rebuild_log` must re-establish the bound `new` set up.
+
+    Sizing the buffer to the plays already made leaves a state that
+    encodes correctly and then dies several plays later, inside
+    `step`, with an index error that names neither the cause nor the
+    call that caused it.
+    """
+    rng = np.random.default_rng(9)
+    state, _info = generate(rng, 2)
+    for _ in range(20):
+        moves = state.legal_moves(cap=128)
+        state.step(moves.moves[int(rng.integers(len(moves.moves)))])
+
+    # Force the grow path: a buffer too small for the position.
+    state.log_counts = np.zeros((4, NUM_TYPES), dtype=np.float32)
+    state.log_meta = np.zeros((4, 4), dtype=np.int64)
+    state.rebuild_log()
+
+    played = 0
+    while not state.done:
+        moves = state.legal_moves(cap=128)
+        state.step(moves.moves[int(rng.integers(len(moves.moves)))])
+        played += 1
+    assert played > 0
+    print(f"    rebuilt mid-hand, then played {played} more to the end")
+
+
+def test_an_unbuilt_log_is_refused_rather_than_encoded() -> None:
+    """A state whose log does not describe it must not encode.
+
+    The log is the encoder's only view of the hand's history now, so a
+    state assembled without it does not raise -- it returns an empty
+    history and counts a whole hand of played cards as unseen, which
+    is a plausible-looking observation of a position that never
+    happened.
+    """
+    rng = np.random.default_rng(11)
+    state, _info = generate(rng, 2)
+    for _ in range(8):
+        moves = state.legal_moves(cap=128)
+        state.step(moves.moves[int(rng.integers(len(moves.moves)))])
+
+    state.log_n = 0
+    try:
+        F.encode(state, int(state.to_act))
+    except ValueError as exc:
+        assert "rebuild_log" in str(exc), exc
+    else:
+        raise AssertionError("an inconsistent log encoded without complaint")
+
+    state.rebuild_log()
+    obs = F.encode(state, int(state.to_act))
+    assert int(obs.history_len) == 8
+    print("    inconsistent log refused; rebuilt log encodes 8 plays")
 
 
 if __name__ == "__main__":

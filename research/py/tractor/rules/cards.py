@@ -151,7 +151,15 @@ class Ctx:
     rather than a 2-D array.
     """
 
-    __slots__ = ("level_rank", "trump_suit", "cid", "eff", "strength", "is_trump")
+    __slots__ = (
+        "level_rank",
+        "trump_suit",
+        "cid",
+        "eff",
+        "strength",
+        "is_trump",
+        "suit_mask",
+    )
 
     def __init__(self, level_rank: int, trump_suit: int) -> None:
         if not 0 <= level_rank < NUM_RANKS:
@@ -164,6 +172,14 @@ class Ctx:
         self.eff: np.ndarray = EFF_SUIT[self.cid]
         self.strength: np.ndarray = STRENGTH[self.cid]
         self.is_trump: np.ndarray = IS_TRUMP[self.cid]
+        # One int8 row per effective suit, holding 1 where a card type
+        # belongs to it. Restricting a holding to a suit is then a
+        # multiply: the comparison it replaces is constant for the
+        # context, and the enumerator asks for it several times per
+        # decision.
+        self.suit_mask: np.ndarray = np.stack(
+            [(self.eff == suit).astype(np.int8) for suit in range(NUM_SUITS + 1)]
+        )
 
     def __repr__(self) -> str:
         ts = "NT" if self.trump_suit == NO_TRUMP else SUIT_NAMES[self.trump_suit]

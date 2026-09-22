@@ -39,7 +39,15 @@ from ..rules.cards import (
     Ctx,
 )
 from ..rules.combos import covers, decompose, play_suit
-from ..sim.state import NUM_SEATS, PlayState, team_of
+from ..sim.state import (
+    LOG_PLAYER,
+    LOG_POSITION,
+    LOG_TRICK,
+    LOG_WON,
+    NUM_SEATS,
+    PlayState,
+    team_of,
+)
 
 # --- plane layout ---------------------------------------------------------
 
@@ -92,6 +100,16 @@ FOLLOW_FIELDS = slice(CTX_LEAD_SIZE, CONTEXT_DIM)
 
 # Tokens kept. A two-deck hand runs to a hundred plays, so the window
 # only ever slides for longer variants; the oldest fall off the front.
+_SUMMARY_SLOT = "history_summary"
+
+# _ROTATE[seat] lists the absolute seats in order of their offset from
+# `seat`, so a per-seat view of a per-seat table is one gather.
+_ROTATE = np.array(
+    [[(seat + rel) % NUM_SEATS for rel in range(NUM_SEATS)]
+     for seat in range(NUM_SEATS)],
+    dtype=np.intp,
+)
+
 MAX_HISTORY = 128
 
 HIST_SUMMARY = 0  # D_STATIC: sum of the static rows of the cards played
@@ -258,65 +276,80 @@ def plays_so_far(state: PlayState, seat: int) -> tuple[np.ndarray, np.ndarray]:
     """Every play of the hand, oldest first, seen from `seat`.
 
     Returns the cards as float32[n, 54] and the meta table as
-    int64[n, META_COLS]. One pass builds what the planes, the point
-    count and the history tokens all need; the alternative is three
-    walks over the same hundred plays.
+    int64[n, META_COLS]. Both come from the log the simulator maintains
+    as plays happen, so this is a slice and one vector subtraction
+    rather than a walk over the hand: the encoder runs once per
+    decision, and rebuilding a list that grows by one row each time is
+    quadratic in the length of a hand.
+
+    The cards are returned as a read-only view of the simulator's own
+    buffer. Callers read them into planes, a point total and the history
+    tokens, none of which write back, and the flag makes an attempt to
+    do so an error rather than a corrupted game.
 
     Plays in the trick still in progress carry the index of the trick
     that has not closed and a zero won-flag, because the trick is
     undecided. A token is therefore final from the moment its trick
-    closes, which is what lets a caller keep a prefix and append.
+    closes, which is what lets the history cache keep a prefix.
     """
-    plays: list[np.ndarray] = []
-    meta: list[tuple[int, int, int, int]] = []
-
-    for index, trick in enumerate(state.tricks):
-        leader = trick.leader
-        winner = trick.winner
-        for i, play in enumerate(trick.plays):
-            player = (leader + i) % NUM_SEATS
-            plays.append(play)
-            meta.append(
-                ((player - seat) % NUM_SEATS, index, i, int(player == winner))
-            )
-    index = len(state.tricks)
-    for i, play in enumerate(state.trick_plays):
-        player = (state.trick_leader + i) % NUM_SEATS
-        plays.append(play)
-        meta.append(((player - seat) % NUM_SEATS, index, i, 0))
-
-    if not plays:
-        return (
-            np.zeros((0, NUM_TYPES), dtype=np.float32),
-            np.zeros((0, META_COLS), dtype=np.int64),
+    n = state.log_n
+    # A closed trick holds one play per seat, so the log's length is
+    # known from the trick records alone. Checking it costs two calls
+    # to len() and turns "this state never had its log built" from an
+    # empty history and a hand of phantom unseen cards into an error.
+    expected = NUM_SEATS * len(state.tricks) + len(state.trick_plays)
+    if n != expected:
+        raise ValueError(
+            f"play log holds {n} rows, the position has {expected}; "
+            "a state assembled without step() needs rebuild_log()"
         )
-    return np.array(plays, dtype=np.float32), np.array(meta, dtype=np.int64)
+    counts = state.log_counts[:n]
+    counts.flags.writeable = False
+
+    meta = np.empty((n, META_COLS), dtype=np.int64)
+    if n:
+        src = state.log_meta[:n]
+        # The log stores the player absolutely so that one copy serves
+        # all four seats; only this column differs between readers.
+        meta[:, META_SEAT] = (src[:, LOG_PLAYER] - seat) % NUM_SEATS
+        meta[:, META_TRICK] = src[:, LOG_TRICK]
+        meta[:, META_POSITION] = src[:, LOG_POSITION]
+        meta[:, META_WON] = src[:, LOG_WON]
+    return counts, meta
 
 
-def _points_played(counts: np.ndarray) -> float:
-    """Points on the table, from the stacked plays."""
-    if counts.shape[0] == 0:
-        return 0.0
-    return float(counts.sum(axis=0) @ _POINTS_F)
+def _points_played(state: PlayState) -> float:
+    """Points on the table.
+
+    Read from the running per-type total the simulator keeps, rather
+    than reduced over every play of the hand on each call.
+    """
+    return float(state.played_total @ _POINTS_F)
 
 
-def _planes_from_plays(
-    state: PlayState, seat: int, counts: np.ndarray, meta: np.ndarray
-) -> np.ndarray:
+def _planes_from_plays(state: PlayState, seat: int) -> np.ndarray:
+    """int8[NUM_PLANES, 54], read from the totals the simulator keeps.
+
+    The completed-trick planes change only when a trick closes, and the
+    simulator accumulates them as that happens, so this copies four
+    rows rather than scattering every play of the hand into its plane.
+    The trick in progress holds at most four plays and is written
+    directly.
+    """
     planes = np.zeros((NUM_PLANES, NUM_TYPES), dtype=np.int8)
     planes[PLANE_HAND] = state.hands[seat]
-    n = counts.shape[0]
-    if n:
-        # Scatter by matrix product: an [8, n] selector drops each play
-        # into its plane in one pass. Counts never exceed num_decks, so
-        # the float32 arithmetic is exact.
-        open_trick = meta[:, META_TRICK] >= len(state.tricks)
-        slot = meta[:, META_SEAT] + np.where(
-            open_trick, PLANE_TRICK - PLANE_PLAYED, 0
-        )
-        select = np.zeros((PLANE_KITTY - PLANE_PLAYED, n), dtype=np.float32)
-        select[slot, np.arange(n)] = 1.0
-        planes[PLANE_PLAYED:PLANE_KITTY] = (select @ counts).astype(np.int8)
+
+    # One gather rather than four assignments: at this size the
+    # per-call overhead of a numpy operation is the whole cost, so the
+    # count of operations is what to minimise.
+    planes[PLANE_PLAYED : PLANE_PLAYED + NUM_SEATS] = state.played_by_seat[
+        _ROTATE[seat]
+    ]
+
+    for i, play in enumerate(state.trick_plays):
+        player = (state.trick_leader + i) % NUM_SEATS
+        planes[PLANE_TRICK + (player - seat) % NUM_SEATS] = play
+
     if seat == state.landlord:
         planes[PLANE_KITTY] = state.kitty
     return planes
@@ -329,8 +362,7 @@ def card_planes(state: PlayState, seat: int) -> np.ndarray:
     relative seat, planes 5..8 the plays in the trick in progress, and
     plane 9 my burial -- all zeros unless I am the landlord.
     """
-    counts, meta = plays_so_far(state, seat)
-    return _planes_from_plays(state, seat, counts, meta)
+    return _planes_from_plays(state, seat)
 
 
 def _suit_and_rank(
@@ -406,12 +438,10 @@ def _context_vector(
     out[CTX_LEVEL + ctx.level_rank] = 1.0
     out[CTX_TRUMP + ctx.trump_suit] = 1.0
 
-    # Recomputed from the trick records rather than read off the state:
-    # once the hand ends ``state.attacker_points`` has absorbed the
-    # kitty bonus, which a seat that did not bury it may not see.
-    attacker_points = sum(
-        t.points for t in state.tricks if team_of(t.winner) != state.defenders
-    )
+    # Not ``state.attacker_points``: once the hand ends that has
+    # absorbed the kitty bonus, which a seat that did not bury the kitty
+    # may not see. The simulator keeps the trick-only total alongside it.
+    attacker_points = state.trick_points_attacker
     deck_points = POINTS_PER_DECK * state.num_decks
     out[CTX_ATTACKER_POINTS] = attacker_points / POINT_NORM
     out[CTX_UNPLAYED_POINTS] = (deck_points - points_played) / POINT_NORM
@@ -436,12 +466,46 @@ def context_vector(state: PlayState, seat: int) -> np.ndarray:
     The follow-only tail -- lead size, led suit, who is winning -- is
     zero on a lead.
     """
-    counts, _meta = plays_so_far(state, seat)
-    return _context_vector(state, seat, _points_played(counts))
+    return _context_vector(state, seat, _points_played(state))
+
+
+def _play_summaries(
+    state: PlayState, counts: np.ndarray, static: np.ndarray
+) -> np.ndarray:
+    """float32[n, D_STATIC]: each play's cards against the static block.
+
+    A play's summary is settled the moment the play is made -- it reads
+    the cards and a block that is constant for the hand's trump context
+    -- so it is computed once per play and kept, rather than once per
+    decision for every play so far. The product is small enough that
+    the library's own overhead dominates it: at a hundred plays the
+    whole matrix costs about 56 microseconds against roughly one for a
+    single row, so recomputing it each decision cost more than the rest
+    of the encoder together.
+    """
+    n = counts.shape[0]
+    slot = state.scratch.get(_SUMMARY_SLOT)
+    # Keyed by the block itself: a state carries one trump context for
+    # its whole life, so this only ever rejects a slot left by a caller
+    # that swapped the features underneath it.
+    if slot is None or slot[0] is not static or slot[1].shape[0] < n:
+        buf = np.zeros((max(n, state.log_counts.shape[0]), D_STATIC),
+                       dtype=np.float32)
+        slot = (static, buf, 0)
+    static_block, buf, filled = slot
+    # The mark cannot outrun the log. A log only ever grows under
+    # `step`, but a caller that rewound one would otherwise be served
+    # summaries of plays that are no longer there, and the rows would
+    # look valid.
+    filled = min(filled, n)
+    if n > filled:
+        buf[filled:n] = counts[filled:n] @ static_block
+    state.scratch[_SUMMARY_SLOT] = (static_block, buf, n)
+    return buf[:n]
 
 
 def _history_tokens(
-    counts: np.ndarray, meta: np.ndarray, static: np.ndarray
+    state: PlayState, counts: np.ndarray, meta: np.ndarray, static: np.ndarray
 ) -> tuple[np.ndarray, int]:
     """float32[MAX_HISTORY, HISTORY_DIM] and the number of rows filled.
 
@@ -451,7 +515,8 @@ def _history_tokens(
     carrying it would mean something different each time it was read.
     """
     tokens = np.zeros((MAX_HISTORY, HISTORY_DIM), dtype=np.float32)
-    kept = min(counts.shape[0], MAX_HISTORY)
+    total = counts.shape[0]
+    kept = min(total, MAX_HISTORY)
     if kept == 0:
         return tokens, 0
 
@@ -459,7 +524,8 @@ def _history_tokens(
     info = meta[-kept:]
     rows = np.arange(kept)
 
-    tokens[:kept, HIST_SUMMARY : HIST_SUMMARY + D_STATIC] = recent @ static
+    summary = _play_summaries(state, counts, static)
+    tokens[:kept, HIST_SUMMARY : HIST_SUMMARY + D_STATIC] = summary[total - kept :]
     tokens[rows, HIST_SEAT + info[:, META_SEAT]] = 1.0
     tokens[:kept, HIST_TRICK] = info[:, META_TRICK] / MAX_TRICKS
     tokens[:kept, HIST_POSITION] = info[:, META_POSITION] / NUM_SEATS
@@ -515,13 +581,13 @@ def encode(state: PlayState, seat: int, cache: Cache | None = None) -> Observati
     static = cache.static_card_features(state.ctx, state.num_decks)
 
     counts, meta = plays_so_far(state, seat)
-    planes = _planes_from_plays(state, seat, counts, meta)
+    planes = _planes_from_plays(state, seat)
     unseen = state.unseen_from(seat)
     cards = card_features(
         planes[PLANE_HAND], unseen, state.ctx, state.num_decks, static
     )
-    context = _context_vector(state, seat, _points_played(counts))
-    history, length = _history_tokens(counts, meta, static)
+    context = _context_vector(state, seat, _points_played(state))
+    history, length = _history_tokens(state, counts, meta, static)
 
     return Observation(
         seat=seat,

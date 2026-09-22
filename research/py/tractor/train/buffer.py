@@ -134,6 +134,11 @@ def _check_layout() -> None:
 _check_layout()
 
 
+# The two ObsBatch fields that are not float32: everything else is
+# promoted after the move to the device.
+_OBS_NON_FLOAT = frozenset({"history_len", "candidate_mask"})
+
+
 def obs_batch_from_arrays(
     history: np.ndarray,
     history_len: np.ndarray,
@@ -153,24 +158,38 @@ def obs_batch_from_arrays(
     ``ObsBatch`` order on purpose: a caller that passes them by keyword
     is protected by the names, one that passes them positionally is
     protected by this function being the only place it happens.
+
+    The promotion happens after the move rather than before it. Widening
+    float16 to float32 is exact, so the values are the same either way,
+    but done on the host it is the single most expensive thing here --
+    about 10 ms for a batch of 256 -- and it doubles what crosses the
+    bus. On the device it is a bandwidth-bound kernel over data that is
+    already there.
     """
     batch = ObsBatch(
-        history=torch.from_numpy(np.ascontiguousarray(history, dtype=np.float32)),
+        history=torch.from_numpy(np.ascontiguousarray(history)),
         history_len=torch.from_numpy(
             np.ascontiguousarray(history_len, dtype=np.int64)
         ),
-        context=torch.from_numpy(np.ascontiguousarray(context, dtype=np.float32)),
-        unseen=torch.from_numpy(np.ascontiguousarray(unseen, dtype=np.float32)),
-        planes=torch.from_numpy(np.ascontiguousarray(planes, dtype=np.float32)),
-        cards=torch.from_numpy(np.ascontiguousarray(cards, dtype=np.float32)),
-        candidates=torch.from_numpy(
-            np.ascontiguousarray(candidates, dtype=np.float32)
-        ),
+        context=torch.from_numpy(np.ascontiguousarray(context)),
+        unseen=torch.from_numpy(np.ascontiguousarray(unseen)),
+        planes=torch.from_numpy(np.ascontiguousarray(planes)),
+        cards=torch.from_numpy(np.ascontiguousarray(cards)),
+        candidates=torch.from_numpy(np.ascontiguousarray(candidates)),
         candidate_mask=torch.from_numpy(
             np.ascontiguousarray(candidate_mask, dtype=bool)
         ),
     )
-    return batch if device is None else batch.to(device)
+    if device is not None:
+        batch = batch.to(device)
+    # `float()` returns the tensor unchanged when it is already float32,
+    # so a caller that handed in float32 pays nothing for this.
+    return ObsBatch(
+        *(
+            tensor if name in _OBS_NON_FLOAT else tensor.float()
+            for name, tensor in zip(ObsBatch._fields, batch)
+        )
+    )
 
 
 class RolloutBuffer:

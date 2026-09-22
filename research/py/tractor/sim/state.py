@@ -30,6 +30,15 @@ from .actions import MoveSet, legal_leads, legal_follows
 
 NUM_SEATS = 4
 
+# Columns of `PlayState.log_meta`. The player is absolute, so one log
+# answers for every seat; a reader wanting it relative subtracts its own
+# seat, which is one vector operation rather than a rebuild.
+LOG_PLAYER = 0
+LOG_TRICK = 1
+LOG_POSITION = 2
+LOG_WON = 3
+LOG_COLS = 4
+
 
 def team_of(seat: int) -> int:
     return seat % 2
@@ -58,6 +67,45 @@ class PlayState:
     last_forced_lead: np.ndarray | None  # cards revealed by a blocked throw
     done: bool
 
+    # The plays of the hand in the flat shape every consumer wants, kept
+    # up to date as they happen. `tricks` already holds this information,
+    # but reading it costs a walk over every play of the hand, and the
+    # encoder reads it once per decision -- quadratic in the length of a
+    # hand, for a quantity that grows by one row at a time.
+    #
+    # `log_meta` columns are (player, trick, position within trick, won),
+    # with the player absolute rather than relative to any seat, so one
+    # log serves all four. The won flag is 0 while a trick is open and is
+    # written for the whole trick when it closes, which is the only
+    # retrospective edit the log ever makes.
+    played_total: np.ndarray  # int16[54], every card on the table
+    log_counts: np.ndarray  # float32[cap, 54]
+    log_meta: np.ndarray  # int64[cap, 4]
+    log_n: int
+
+    # Attacking points won in tricks, with no kitty bonus in it. The
+    # bonus lands in `attacker_points` when the hand ends, and a seat
+    # that did not bury the kitty cannot see it, so an observation
+    # needs the figure without it. Kept rather than summed over the
+    # tricks on demand, the encoder asking once per decision.
+    trick_points_attacker: int
+
+    # Cards each seat has played in tricks that have closed, indexed by
+    # absolute seat. The trick in progress is not in here: a play joins
+    # it when its trick closes, which is the same boundary the
+    # observation's plane layout draws.
+    played_by_seat: np.ndarray  # int16[4, 54]
+
+    # Scratch space for consumers that derive per-play values from the
+    # log and want to keep them. The simulator writes nothing here and
+    # reads nothing from it; it exists because a derived value that is
+    # final once its play is made -- a feature summary, say -- has
+    # nowhere else to live that survives one hand and not the next,
+    # several hands being in flight at once. `clone` starts a fresh one
+    # rather than copying, so a cached value can assume it describes
+    # the history of the state holding it.
+    scratch: dict
+
     # --- construction -----------------------------------------------------
 
     @staticmethod
@@ -68,6 +116,10 @@ class PlayState:
         landlord: int,
         num_decks: int = 2,
     ) -> "PlayState":
+        # A play is at least one card, so the hand cannot produce more
+        # plays than it holds cards. Sizing the log to that bound means
+        # it is written into and never grown.
+        cap = int(np.asarray(hands).sum())
         return PlayState(
             ctx=ctx,
             num_decks=num_decks,
@@ -81,6 +133,13 @@ class PlayState:
             tricks=[],
             last_forced_lead=None,
             done=False,
+            played_total=np.zeros(NUM_TYPES, dtype=np.int16),
+            log_counts=np.zeros((cap, NUM_TYPES), dtype=np.float32),
+            log_meta=np.zeros((cap, LOG_COLS), dtype=np.int64),
+            log_n=0,
+            trick_points_attacker=0,
+            played_by_seat=np.zeros((NUM_SEATS, NUM_TYPES), dtype=np.int16),
+            scratch={},
         )
 
     def clone(self) -> "PlayState":
@@ -99,6 +158,13 @@ class PlayState:
             if self.last_forced_lead is None
             else self.last_forced_lead.copy(),
             done=self.done,
+            played_total=self.played_total.copy(),
+            log_counts=self.log_counts.copy(),
+            log_meta=self.log_meta.copy(),
+            log_n=self.log_n,
+            trick_points_attacker=self.trick_points_attacker,
+            played_by_seat=self.played_by_seat.copy(),
+            scratch={},
         )
 
     # --- queries ----------------------------------------------------------
@@ -111,17 +177,70 @@ class PlayState:
     def defenders(self) -> int:
         return team_of(self.landlord)
 
+    def rebuild_log(self) -> None:
+        """Recompute the play log from `tricks` and `trick_plays`.
+
+        `step` maintains the log, so a state that reached its position
+        by playing never needs this. A state assembled some other way --
+        a test fixture setting `tricks` directly, a position loaded from
+        elsewhere -- has a log that does not describe it, and every
+        consumer of the log would silently see an empty hand. Call this
+        after building a state by hand.
+        """
+        rows = sum(len(t.plays) for t in self.tricks) + len(self.trick_plays)
+        # Room for the plays still to come, not merely for the ones
+        # already made. `new` sizes the buffer from the cards dealt,
+        # which bounds the whole hand; rebuilding from a position has
+        # to re-establish that bound or the next `step` writes past the
+        # end -- and it would do so several plays later, far from here.
+        needed = rows + int(self.hands.sum())
+        if needed > self.log_counts.shape[0]:
+            self.log_counts = np.zeros((needed, NUM_TYPES), dtype=np.float32)
+            self.log_meta = np.zeros((needed, LOG_COLS), dtype=np.int64)
+        self.played_total = np.zeros(NUM_TYPES, dtype=np.int16)
+        self.trick_points_attacker = sum(
+            t.points for t in self.tricks if team_of(t.winner) != self.defenders
+        )
+        self.played_by_seat = np.zeros((NUM_SEATS, NUM_TYPES), dtype=np.int16)
+        for trick in self.tricks:
+            for i, play in enumerate(trick.plays):
+                self.played_by_seat[(trick.leader + i) % NUM_SEATS] += play
+        # Anything derived from the old log describes a different hand.
+        self.scratch.clear()
+
+        row = 0
+        for index, trick in enumerate(self.tricks):
+            for i, play in enumerate(trick.plays):
+                player = (trick.leader + i) % NUM_SEATS
+                self.log_counts[row] = play
+                self.log_meta[row, LOG_PLAYER] = player
+                self.log_meta[row, LOG_TRICK] = index
+                self.log_meta[row, LOG_POSITION] = i
+                self.log_meta[row, LOG_WON] = int(player == trick.winner)
+                self.played_total += play
+                row += 1
+        index = len(self.tricks)
+        for i, play in enumerate(self.trick_plays):
+            player = (self.trick_leader + i) % NUM_SEATS
+            self.log_counts[row] = play
+            self.log_meta[row, LOG_PLAYER] = player
+            self.log_meta[row, LOG_TRICK] = index
+            self.log_meta[row, LOG_POSITION] = i
+            self.log_meta[row, LOG_WON] = 0
+            self.played_total += play
+            row += 1
+        self.log_n = row
+
     def unseen_from(self, seat: int) -> np.ndarray:
         """Cards `seat` has not seen: the deck less its hand, less every
-        card played, less the kitty when the seat buried it."""
-        seen = self.hands[seat].astype(np.int16).copy()
-        for trick in self.tricks:
-            for play in trick.plays:
-                seen += play
-        for play in self.trick_plays:
-            seen += play
+        card played, less the kitty when the seat buried it.
+
+        The played total is maintained by `step`, so this costs three
+        vector operations rather than a walk over the hand's history.
+        """
+        seen = self.hands[seat].astype(np.int16) + self.played_total
         if seat == self.landlord:
-            seen += self.kitty
+            seen = seen + self.kitty
         out = np.full(NUM_TYPES, self.num_decks, dtype=np.int16) - seen
         return np.maximum(out, 0).astype(np.int8)
 
@@ -181,7 +300,18 @@ class PlayState:
                 )
 
         self.hands[seat] -= cards
+        position = len(self.trick_plays)
         self.trick_plays.append(cards)
+
+        row = self.log_n
+        self.log_counts[row] = cards
+        self.log_meta[row, LOG_PLAYER] = seat
+        self.log_meta[row, LOG_TRICK] = len(self.tricks)
+        self.log_meta[row, LOG_POSITION] = position
+        self.log_meta[row, LOG_WON] = 0
+        self.log_n = row + 1
+        self.played_total += cards
+
         if len(self.trick_plays) < NUM_SEATS:
             self.to_act = (seat + 1) % NUM_SEATS
             return cards
@@ -277,9 +407,20 @@ class PlayState:
         points = sum(total_points(p) for p in self.trick_plays)
         if team_of(winner) != self.defenders:
             self.attacker_points += points
+            self.trick_points_attacker += points
         self.tricks.append(
             TrickRecord(self.trick_leader, list(self.trick_plays), winner, points)
         )
+
+        # The only retrospective edit the log makes: the four rows of
+        # the trick just closed learn who took it.
+        first = self.log_n - NUM_SEATS
+        assert first >= 0, f"trick closed with only {self.log_n} plays logged"
+        rows = self.log_meta[first : self.log_n]
+        rows[:, LOG_WON] = (rows[:, LOG_PLAYER] == winner).astype(np.int64)
+
+        for i, play in enumerate(self.trick_plays):
+            self.played_by_seat[(self.trick_leader + i) % NUM_SEATS] += play
 
         self.trick_plays = []
         self.trick_leader = winner

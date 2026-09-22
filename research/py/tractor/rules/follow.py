@@ -49,7 +49,7 @@ def lead_obligations(
 
 def restrict(counts: np.ndarray, ctx: Ctx, suit: int) -> np.ndarray:
     """The part of a holding that lies in one effective suit."""
-    return np.where(ctx.eff == suit, counts, 0).astype(np.int8)
+    return counts * ctx.suit_mask[suit]
 
 
 def count_pairs(counts: np.ndarray, num_decks: int) -> int:
