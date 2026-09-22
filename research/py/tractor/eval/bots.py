@@ -69,6 +69,45 @@ __all__ = ["play_against_bot", "state_from_wire"]
 REPO = Path(__file__).resolve().parents[4]
 HOST = REPO / "research" / "src" / "evalhost.ts"
 
+# The opponents a checkpoint is measured against, cheapest first.
+#
+# One rung cannot tell saturation from a plateau: a policy that has
+# stopped improving and a policy whose opponent is too weak to separate
+# look identical against that opponent, and different across a ladder --
+# the plateau is flat everywhere, the saturation only flat at the easy
+# end. This run showed exactly that, reading as a plateau against random
+# play while sitting within noise of the strongest bot.
+#
+# The order is load bearing. Per decision, measured: the first eight
+# rungs cost 12 to 18 milliseconds, smart-v9 costs 93, and the rungs
+# that search cost 560 to 670 -- a factor of fifty. A measurement cut
+# short by its budget therefore still returns the cheap end, which is
+# the half that runs every time.
+LADDER: tuple[str, ...] = (
+    "random",
+    "lowball",
+    "point-hoarder",
+    "aggressive",
+    "smart",
+    "smart-v2",
+    "smart-v4",
+    "smart-v9",
+    "smart-v18",
+    "smart-v28",
+    "smart-v34",
+)
+
+
+def resolve_bots(names: Sequence[str]) -> tuple[str, ...]:
+    """Expand the name ``ladder`` to the rungs; pass anything else through."""
+    out: list[str] = []
+    for name in names:
+        if name == "ladder":
+            out.extend(r for r in LADDER if r not in out)
+        elif name not in out:
+            out.append(name)
+    return tuple(out)
+
 # Which team the network holds in each half. Half 0 seats it on 0 and 2,
 # half 1 on 1 and 3; ``team_of`` is the authority on which team that is,
 # and each half is one whole team so "the network's result" is a single

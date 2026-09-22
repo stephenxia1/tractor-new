@@ -498,5 +498,64 @@ def main() -> int:
     return 1 if failed else 0
 
 
+def test_the_ladder_resolves_and_dedupes() -> None:
+    """`ladder` expands to the rungs; anything else passes through."""
+    from ..eval.bots import LADDER, resolve_bots
+
+    assert resolve_bots(["ladder"]) == LADDER
+    # An explicit name keeps its place and is not repeated by the ladder.
+    got = resolve_bots(["lowball", "ladder"])
+    assert got[0] == "lowball"
+    assert len(got) == len(LADDER)
+    assert len(set(got)) == len(got)
+    # A name outside the ladder is still measured.
+    assert "smart-v31" in resolve_bots(["ladder", "smart-v31"])
+    print(f"    {len(LADDER)} rungs, resolution dedupes and preserves order")
+
+
+def test_the_ladder_runs_cheapest_first() -> None:
+    """The order is what makes a truncated measurement useful.
+
+    Measured per decision: the heuristic rungs cost 12 to 18
+    milliseconds, smart-v9 costs 93, and the rungs that search cost 560
+    to 670. A budget that runs out must therefore leave the expensive
+    end unmeasured, not the cheap end.
+    """
+    from ..eval.bots import LADDER
+
+    cheap = ("random", "lowball", "point-hoarder", "aggressive")
+    dear = ("smart-v9", "smart-v18", "smart-v28", "smart-v34")
+    last_cheap = max(LADDER.index(b) for b in cheap if b in LADDER)
+    first_dear = min(LADDER.index(b) for b in dear if b in LADDER)
+    assert last_cheap < first_dear, LADDER
+    print("    cheap rungs precede every rung that searches")
+
+
+def test_a_budget_leaves_the_expensive_end_unmeasured() -> None:
+    """A truncated ladder says so, rather than reading as a full one."""
+    import time as _time
+
+    from ..train.evaluate import evaluate_against_bots
+
+    cfg = _tiny()
+    net = ActorCritic(cfg)
+    started = _time.perf_counter()
+    out = evaluate_against_bots(
+        net, ["ladder"], "cpu", cfg, num_deals=2, seed=5, workers=4,
+        budget_s=20.0,
+    )
+    elapsed = _time.perf_counter() - started
+    run = out["ladder/rungs_run"]
+    skipped = out["ladder/rungs_skipped"]
+    assert run >= 1, out
+    assert skipped >= 1, "the budget was too generous to test truncation"
+    from ..eval.bots import resolve_bots as _resolve
+    assert run + skipped == len(_resolve(["ladder"]))
+    # Whatever ran must be from the cheap end.
+    measured = {k.split("/")[0][3:] for k in out if k.startswith("vs_")}
+    assert "smart-v34" not in measured, measured
+    print(f"    ran {run:.0f} rungs, skipped {skipped:.0f}, in {elapsed:.0f}s")
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

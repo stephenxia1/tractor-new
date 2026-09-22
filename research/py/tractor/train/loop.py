@@ -82,6 +82,11 @@ class TrainConfig:
     # interval on a duplicate-paired score closes quickly enough that a
     # smaller set still separates one policy from another.
     eval_bot_deals: int = 24
+    # Wall-clock ceiling for one ladder measurement. The rungs run
+    # cheapest first, so a budget that runs out leaves the expensive end
+    # unmeasured rather than leaving a rung half done, and the row says
+    # how many were reached. None runs every rung however long it takes.
+    eval_bot_budget_s: float | None = 600.0
 
     checkpoint_dir: str = "checkpoints"
     keep_last: int = 3
@@ -246,6 +251,7 @@ def train(
                             num_deals=cfg.eval_bot_deals,
                             seed=cfg.eval_seed,
                             workers=cfg.eval_bot_workers,
+                            budget_s=cfg.eval_bot_budget_s,
                         )
                     )
 

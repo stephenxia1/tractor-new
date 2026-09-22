@@ -26,12 +26,13 @@ it; those do, and they are what the shipped game plays with.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Sequence
 
 import numpy as np
 import torch
 
-from ..eval.bots import play_against_bot
+from ..eval.bots import LADDER, play_against_bot, resolve_bots
 from ..eval.duplicate import Policy, PolicyFactory, compare, uniform_random_policy
 from ..nn.features import Cache
 from ..nn.model import ModelConfig
@@ -156,6 +157,7 @@ def evaluate_against_bots(
     max_candidates: int = 128,
     node: str | Sequence[str] | None = None,
     workers: int = 1,
+    budget_s: float | None = None,
 ) -> dict[str, float]:
     """Score ``net`` against each of the engine's heuristic ``bots``.
 
@@ -173,8 +175,16 @@ def evaluate_against_bots(
     decision at a time, so this belongs on the same schedule as
     `evaluate` rather than beside it every step.
     """
+    rungs = resolve_bots(bots)
     out: dict[str, float] = {}
-    for bot in bots:
+    started = time.perf_counter()
+    run = 0
+    for bot in rungs:
+        # Checked before each rung rather than during one: a rung is the
+        # unit that produces a number, and half of one is not a cheaper
+        # measurement, it is no measurement.
+        if budget_s is not None and time.perf_counter() - started >= budget_s:
+            break
         scores = play_against_bot(
             net,
             bot,
@@ -187,4 +197,10 @@ def evaluate_against_bots(
             workers=workers,
         )
         out.update({f"vs_{bot}/{key}": value for key, value in scores.items()})
+        run += 1
+    # Which rungs were reached is part of the measurement: a ladder that
+    # silently stopped at the cheap end reads as a strong result.
+    out["ladder/rungs_run"] = float(run)
+    out["ladder/rungs_skipped"] = float(len(rungs) - run)
+    out["ladder/seconds"] = time.perf_counter() - started
     return out

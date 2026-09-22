@@ -188,7 +188,8 @@ def launch(steps: int = 2500, hands: int = 128, name: str = "run",
            gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
            eval_every: int = 250, eval_deals: int = 96,
            eval_bots: str = "", eval_bot_deals: int = 24,
-           eval_bot_workers: int = 8, checkpoint_every: int = 125,
+           eval_bot_workers: int = 8, eval_bot_budget_s: float = 600.0,
+           checkpoint_every: int = 125,
            keep_last: int = 24, anneal_steps: int = 400) -> None:
     """Submit a run and return, rather than waiting on it.
 
@@ -213,8 +214,10 @@ def launch(steps: int = 2500, hands: int = 128, name: str = "run",
             "eval_bots": _bot_list(eval_bots),
         "eval_bot_deals": eval_bot_deals,
         "eval_bot_workers": eval_bot_workers,
+        "eval_bot_budget_s": eval_bot_budget_s,
             "eval_bot_deals": eval_bot_deals,
             "eval_bot_workers": eval_bot_workers,
+            "eval_bot_budget_s": eval_bot_budget_s,
             "checkpoint_every": checkpoint_every,
             "keep_last": keep_last,
             "anneal_steps": anneal_steps,
@@ -230,6 +233,7 @@ def main(steps: int = 1000, hands: int = 64, name: str = "run",
          gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
          eval_every: int = 0, eval_deals: int = 64, eval_bots: str = "",
          eval_bot_deals: int = 24, eval_bot_workers: int = 8,
+         eval_bot_budget_s: float = 600.0,
          checkpoint_every: int = 50, keep_last: int = 3,
          anneal_steps: int = 400) -> None:
     import json
