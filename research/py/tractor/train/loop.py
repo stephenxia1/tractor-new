@@ -131,8 +131,16 @@ def train(
     device: torch.device | str = "cpu",
     run: Any = None,
     resume: str | Path | None = None,
+    on_checkpoint: Any = None,
 ) -> dict:
-    """Run `cfg.total_steps` learner steps. Returns a summary dict."""
+    """Run `cfg.total_steps` learner steps. Returns a summary dict.
+
+    `on_checkpoint` is called with the path just written, and is where
+    a caller whose storage needs an explicit flush performs it. A run
+    measured in hours that only persists when it returns has no
+    checkpoints at all until it does, which is the wrong way round:
+    they exist so that the hours are not lost.
+    """
     device = torch.device(device)
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
@@ -238,12 +246,18 @@ def train(
         last = row
 
         if cfg.checkpoint_every and (step + 1) % cfg.checkpoint_every == 0:
-            save_checkpoint(
+            written = save_checkpoint(
                 ckpt_dir / f"step_{step + 1:07d}.pt", net, learner, step + 1, cfg
             )
             _prune(ckpt_dir, cfg.keep_last)
+            if on_checkpoint is not None:
+                on_checkpoint(written)
 
-    save_checkpoint(ckpt_dir / "final.pt", net, learner, cfg.total_steps, cfg)
+    final = save_checkpoint(
+        ckpt_dir / "final.pt", net, learner, cfg.total_steps, cfg
+    )
+    if on_checkpoint is not None:
+        on_checkpoint(final)
     summary = {
         "steps": cfg.total_steps - start,
         "wall_s": time.perf_counter() - started,

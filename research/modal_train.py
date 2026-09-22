@@ -85,8 +85,17 @@ def _train(steps: int, hands: int, name: str, gpu_label: str,
         enabled=enabled,
         jsonl=f"{VOLUME}/{name}/metrics.jsonl",
     ) as run:
+        def _flush(path) -> None:
+            # Modal volumes persist on an explicit commit, so a long
+            # run that only committed on return would keep nothing if
+            # it were interrupted at hour seventeen.
+            try:
+                volume.commit()
+            except Exception as exc:  # pragma: no cover
+                print(f"modal_train: volume commit failed ({exc})")
+
         out = train(cfg, device=device, run=run,
-                    resume=resume or None)
+                    resume=resume or None, on_checkpoint=_flush)
     volume.commit()
     out["device"] = device
     return out
