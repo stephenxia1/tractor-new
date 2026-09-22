@@ -126,7 +126,8 @@ def smoke() -> None:
 def main(steps: int = 1000, hands: int = 64, name: str = "run",
          gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
          eval_every: int = 0, eval_deals: int = 64,
-         checkpoint_every: int = 50) -> None:
+         checkpoint_every: int = 50, keep_last: int = 3,
+         anneal_steps: int = 400) -> None:
     import json
 
     fn = {"a10g": train_a10g, "a100": train_a100}[gpu.lower()]
@@ -134,6 +135,8 @@ def main(steps: int = 1000, hands: int = 64, name: str = "run",
         "eval_every": eval_every,
         "eval_deals": eval_deals,
         "checkpoint_every": checkpoint_every,
+        "keep_last": keep_last,
+        "anneal_steps": anneal_steps,
     }
     print(json.dumps(
         fn.remote(steps, hands, name, wandb_on, resume, overrides),
