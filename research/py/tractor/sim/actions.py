@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..rules.cards import NUM_TYPES, TRUMP, Ctx
+from ..rules.cards import Ctx, MAX_STRENGTH, NUM_TYPES, TRUMP
 from ..rules.combos import NKIND, SINGLE, TRACTOR, Component, _runs, paired_rungs
 from ..rules.follow import (
     Obligations,
@@ -186,6 +186,68 @@ def _components_in_suit(
     return out
 
 
+class SuitBeaters:
+    """What can beat a component in one suit, computed once per suit.
+
+    Every component of a suit is judged against the same unseen cards,
+    so the quantities that depend only on the suit belong here rather
+    than in each component's test. For singles and n-of-a-kinds that
+    turns two comparisons over 54 card types and a masked sum into an
+    index into a suffix table; for tractors it hoists the run
+    decomposition of the unseen holding out of the loop.
+
+    Each half is built on first use. Most suits are asked about only
+    one kind of component, and building both eagerly cost more than the
+    per-component work it replaced -- a suit holding no tractors was
+    paying for their run decomposition.
+    """
+
+    __slots__ = ("_suit", "_unseen", "_ctx", "_decks", "_above", "_runs")
+
+    def __init__(
+        self, suit: int, unseen: np.ndarray, ctx: Ctx, num_decks: int
+    ) -> None:
+        self._suit = suit
+        self._unseen = unseen
+        self._ctx = ctx
+        self._decks = num_decks
+        self._above: tuple[np.ndarray, np.ndarray] | None = None
+        self._runs: list[tuple[int, int]] | None = None
+
+    def _in_suit(self) -> np.ndarray:
+        return (self._unseen * self._ctx.suit_mask[self._suit]).astype(np.int8)
+
+    def above(self, kind: int, top: int) -> int:
+        """Unseen singles, or n-of-a-kinds, ranking above `top`."""
+        if self._above is None:
+            in_suit = self._in_suit()
+            strength = self._ctx.strength
+            singles = np.zeros(MAX_STRENGTH + 2, dtype=np.int64)
+            nkinds = np.zeros(MAX_STRENGTH + 2, dtype=np.int64)
+            for t in np.nonzero(in_suit)[0]:
+                count = int(in_suit[t])
+                singles[int(strength[t])] += count
+                if count >= self._decks:
+                    nkinds[int(strength[t])] += 1
+            self._above = (
+                np.cumsum(singles[::-1])[::-1].copy(),
+                np.cumsum(nkinds[::-1])[::-1].copy(),
+            )
+        if top >= MAX_STRENGTH:
+            return 0
+        singles, nkinds = self._above
+        return int(singles[top + 1] if kind == SINGLE else nkinds[top + 1])
+
+    @property
+    def runs(self) -> list[tuple[int, int]]:
+        """Runs of consecutively paired rungs among the unseen cards."""
+        if self._runs is None:
+            self._runs = list(
+                _runs(paired_rungs(self._in_suit(), self._ctx, self._decks))
+            )
+        return self._runs
+
+
 def component_status(
     comp: Component,
     suit: int,
@@ -193,6 +255,7 @@ def component_status(
     ctx: Ctx,
     num_decks: int,
     kitty_slots: int,
+    beaters_in_suit: "SuitBeaters | None" = None,
 ) -> tuple[int, int]:
     """Is this component safe to throw, and how many beaters are unseen?
 
@@ -202,22 +265,25 @@ def component_status(
     the kitty can hold puts at least one in a hand. Multi-card beaters
     can also be neutralised by splitting across hands, so they never
     prove doom and only make the component uncertain.
+
+    `beaters_in_suit` is the suit's precomputed answer. It is optional
+    so that a caller asking about one component need not build it, and
+    the two paths are checked against each other in the tests.
     """
-    higher = (ctx.eff == suit) & (ctx.strength > comp.top)
+    table = beaters_in_suit or SuitBeaters(suit, unseen, ctx, num_decks)
     if comp.kind == SINGLE:
-        beaters = int(unseen[higher].sum())
+        beaters = table.above(SINGLE, comp.top)
         single_card_beaters = beaters
     elif comp.kind == NKIND:
-        beaters = int(np.count_nonzero(unseen[higher] >= num_decks))
+        beaters = table.above(NKIND, comp.top)
         single_card_beaters = 0
     else:
         # A tractor outranks this one when its *top* rung is higher; its
         # lower rungs may sit at or below `comp.top`. Masking the unseen
         # cards to strictly higher rungs first would hide exactly those,
         # and two holdings can share a rung on the off-suit level cards.
-        in_suit = np.where(ctx.eff == suit, unseen, 0).astype(np.int8)
         beaters = 0
-        for start, run_len in _runs(paired_rungs(in_suit, ctx, num_decks)):
+        for start, run_len in table.runs:
             for off in range(run_len - comp.length + 1):
                 if start + off + comp.length - 1 > comp.top:
                     beaters += 1
@@ -275,10 +341,21 @@ def legal_leads(
         # Throws: subsets of two or more components that are not
         # provably beaten, and that use each card at most as often as
         # the hand holds it.
+        # Only a single can be doomed. Doom requires more single-card
+        # beaters than the kitty can absorb, and a component that is
+        # not a single has none by definition: a pair or a tractor is
+        # beaten only by another pair or tractor, and those can always
+        # be neutralised by splitting across two hands instead. So the
+        # status of everything else is known without computing it, and
+        # the suit's beater table is built only if a single asks.
+        table = SuitBeaters(suit, unseen, ctx, num_decks)
         live = [
             (comp, cards)
             for comp, cards in pieces
-            if component_status(comp, suit, unseen, ctx, num_decks, kitty_slots)[0]
+            if comp.kind != SINGLE
+            or component_status(
+                comp, suit, unseen, ctx, num_decks, kitty_slots, table
+            )[0]
             != DOOMED
         ]
         if len(live) < 2:
@@ -300,29 +377,54 @@ def _emit_throws(
     offer,
     out: MoveSet,
 ) -> None:
-    seen: set[bytes] = set()
-    chosen: list[np.ndarray] = []
+    """Offer every subset of two or more components the hand can afford.
 
-    def rec(start: int, used: np.ndarray) -> None:
-        if len(chosen) >= 2:
-            cards = used.copy()
+    The capacity test runs on the card types a component actually
+    touches -- one for a single or an n-of-a-kind, a handful for a
+    tractor -- rather than over all 54. Phrased as whole-vector
+    arithmetic it allocated two temporaries and paid a dispatch per
+    node of the recursion, to answer a question about at most four
+    numbers.
+    """
+    seen: set[bytes] = set()
+    # (type, count) pairs per component, and the suit's capacity as a
+    # plain list: the recursion indexes these one element at a time,
+    # which is what Python lists are good at and numpy arrays are not.
+    items = [
+        [(int(t), int(cards[t])) for t in np.nonzero(cards)[0]]
+        for _comp, cards in live
+    ]
+    room = [int(v) for v in in_suit]
+    used = [0] * NUM_TYPES
+    depth = 0
+
+    def rec(start: int) -> None:
+        nonlocal depth
+        if depth >= 2:
+            cards = np.array(used, dtype=np.int8)
             key = cards.tobytes()
             if key not in seen:
                 seen.add(key)
                 if not offer(cards):
                     return
-        if len(chosen) >= max_components:
+        if depth >= max_components:
             # Deeper subsets exist and are legal leads; record that the
             # enumeration stopped rather than that it finished.
-            if len(live) > len(chosen):
+            if len(live) > depth:
                 out.unenumerated = True
             return
         for i in range(start, len(live)):
-            cards = live[i][1]
-            if np.any(used + cards > in_suit):
-                continue
-            chosen.append(cards)
-            rec(i + 1, (used + cards).astype(np.int8))
-            chosen.pop()
+            pairs = items[i]
+            for t, v in pairs:
+                if used[t] + v > room[t]:
+                    break
+            else:
+                for t, v in pairs:
+                    used[t] += v
+                depth += 1
+                rec(i + 1)
+                depth -= 1
+                for t, v in pairs:
+                    used[t] -= v
 
-    rec(0, np.zeros(NUM_TYPES, dtype=np.int8))
+    rec(0)

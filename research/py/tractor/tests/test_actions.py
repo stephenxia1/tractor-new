@@ -14,6 +14,8 @@ import numpy as np
 from tractor.rules import cards as C
 from tractor.rules import combos as K
 from tractor.rules import follow as F
+from tractor.gen.episode import generate
+from tractor.rules.combos import SINGLE
 from tractor.sim import actions as A
 
 DECKS = 2
@@ -185,6 +187,75 @@ def main() -> int:
             print(f"ok    {fn.__name__}  ({time.time() - started:.1f}s)")
     print(f"{len(fns) - failed}/{len(fns)} passed")
     return 1 if failed else 0
+
+
+def test_only_a_single_can_be_doomed() -> None:
+    """`legal_leads` skips the status of everything but a single.
+
+    Doom needs more single-card beaters than the kitty can absorb, and
+    a component that is not a single has none: a pair or a tractor is
+    beaten only by another pair or tractor, and those are neutralised
+    by splitting across two hands rather than by hiding in the kitty.
+    The enumerator relies on that to avoid asking, so the claim is
+    checked here rather than left as a comment.
+    """
+    rng = np.random.default_rng(31)
+    checked = 0
+    for _ in range(10):
+        state, _info = generate(rng, 2)
+        while not state.done:
+            seat = int(state.to_act)
+            unseen = state.unseen_from(seat)
+            for suit in range(5):
+                in_suit = A.restrict(state.hands[seat], state.ctx, suit)
+                if int(in_suit.sum()) == 0:
+                    continue
+                for comp, _cards in A._components_in_suit(in_suit, state.ctx, 2):
+                    if comp.kind == SINGLE:
+                        continue
+                    status, _b = A.component_status(
+                        comp, suit, unseen, state.ctx, 2, 8
+                    )
+                    assert status != A.DOOMED, (comp, suit)
+                    checked += 1
+            moves = state.legal_moves(cap=128)
+            state.step(moves.moves[int(rng.integers(len(moves.moves)))])
+    assert checked > 500, checked
+    print(f"    {checked} non-single components, none doomed")
+
+
+def test_the_suit_beater_table_matches_the_standalone_path() -> None:
+    """The hoisted table and the per-component path must agree.
+
+    `component_status` takes the table as an optional argument so that
+    a caller asking about one component need not build it. Two paths to
+    one answer is two chances to be wrong, so they are compared.
+    """
+    rng = np.random.default_rng(21)
+    checked = 0
+    for _ in range(8):
+        state, _info = generate(rng, 2)
+        while not state.done:
+            seat = int(state.to_act)
+            unseen = state.unseen_from(seat)
+            for suit in range(5):
+                in_suit = A.restrict(state.hands[seat], state.ctx, suit)
+                if int(in_suit.sum()) == 0:
+                    continue
+                table = A.SuitBeaters(suit, unseen, state.ctx, 2)
+                for comp, _cards in A._components_in_suit(in_suit, state.ctx, 2):
+                    alone = A.component_status(
+                        comp, suit, unseen, state.ctx, 2, 8
+                    )
+                    hoisted = A.component_status(
+                        comp, suit, unseen, state.ctx, 2, 8, table
+                    )
+                    assert alone == hoisted, (comp, suit, alone, hoisted)
+                    checked += 1
+            moves = state.legal_moves(cap=128)
+            state.step(moves.moves[int(rng.integers(len(moves.moves)))])
+    assert checked > 5000, checked
+    print(f"    {checked} components, both paths agree")
 
 
 if __name__ == "__main__":
