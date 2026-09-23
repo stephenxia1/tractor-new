@@ -167,6 +167,22 @@ def train_a100(steps: int, hands: int, name: str, wandb_on: bool,
     return _train(steps, hands, name, "A100-40GB", wandb_on, resume, overrides)
 
 
+@app.function(image=image, gpu="L40S", volumes={VOLUME: volume},
+              secrets=WANDB, timeout=86400, cpu=12.0, memory=65536)
+def train_l40s(steps: int, hands: int, name: str, wandb_on: bool,
+               resume: str, overrides: dict) -> dict:
+    """One step up from the A10G, and the step the bottleneck asks for.
+
+    A training step is about 82% accelerator: of 49.5 s measured at
+    1024 hands, the rollout's forward is 8.9 s and the update 31.8 s,
+    against 8.8 s of worker packing and transport. Both of the large
+    terms are the same network in bf16, where this card is nominally
+    about 2.9x the A10G, so it is the term worth buying down. The
+    twelve cores keep seven rollout workers fed beside it.
+    """
+    return _train(steps, hands, name, "L40S", wandb_on, resume, overrides)
+
+
 @app.function(image=image, gpu="A10G", volumes={VOLUME: volume},
               secrets=WANDB, timeout=3600, cpu=8.0, memory=32768)
 def train_smoke() -> dict:
@@ -185,7 +201,7 @@ def smoke() -> None:
 
 @app.local_entrypoint()
 def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
-           gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
+           gpu: str = "l40s", wandb_on: bool = True, resume: str = "",
            eval_every: int = 250, eval_deals: int = 96,
            eval_bots: str = "", eval_bot_deals: int = 24,
            eval_bot_workers: int = 8, eval_bot_budget_s: float = 600.0,
@@ -231,7 +247,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     Modal and exits, so nothing local can end it. Watch it with
     `modal app logs`, or on the run's Weights and Biases page.
     """
-    fn = {"a10g": train_a10g, "a100": train_a100}[gpu.lower()]
+    fn = {"a10g": train_a10g, "a100": train_a100,
+          "l40s": train_l40s}[gpu.lower()]
     call = fn.spawn(
         steps,
         hands,
@@ -273,7 +290,8 @@ def main(steps: int = 1000, hands: int = 64, name: str = "run",
          anneal_steps: int = 0, final_level_weight: float = 0.0) -> None:
     import json
 
-    fn = {"a10g": train_a10g, "a100": train_a100}[gpu.lower()]
+    fn = {"a10g": train_a10g, "a100": train_a100,
+          "l40s": train_l40s}[gpu.lower()]
     overrides = {
         "eval_every": eval_every,
         "eval_deals": eval_deals,

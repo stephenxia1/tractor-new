@@ -374,6 +374,30 @@ def train(
                 run.log(row)
             last = row
 
+            # One line per step on stdout. A detached run's only other
+            # channel is the JSONL on the volume, which becomes visible
+            # at checkpoints -- over an hour apart at this round size --
+            # and the question worth watching continuously is whether
+            # the accelerator is still what the step waits on.
+            #
+            # `gpu` is the forward plus the update over the step: both
+            # are the same network, and everything outside them is the
+            # simulator, the encoder and moving bytes. It is occupancy
+            # and not utilisation -- it says the device was busy, not
+            # that it was busy doing useful arithmetic.
+            gpu_s = row.get("span/forward", 0.0) + row.get("span/update", 0.0)
+            print(
+                f"[{step + 1}/{cfg.total_steps}] {step_s:5.1f}s"
+                f"  collect {row.get('span/collect', 0.0):5.1f}"
+                f" (fwd {row.get('span/forward', 0.0):4.1f})"
+                f"  update {row.get('span/update', 0.0):5.1f}"
+                f"  gpu {100.0 * gpu_s / max(step_s, 1e-9):4.1f}%"
+                f"  {row.get('decisions_per_s', 0.0):5.0f} dec/s"
+                f"  ev {metrics.get('explained_variance', float('nan')):+.3f}"
+                f"  lw {level_weight:.2f}",
+                flush=True,
+            )
+
             if cfg.checkpoint_every and (step + 1) % cfg.checkpoint_every == 0:
                 written = save_checkpoint(
                     ckpt_dir / f"step_{step + 1:07d}.pt", net, learner, step + 1, cfg
