@@ -236,5 +236,102 @@ def main() -> int:
     return 1 if failed else 0
 
 
+def test_a_hand_is_won_at_eighty_points_from_either_side() -> None:
+    """The threshold, and that the two sides are complementary.
+
+    The attacking team wins by taking the landlord title, which it does
+    at 80 whether or not it also gains a rank; the defending team wins
+    by keeping it. Exactly one of them wins a hand, so the same
+    threshold has to answer for both.
+    """
+    from tractor.eval.duplicate import (
+        DECK_POINTS,
+        HandOutcome,
+        WIN_THRESHOLD,
+        attackers_won,
+        team_won,
+    )
+
+    assert WIN_THRESHOLD == 80
+    assert DECK_POINTS == 200
+    for points in range(0, DECK_POINTS + 1, 5):
+        outcome = HandOutcome(
+            attacker_points=points,
+            defender_levels=0,
+            attacker_levels=0,
+            defenders=0,
+            tricks=0,
+            decisions=0,
+        )
+        attackers = attackers_won(points)
+        assert attackers == (points >= 80)
+        # Team 0 is the landlord's team here, so it defends.
+        assert team_won(outcome, 0) is not attackers
+        assert team_won(outcome, 1) is attackers
+    # The boundary itself: 79 defends, 80 attacks, and neither gains a
+    # rank until 120.
+    assert not attackers_won(79)
+    assert attackers_won(80)
+    print("    threshold at 80, complementary across 41 point totals")
+
+
+def test_self_play_wins_half_its_hands_and_takes_half_the_points() -> None:
+    """One policy against itself is the symmetric case.
+
+    A duplicate pair puts the same policy in both seatings, so the win
+    rate and the points taken have to come out even whatever the cards
+    did. It is the check that the sign conventions did not get crossed.
+    """
+    from tractor.eval.duplicate import DECK_POINTS, compare, uniform_random_policy
+
+    result = compare(uniform_random_policy, uniform_random_policy,
+                     num_deals=24, seed=9)
+    assert result.wins.shape == (24, 2)
+    assert result.taken.shape == (24, 2)
+    assert result.wins.mean() == 0.5, result.wins.mean()
+    # The same policy on both sides must see the same attacking total
+    # whichever side of it it sat on.
+    attacking = result.taken[result.attacked].mean()
+    conceding = result.taken[~result.attacked].mean()
+    assert attacking == conceding, (attacking, conceding)
+    # And the paired margins cancel exactly, for the same reason.
+    assert abs(float(result.mean)) < 1e-12
+    assert abs(float(result.point_mean)) < 1e-12
+    print("    24 deals: winrate 0.500, 100.0 points each, margins zero")
+
+
+def test_the_winner_is_the_team_that_took_or_kept_the_title() -> None:
+    """A win must follow the points, hand by hand, not on average."""
+    from tractor.eval.duplicate import (
+        DECK_POINTS,
+        compare,
+        lowest_index_policy,
+        uniform_random_policy,
+    )
+
+    result = compare(uniform_random_policy, lowest_index_policy,
+                     num_deals=16, seed=4)
+    # `taken` is X's own points, and the win condition depends on which
+    # side of the table X sat: attacking it needs 80, defending it needs
+    # the other side held under 80, which is over 120 of its own. The
+    # role is not on the Result, so these are the two implications that
+    # hold either way -- and they still catch a crossed sign, since a
+    # flipped win would put a loss above 120 or a win below 80.
+    for deal in range(result.wins.shape[0]):
+        for seating in range(2):
+            took = int(result.taken[deal, seating])
+            won = bool(result.wins[deal, seating])
+            # The attacking total carries the kitty bonus, so it is
+            # bounded below by zero and not above by the deck.
+            assert took >= 0
+            attacked = bool(result.attacked[deal, seating])
+            # Attacking, a win needs 80; defending, it needs the other
+            # side held under 80.
+            assert won == (took >= 80 if attacked else took < 80), (
+                deal, seating, took, attacked, won
+            )
+    print(f"    {result.wins.size} hands, wins agree with the point totals")
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

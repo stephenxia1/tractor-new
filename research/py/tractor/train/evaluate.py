@@ -33,7 +33,13 @@ import numpy as np
 import torch
 
 from ..eval.bots import LADDER, play_against_bot, resolve_bots
-from ..eval.duplicate import Policy, PolicyFactory, compare, uniform_random_policy
+from ..eval.duplicate import (
+    DECK_POINTS,
+    Policy,
+    PolicyFactory,
+    compare,
+    uniform_random_policy,
+)
 from ..nn.features import Cache
 from ..nn.model import ModelConfig
 from ..sim.state import PlayState
@@ -139,12 +145,33 @@ def evaluate(
         "levels_ci_high": result.ci_high,
         "points": result.point_mean,
         "points_stderr": result.point_stderr,
+        # The hand's own totals, which a margin hides: a margin of zero
+        # is 100 against 100 as readily as 0 against 0. Reported by the
+        # side the network sat on, both as the attacking total, so both
+        # read against the same 80-point threshold.
+        "points_as_attacker": _mean(result.taken[result.attacked]),
+        "points_conceded": _mean(result.taken[~result.attacked]),
+        # A hand is won by taking the landlord title or by keeping it,
+        # which is the 80-point threshold from either side. Over hands
+        # played, not deals paired.
+        "winrate": float(result.wins.mean()),
+        "hands": float(result.wins.size),
         "decisions": float(result.decisions),
         # Positive only when the whole interval is, which is the
         # question a training chart is actually being asked.
         "ahead": float(result.ci_low > 0.0),
     }
 
+
+
+def _mean(values: np.ndarray) -> float:
+    """The mean, or NaN when there is nothing to average.
+
+    A short measurement can put the network on one side of the table
+    for every hand, and a zero would read as a hand it lost badly
+    rather than as one it never played.
+    """
+    return float(values.mean()) if values.size else float("nan")
 
 def evaluate_against_bots(
     net: Any,

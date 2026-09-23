@@ -252,6 +252,35 @@ def play_hand(
     )
 
 
+# The point total at which the hand changes hands: the attackers take
+# the landlord title at or above it, the defenders keep it below
+# (rules.md 8.3). Above 120 the attackers also gain ranks, but the
+# title has already moved, so the threshold and not the rank change is
+# what decides a hand.
+WIN_THRESHOLD = 80
+
+# Points in a two-deck shoe, the total the two teams divide between them.
+DECK_POINTS = 200
+
+
+def attackers_won(attacker_points: int) -> bool:
+    """Did the attacking team take the hand?"""
+    return attacker_points >= WIN_THRESHOLD
+
+
+def team_won(outcome: "HandOutcome", team: int) -> bool:
+    """Did `team` win this hand?
+
+    The attacking team wins by taking the landlord title, which it does
+    at 80 points whether or not it also gains a rank. The defending team
+    wins by keeping the title, which it does by holding the attackers
+    below that. The two are complementary, so one threshold answers for
+    both sides.
+    """
+    attacking = team != outcome.defenders
+    return attackers_won(outcome.attacker_points) == attacking
+
+
 def signed_levels(outcome: HandOutcome, team: int) -> int:
     """The hand's result in level units, positive when `team` gained.
 
@@ -291,6 +320,12 @@ class DealScore:
     hand_levels: tuple[int, int]  # X's signed level result, per seating
     hand_points: tuple[int, int]  # X's signed point result, per seating
     attacker_points: tuple[int, int]  # raw, per seating
+    # Did X's team win the hand, and how many points did it take? Both
+    # are per seating rather than paired: a win is a property of a hand
+    # that was played, where a score is a comparison across the pair.
+    wins: tuple[bool, bool]
+    taken: tuple[int, int]  # the hand's attacking total
+    attacked: tuple[bool, bool]  # was X the attacking team?
     landlord: int
     decisions: int
 
@@ -312,6 +347,9 @@ def play_deal(
     levels: list[int] = []
     points: list[int] = []
     raw: list[int] = []
+    wins: list[bool] = []
+    taken: list[int] = []
+    attacked: list[bool] = []
     decisions = 0
 
     for seating in (0, 1):
@@ -335,6 +373,14 @@ def play_deal(
         levels.append(signed_levels(outcome, x_team))
         points.append(signed_points(outcome, x_team))
         raw.append(outcome.attacker_points)
+        wins.append(team_won(outcome, x_team))
+        # The hand's attacking total, and which side of it X was on.
+        # Not "X's points": the attacking total carries the kitty bonus,
+        # which is twice the kitty's points times the cards in the last
+        # winning play and can put it past the 200 in the deck, so the
+        # defenders' share is not the complement of it.
+        taken.append(outcome.attacker_points)
+        attacked.append(x_team != outcome.defenders)
         decisions += outcome.decisions
 
     return DealScore(
@@ -345,6 +391,9 @@ def play_deal(
         hand_levels=(levels[0], levels[1]),
         hand_points=(points[0], points[1]),
         attacker_points=(raw[0], raw[1]),
+        wins=(wins[0], wins[1]),
+        taken=(taken[0], taken[1]),
+        attacked=(attacked[0], attacked[1]),
         landlord=base.landlord,
         decisions=decisions,
     )
@@ -390,6 +439,11 @@ class Result:
     hand_levels: np.ndarray  # int32[num_deals, 2]
     hand_points: np.ndarray  # int32[num_deals, 2]
     attacker_points: np.ndarray  # int32[num_deals, 2]
+    # Per hand rather than per deal: two entries for each deal, since a
+    # win belongs to a hand that was played and a paired score does not.
+    wins: np.ndarray  # bool[num_deals, 2]
+    taken: np.ndarray  # int32[num_deals, 2], the hand's attacking total
+    attacked: np.ndarray  # bool[num_deals, 2], was X attacking?
     digests: np.ndarray  # uint64[num_deals]
     decisions: int
 
@@ -477,6 +531,9 @@ def compare(
         hand_levels=np.array([d.hand_levels for d in deals], dtype=np.int32),
         hand_points=np.array([d.hand_points for d in deals], dtype=np.int32),
         attacker_points=np.array([d.attacker_points for d in deals], dtype=np.int32),
+        wins=np.array([d.wins for d in deals], dtype=bool),
+        taken=np.array([d.taken for d in deals], dtype=np.int32),
+        attacked=np.array([d.attacked for d in deals], dtype=bool),
         digests=np.array([d.digest for d in deals], dtype=np.uint64),
         decisions=sum(d.decisions for d in deals),
     )

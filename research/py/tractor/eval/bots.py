@@ -60,7 +60,14 @@ from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, TrickRecord, team_of
 from ..train.buffer import obs_batch_from_arrays
 from ..train.rollout import _InFlight, _choose, _evaluate, _pack
-from .duplicate import HandOutcome, _interval, signed_levels, signed_points
+from .duplicate import (
+    DECK_POINTS,
+    HandOutcome,
+    _interval,
+    signed_levels,
+    signed_points,
+    team_won,
+)
 
 __all__ = ["play_against_bot", "state_from_wire"]
 
@@ -364,8 +371,14 @@ class _Half:
     decisions: int
 
 
-def _paired(games: dict[int, dict[int, _Half]]) -> tuple[np.ndarray, np.ndarray]:
-    """Per-deal paired scores, in levels and in attacker points.
+def _paired(
+    games: dict[int, dict[int, _Half]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per-deal paired scores, plus per-hand wins and points taken.
+
+    The first two are per deal and the last two per hand: a score is
+    paired across the two halves and cancels the cards, while a win and
+    a point total are properties of a hand that was played.
 
     The two halves of a deal are a matched pair rather than two draws:
     whatever the cards were worth, both policies were handed them, and
@@ -374,6 +387,9 @@ def _paired(games: dict[int, dict[int, _Half]]) -> tuple[np.ndarray, np.ndarray]
     """
     levels: list[float] = []
     points: list[float] = []
+    wins: list[float] = []
+    taken: list[float] = []
+    attacked: list[bool] = []
     for game in sorted(games):
         halves = games[game]
         if set(halves) != {0, 1}:
@@ -390,6 +406,9 @@ def _paired(games: dict[int, dict[int, _Half]]) -> tuple[np.ndarray, np.ndarray]
             )
         signed_l: list[int] = []
         signed_p: list[int] = []
+        won: list[float] = []
+        attack_pts: list[float] = []
+        roles: list[bool] = []
         for half in (0, 1):
             got = halves[half]
             # ``tricks`` is not on the wire and nothing here reads it;
@@ -405,16 +424,45 @@ def _paired(games: dict[int, dict[int, _Half]]) -> tuple[np.ndarray, np.ndarray]
             )
             signed_l.append(signed_levels(outcome, NET_TEAM[half]))
             signed_p.append(signed_points(outcome, NET_TEAM[half]))
+            won.append(float(team_won(outcome, NET_TEAM[half])))
+            # The hand's attacking total, and which side of it the
+            # network was on. Not "its own points": the attacking total
+            # carries the kitty bonus and can pass the 200 in the deck,
+            # so the defenders' share is not its complement.
+            attack_pts.append(float(got.attacker_points))
+            roles.append(NET_TEAM[half] != outcome.defenders)
         levels.append(0.5 * (signed_l[0] + signed_l[1]))
         points.append(0.5 * (signed_p[0] + signed_p[1]))
-    return np.array(levels, dtype=np.float64), np.array(points, dtype=np.float64)
+        # Both halves count: a deal is two hands, and the win rate is
+        # over hands played, not over deals paired.
+        wins.extend(won)
+        taken.extend(attack_pts)
+        attacked.extend(roles)
+    return (
+        np.array(levels, dtype=np.float64),
+        np.array(points, dtype=np.float64),
+        np.array(wins, dtype=np.float64),
+        np.array(taken, dtype=np.float64),
+        np.array(attacked, dtype=bool),
+    )
 
+
+
+def _mean(values: np.ndarray) -> float:
+    """The mean, or NaN when there is nothing to average.
+
+    A short measurement can put the network on one side of the table
+    for every hand, and a zero would read as a hand it lost badly
+    rather than as one it never played.
+    """
+    return float(values.mean()) if values.size else float("nan")
 
 def summarise(games: dict[int, dict[int, _Half]]) -> dict[str, float]:
     """The flat statistics dict, in ``train/evaluate.py``'s shape."""
-    levels, points = _paired(games)
+    levels, points, wins, taken, attacked = _paired(games)
     mean, stderr, lo, hi = _interval(levels)
     pmean, pstderr, _plo, _phi = _interval(points)
+    wmean, wstderr, wlo, whi = _interval(wins)
     decisions = sum(h.decisions for halves in games.values() for h in halves.values())
     return {
         "deals": float(levels.size),
@@ -424,6 +472,17 @@ def summarise(games: dict[int, dict[int, _Half]]) -> dict[str, float]:
         "levels_ci_high": hi,
         "points": pmean,
         "points_stderr": pstderr,
+        # The hand's own totals, which a margin hides: 100 against 100
+        # and 0 against 0 are both a margin of zero. Both are attacking
+        # totals, so both read against the same 80-point threshold.
+        "points_as_attacker": _mean(taken[attacked]),
+        "points_conceded": _mean(taken[~attacked]),
+        # A hand is won by taking the landlord title, or by keeping it.
+        "winrate": wmean,
+        "winrate_stderr": wstderr,
+        "winrate_ci_low": wlo,
+        "winrate_ci_high": whi,
+        "hands": float(wins.size),
         # The network's own decisions, not every decision in the hand:
         # the bot's moves are made inside the host and never seen here.
         "decisions": float(decisions),
