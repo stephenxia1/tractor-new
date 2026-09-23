@@ -184,7 +184,7 @@ def smoke() -> None:
 
 
 @app.local_entrypoint()
-def launch(steps: int = 2500, hands: int = 512, name: str = "run",
+def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            gpu: str = "a10g", wandb_on: bool = True, resume: str = "",
            eval_every: int = 250, eval_deals: int = 96,
            eval_bots: str = "", eval_bot_deals: int = 24,
@@ -196,31 +196,32 @@ def launch(steps: int = 2500, hands: int = 512, name: str = "run",
     """Submit a run and return, rather than waiting on it.
 
     The defaults for `hands`, `epochs` and `rollout_workers` come from
-    two measurements rather than from taste.
+    measurement rather than taste. All three were taken by holding a
+    quarter of the *hands* out of the fit and scoring the critic on
+    them: `modal run modal_train.py::critic_hands`.
 
-    `epochs` is 1 because four passes over a round is where the critic
-    stops generalising. Measured by holding a quarter of the hands out
-    of the fit (`modal run modal_train.py::critic`), at the end of the
-    anneal the critic explains +0.94 of the variance on the hands it
-    was fitted to and -0.32 on hands it was not -- worse than
-    predicting the mean, so the value function was adding variance to
-    the policy gradient rather than removing it. Two epochs gives
-    -0.23 and one gives +0.03. One epoch is the only setting measured
-    that is not actively harmful.
+    `epochs` is 1. Four passes over a round is where the critic stops
+    generalising, and the effect is largest exactly where the reward
+    used to end up. At a level weight of 1 the critic explained +0.94
+    of the variance on the hands it was fitted to and -0.32 on hands it
+    was not, which is worse than predicting the mean; two epochs gave
+    -0.23 and one +0.03. On the points-only reward the penalty is
+    smaller but has not gone away: paired on identical hands at 1024 a
+    round, one epoch holds out at +0.473 against +0.424 for four, and
+    is better calibrated (slope 0.95 against 0.79).
 
-    `hands` is 512 because one epoch over four times the data is the
-    same number of gradient steps on four times as many independent
-    targets, and the critic's problem is targets: with `gamma = 1` and
-    an end-loaded reward, a hand is about one target however many rows
-    it writes. It costs almost nothing. A 512-hand round at one epoch
-    measured about the same wall clock as the old 128-hand round at
-    four, because the update scales with rows times epochs and those
-    cancel, and because the rollout is now parallel.
+    `hands` is 1024 because that is where more hands stop paying. The
+    critic's problem is independent targets -- with an end-loaded
+    reward a hand is about one target per seat however many rows it
+    writes -- and held-out explained variance runs +0.023, +0.404,
+    +0.378, +0.473, +0.479 across 128, 256, 512, 1024 and 2048 hands.
+    The rise stops at 1024, where the calibration slope also peaks at
+    0.95, and 2048 buys +0.006 for twice the rollout.
 
     `rollout_workers` is 7 because the rollout is host-bound and the
-    container reserves eight cores. Measured on an A10G at 128 hands,
-    a persistent pool of 7 workers runs a round 2.28x faster than the
-    single-process rollout.
+    container reserves eight cores. Measured on an A10G, a persistent
+    pool of 7 runs a round 2.28x faster than the single-process
+    rollout at 128 hands and 2.40x at 512.
 
     `main` waits for the function to finish, which ties a run measured
     in hours to the lifetime of the terminal that started it: the

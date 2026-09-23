@@ -201,24 +201,24 @@ result was believed.
 - **Throughput**: tuned from 1.4k to ~4.1k decisions/s. The dominant term
   was torch thread count starving the Node actors, not the loop structure.
 
-## Two measurements on the PPO track (`py/tractor/`)
+## Measurements on the PPO track (`py/tractor/`)
 
-Both are reproducible from the repo:
-`modal run modal_train.py::critic` and `modal run modal_train.py::rollout`.
+All reproducible: `modal run modal_train.py::critic`,
+`::critic_hands`, `::rollout`.
 
-### The critic stops generalising as the reward anneal proceeds
+### The reward is trick points, and the terminal term is off
 
-`explained_variance` as the learner logs it is measured on the rows the
-update is about to train on, so it says how well the behaviour critic fit
-the returns it already saw. `py/tractor/train/critic_diag.py` asks the
-other question: keep a quarter of the *hands* out of the fit, run the real
-update on the rest, and score the fitted critic on both halves. Hands, not
-rows — the critic reads a privileged view of all four hands, so a seat held
-out of a hand whose other seats were fitted is not held out at all.
+The learner's `explained_variance` is computed on the rows the update
+is about to train on, so it says how well the behaviour critic fit
+returns it had already seen. `py/tractor/train/critic_diag.py` asks the
+other question: keep a quarter of the *hands* out of the fit, run the
+real update on the rest, score both halves. Hands, not rows — the
+critic reads a privileged view of all four, so a seat held out of a
+fitted hand is not held out at all.
 
 256 hands, 4 epochs, `gamma = 1`, against the step-2500 checkpoint:
 
-| `level_weight` | fitted hands | held-out hands | gap | calibration slope |
+| `level_weight` | fitted | held out | gap | slope |
 | --- | --- | --- | --- | --- |
 | 0.00 | +0.842 | +0.405 | 0.437 | 0.71 |
 | 0.25 | +0.903 | +0.167 | 0.736 | 0.59 |
@@ -226,72 +226,109 @@ out of a hand whose other seats were fitted is not held out at all.
 | 0.75 | +0.939 | −0.196 | 1.135 | 0.40 |
 | 1.00 | +0.941 | −0.324 | 1.265 | 0.34 |
 
-A negative held-out score is worse than predicting the mean, so past the
-middle of the anneal the value function adds variance to the policy
-gradient instead of removing it. The mechanism is the effective sample
-size: with `gamma = 1` and a terminal level reward, every row of a hand
-carries the same terminal term, so as the anneal moves weight onto it the
-returns within a hand converge and ~11,000 rows collapse towards ~512
-independent targets.
+Negative is worse than predicting the mean, so past the middle of the
+anneal the value function was adding variance to the policy gradient
+instead of removing it. The mechanism is effective sample size: with
+`gamma = 1` and a terminal level reward every row of a hand carries the
+same terminal term, so as weight moves onto it the returns within a
+hand converge and ~11,000 rows collapse towards ~512 targets.
 
-Three remedies, measured at `level_weight = 1.0` on the same rollouts so
-the arms are paired:
+Two candidate remedies do nothing, measured at `level_weight = 1.0` on
+the same rollouts so the arms are paired: `gamma = 0.99` gives −0.328
+and `detach_critic = True` gives −0.320, against a −0.324 baseline. A
+hand is about 22 decisions per seat, so that discount barely separates
+rows sharing a terminal term, and the memorisation is in the critic
+head reading the privileged view rather than in the shared encoder.
 
-| change | held-out | gap |
-| --- | --- | --- |
-| baseline (4 epochs, `gamma = 1`) | −0.324 | 1.265 |
-| `gamma = 0.99` | −0.328 | 1.259 |
-| `detach_critic = True` | −0.320 | 1.256 |
-| 2 epochs | −0.226 | 1.038 |
-| **1 epoch** | **+0.030** | **0.567** |
+So the reward is trick points only: `anneal_steps` and
+`final_level_weight` both default to 0, which is the regime the table
+above shows the critic generalising in. Set them to restore the
+annealed hand-outcome reward.
 
-The discount and the detached trunk do nothing measurable. A hand is about
-22 decisions per seat, so `0.99^22 ≈ 0.80` barely separates rows that share
-a terminal term, and the memorisation is in the critic head reading the
-privileged view rather than in what the shared encoder holds. Epoch count
-is the only lever that moves the number, and one epoch is the only setting
-measured that is not actively harmful — it reaches break-even, not a useful
-critic. A useful one needs more independent targets, which means more hands
-per round.
+Two things the points-only reward cannot see. The kitty bonus is folded
+into the attackers' total by `PlayState._finish` and was never in a
+trick record, so no dense credit exists for it — and it is up to eight
+times the kitty's points. And the game is scored on levels: 119 points
+and 0 points are the same result, and the dense reward rates them 119
+apart. The ladder win rate is where that proxy would show itself
+failing.
+
+### One epoch, and 1024 hands a round
+
+Epoch count is the only lever that moved the anneal number (−0.324 →
+−0.226 → +0.030 for 4, 2, 1), and the penalty shrinks but does not
+vanish on the points-only reward. Paired on identical hands:
+
+| hands | epochs | fitted | held out | gap | slope |
+| --- | --- | --- | --- | --- | --- |
+| 256 | 1 | +0.618 | +0.404 | 0.214 | 0.73 |
+| 256 | 4 | +0.846 | +0.407 | 0.438 | 0.71 |
+| 1024 | 1 | +0.615 | **+0.473** | **0.142** | **0.95** |
+| 1024 | 4 | +0.826 | +0.424 | 0.402 | 0.79 |
+
+What the critic actually wants is independent targets, and a hand is
+about one target per seat however many rows it writes. Widening the
+round at one epoch, points-only:
+
+| hands | targets | fitted | held out | 95% CI | gap | slope |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | 384 | +0.481 | +0.023 | [−0.435, +0.312] | 0.459 | 0.51 |
+| 256 | 768 | +0.618 | +0.404 | [+0.213, +0.539] | 0.214 | 0.73 |
+| 512 | 1536 | +0.640 | +0.378 | [+0.267, +0.465] | 0.262 | 0.82 |
+| 1024 | 3072 | +0.615 | +0.473 | [+0.406, +0.525] | 0.142 | 0.95 |
+| 2048 | 6144 | +0.636 | +0.479 | [+0.438, +0.516] | 0.157 | 0.90 |
+
+The rise stops at 1024, where the calibration slope also peaks at 0.95;
+2048 buys +0.006 for twice the rollout. `launch` therefore defaults to
+`--hands 1024 --epochs 1`. Note that the rollout cost is exactly linear
+in hands (7.0, 13.3, 25.8, 52.3, 102.6 seconds) and that the forward
+batch is set by `pool`, not by round width, so past this point a wider
+round buys neither throughput nor statistics.
 
 ### The rollout was using one of eight reserved cores
 
-Span breakdown of a serial round on an A10G (128 hands, bf16): enumerate
-2.20 s, encode 1.54 s, simulator step 1.10 s, network forward 1.91 s. About
-two thirds is host work in pure Python, where threads cannot help because
-the enumerator holds the GIL.
+Span breakdown of a serial round on an A10G (128 hands, bf16):
+enumerate 2.20 s, encode 1.54 s, simulator step 1.10 s, network forward
+1.91 s. About two thirds is host work in pure Python, where threads
+cannot help because the enumerator holds the GIL.
 
-`py/tractor/train/parallel.py` moves the simulator into worker processes
-and keeps one batched forward in the parent. Two measurements shaped it.
+`py/tractor/train/parallel.py` moves the simulator into worker
+processes and keeps one batched forward in the parent. Two measurements
+shaped it.
 
-*The observations never travel through a queue.* `py/bench_ipc.py` puts a
-`multiprocessing.Queue` carrying the 28,466-byte observation per decision
-at ~1,150 decisions/s — slower than the loop it replaces — against ~23,600
-for a shared-memory ring with the queue carrying a row index, at a batch of
-32. So the buffer *is* the transport (`py/tractor/train/shared.py`) and the
-queues carry tags and integers.
+*The observations never travel through a queue.* `py/bench_ipc.py` puts
+a `multiprocessing.Queue` carrying the 28,466-byte observation per
+decision at ~1,150 decisions/s — slower than the loop it replaces —
+against ~23,600 for a shared-memory ring with the queue carrying a row
+index, at a batch of 32. So the buffer *is* the transport
+(`py/tractor/train/shared.py`) and the queues carry tags and integers.
 
-*The workers are persistent.* A spawned worker takes ~9.5 s to reach its
-first instruction, nearly all of it `import torch`. The first version
-spawned per round and measured 1.08x, with the entire gain inside the
-start-up. `RolloutPool` starts its workers once and a round is a message.
+*The workers are persistent.* A spawned worker takes ~9.5 s to reach
+its first instruction, nearly all of it `import torch`. The first
+version spawned per round and measured 1.08x, with the entire gain
+inside the start-up. `RolloutPool` starts its workers once and a round
+is a message.
 
-| hands/round | serial | 4 workers | 7 workers |
-| --- | --- | --- | --- |
-| 128 | 6.16 s | 2.85 s (2.16x) | 2.70 s (2.28x) |
-| 512 | 19.59 s | 9.42 s (2.08x) | 8.15 s (2.40x) |
+| hands | serial | x4 | x7 | x11 | x15 |
+| --- | --- | --- | --- | --- | --- |
+| 128 | 6.16 s | 2.16x | 2.28x | — | — |
+| 512 | 19.59 s | 2.08x | 2.40x | — | — |
+| 1024 | 38.91 s | — | 2.47x | 2.69x | 2.81x |
 
-Enable it with `rollout_workers` in `TrainConfig`, or `--rollout-workers`
-on the Modal entrypoints.
+Past seven workers it keeps improving and stops mattering. Fitting
+`T(w) = A/w + B` to the 1024-hand row gives `A = 24.3`, `B = 12.25`,
+and that model reproduces the eleven-worker point to the second: there
+is a 12.25 s floor of parent work — the forward, the sampler, the
+transport — that no number of workers touches, so the ceiling is 3.18x
+and fifteen workers already reach 88% of it. The floor exists because
+the design is lockstep: the parent's forward does not overlap the
+workers' packing. Breaking it needs two batches in flight per worker,
+not more cores.
 
-### What the two together imply for a run
-
-One epoch over four times the hands is the same number of gradient steps on
-four times as many independent targets, and the update cost scales with
-rows times epochs, so those cancel. With the parallel rollout absorbing the
-larger round, 512 hands at one epoch costs close to what 128 hands at four
-epochs cost — which is why `launch` now defaults to `--hands 512 --epochs 1
---rollout-workers 7`.
+Sixteen reserved cores are not worth buying for this. They lift collect
+from 15.72 s to 13.87 s at 1024 hands, which against a ~35 s update is
+under 4% of the step, for about 20% more per hour. `cpu=8.0` and seven
+workers is the configuration the training functions use.
 
 ---
 
