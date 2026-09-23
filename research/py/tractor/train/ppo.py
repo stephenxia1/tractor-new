@@ -18,10 +18,12 @@ distribution the sampler actually draws from and nothing else.
 *The critic is privileged.* It reads the four hands and the kitty, which
 no seat can see, so it is only usable as a baseline -- and it is a
 separate tower whose gradient reaches the actor only when asked. The
-update calls the net with ``detach_critic=False``: during learning the
-critic loss *should* shape the shared history encoder, which is the
-whole reason the two towers share one. Collection uses the default,
-detached, path.
+update calls the net with ``detach_critic=cfg.detach_critic``, which
+defaults to False: during learning the critic loss shapes the shared
+history encoder, which is the reason the two towers share one. That
+argument holds while the critic generalises and stops holding when it
+memorises, so the path is a flag rather than a constant. Collection
+always uses the detached path.
 
 *There are three auxiliary heads to feed.* They hang off the actor's
 own summary vector, they cost one small matmul each, and a head that
@@ -180,6 +182,18 @@ class PPOConfig:
     normalise_adv: bool = True
     target_kl: float | None = None
     bf16: bool = True
+
+    # Whether the critic's gradient stops at the shared history encoder.
+    # False -- the default and what every run so far used -- lets the
+    # value loss shape the encoder the actor also reads, which is the
+    # reason the two towers share one. That is a benefit only while the
+    # critic is learning something transferable: a critic fitting the
+    # identity of the hands in its own buffer shapes the trunk towards
+    # encoding hand identity, and the actor reads the result. Setting
+    # this True severs the path, leaving the critic a pure baseline.
+    # Which is better is a measurement, not a position; see
+    # ``critic_diag.generalisation_gap``.
+    detach_critic: bool = False
 
     weight_decay: float = 0.0
     adam_eps: float = 1e-8
@@ -526,7 +540,9 @@ class PPOLearner:
         with torch.autocast(
             device_type=self.device.type, dtype=torch.bfloat16, enabled=self.amp
         ):
-            out, value = self.graph(obs, privileged, detach_critic=False)
+            out, value = self.graph(
+                obs, privileged, detach_critic=cfg.detach_critic
+            )
 
         # Out of autocast from here down: the reductions are float32.
         log_probs = out.log_probs.float()
@@ -613,21 +629,46 @@ class PPOLearner:
 
     # -- one update --------------------------------------------------------
 
-    def update(self, buffer: PPOBuffer) -> dict[str, float]:
+    def update(
+        self, buffer: PPOBuffer, rows: np.ndarray | None = None
+    ) -> dict[str, float]:
         """``cfg.epochs`` shuffled passes over the buffer. -> metrics.
 
         Minibatch means are weighted by minibatch size, so a short tail
         batch does not count as much as a full one.
+
+        ``rows`` restricts the update to a subset of the filled rows;
+        ``None`` means all of them, which is what the loop passes. The
+        subset exists so a caller can keep some hands out of the fit and
+        then ask what the critic does on hands it never saw -- a
+        question that cannot be asked once every row has been trained
+        on. Which rows belong together is the caller's business: this
+        method shuffles whatever it is given and makes no attempt to
+        keep a hand or a seat intact.
         """
         cfg = self.cfg
         n = num_rows(buffer)
         if n == 0:
             raise ValueError("update() called on a buffer with no rows")
+        if rows is None:
+            selected = np.arange(n, dtype=np.int64)
+        else:
+            selected = np.asarray(rows).astype(np.int64, copy=False).reshape(-1)
+            if selected.size == 0:
+                raise ValueError("update() called with an empty row selection")
+            if int(selected.min()) < 0 or int(selected.max()) >= n:
+                raise IndexError(
+                    f"rows {int(selected.min())}..{int(selected.max())} fall "
+                    f"outside the buffer's {n} filled rows"
+                )
+        m = int(selected.size)
 
         # Against the *behaviour* critic's predictions, which is the
         # question worth asking: how well did the value function the
         # rollout ran with explain the returns it went on to earn.
-        ev = explained_variance(np.asarray(buffer.value)[:n], np.asarray(buffer.ret)[:n])
+        ev = explained_variance(
+            np.asarray(buffer.value)[selected], np.asarray(buffer.ret)[selected]
+        )
 
         size = max(1, int(cfg.minibatch))
         totals = {key: 0.0 for key in _LOSS_KEYS}
@@ -645,8 +686,8 @@ class PPOLearner:
 
         self.net.train()
         for epoch in range(max(0, int(cfg.epochs))):
-            order = torch.randperm(n).numpy()
-            for start in range(0, n, size):
+            order = selected[torch.randperm(m).numpy()]
+            for start in range(0, m, size):
                 idx = order[start : start + size]
                 obs, privileged, batch = buffer.as_torch(idx, self.device)
                 loss, parts = self.losses(obs, privileged, batch)
@@ -706,7 +747,7 @@ class PPOLearner:
         metrics["n_minibatches"] = float(n_minibatches)
         metrics["epochs_run"] = float(epochs_run)
         metrics["early_stop"] = 1.0 if early_stop else 0.0
-        metrics["rows"] = float(n)
+        metrics["rows"] = float(m)
         metrics["nonfinite_minibatches"] = float(nonfinite)
         # Counts, so they stay counts: zero clamped rows and zero
         # terminal rows are both true statements about an update that

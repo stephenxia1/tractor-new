@@ -4,12 +4,31 @@ Kept free of Modal and of wandb specifics so that the same loop runs
 under pytest on a laptop and on a GPU container without branching. The
 only thing the caller supplies is a device and a telemetry sink.
 
-Reward shaping is annealed rather than switched. Training begins on
-trick points, which arrive several times a hand and give the critic a
-target long before any hand finishes; the level reward, which is what
-the game is actually scored on, is mixed in over the course of
-training. `reward_mix` is the weight on the level term and runs from
-0 to `final_level_weight` across `anneal_steps` learner steps.
+The reward is trick points, and by default only trick points.
+`reward_mix` is the weight on the terminal level term; it runs from 0
+to `final_level_weight` across `anneal_steps` learner steps, and both
+default to 0, which holds the weight at zero for the whole run.
+
+Points rather than levels because of what the terminal term does to
+the critic. Every row of a hand carries the same terminal value, so as
+weight moves onto it the returns within a hand converge and an
+iteration's rows collapse towards one target per hand-seat. Measured
+on a holdout of whole hands (`train/critic_diag.py`), the critic's
+explained variance on hands it was not fitted to runs +0.405 at a
+level weight of 0 and -0.324 at 1: past the middle of the anneal the
+value function is worse than predicting the mean, so it adds variance
+to the policy gradient rather than removing it.
+
+Two things the points-only reward cannot see, both worth knowing
+before turning it on for a long run. The kitty bonus is folded into
+the attackers' total by `PlayState._finish` and was never in a trick
+record, so no dense credit exists for it -- and it is not small, at
+twice the number of cards in the winning play, up to eight times over
+300 sampled hands. And the game is scored on levels, not points: 119
+points and 0 points are the same result, and the dense reward rates
+them 119 apart. Points are a proxy, and the win rate the evaluation
+reports against the ladder is where the proxy would show itself
+failing.
 """
 
 from __future__ import annotations
@@ -28,6 +47,10 @@ from ..telemetry import Spans, memory_snapshot
 from .buffer import RolloutBuffer
 from .evaluate import evaluate, evaluate_against_bots
 from .gae import compute_gae
+from ..gen.episode import deal_sizes
+from ..sim.state import NUM_SEATS
+from .parallel import RolloutPool
+from .rollout import DECKS
 from .ppo import PPOConfig, PPOLearner
 from .rollout import collect
 
@@ -52,9 +75,27 @@ class TrainConfig:
     # flight holds its own state and encoder output.
     pool: int = 128
 
-    # Reward anneal, described in the module docstring.
-    anneal_steps: int = 400
-    final_level_weight: float = 1.0
+    # Reward anneal, described in the module docstring. Both zero:
+    # the reward is trick points and the terminal level term is off.
+    # Set `final_level_weight` to 1 (with an `anneal_steps` to reach
+    # it over) to restore the annealed hand-outcome reward.
+    anneal_steps: int = 0
+    final_level_weight: float = 0.0
+
+    # Worker processes for the rollout. 1 keeps the single-process
+    # ``collect``; above 1 the simulator moves into that many children
+    # and the parent keeps the network. The rollout is host-bound -- of
+    # an 8.8 s ``collect``, 2.70 s went on enumeration, 1.94 s on
+    # encoding and 1.42 s on the simulator against 1.38 s in the
+    # network -- so this is the only lever that moves it, and a
+    # container reserving eight cores was using one.
+    #
+    # The pool is built once, before the first step, and reused. A
+    # worker takes about 9.5 seconds to reach its first instruction,
+    # nearly all of it ``import torch``, which is more than a round
+    # costs; a pool per step measured 1.08x on an A10G and all of the
+    # gain was inside the start-up.
+    rollout_workers: int = 1
 
     checkpoint_every: int = 50
 
@@ -182,126 +223,173 @@ def train(
     if resume is not None and Path(resume).exists():
         start = load_checkpoint(Path(resume), net, learner)
 
+    # A hand can take one deal's worth of rows per seat, and `collect`
+    # refuses to start a hand it cannot guarantee room for -- so a
+    # buffer too small for `hands_per_step` does not raise, it quietly
+    # returns fewer hands, and the run trains on a round it never
+    # notices was short. Checked here, once, against the same bound the
+    # rollout checks itself against.
+    per_seat, _kitty = deal_sizes(DECKS)
+    needed = cfg.hands_per_step * per_seat * NUM_SEATS
+    if cfg.buffer_capacity < needed:
+        raise ValueError(
+            f"buffer_capacity {cfg.buffer_capacity} cannot hold "
+            f"{cfg.hands_per_step} hands; a hand can write up to "
+            f"{per_seat * NUM_SEATS} rows, so set it to at least {needed}"
+        )
+
     buffer = RolloutBuffer(cfg.buffer_capacity, model_cfg)
+    # Started before the first step and closed in the `finally` below,
+    # so worker start-up is paid once for the run and not once a step.
+    rollout_pool = (
+        RolloutPool(
+            cfg=model_cfg,
+            workers=cfg.rollout_workers,
+            hands_per_round=cfg.hands_per_step,
+        )
+        if cfg.rollout_workers > 1
+        else None
+    )
     ckpt_dir = Path(cfg.checkpoint_dir)
     started = time.perf_counter()
     seen = 0
     last: dict = {}
 
-    for step in range(start, cfg.total_steps):
-        step_started = time.perf_counter()
-        spans = Spans(enabled=True, device=device)
-        buffer.reset()
-        level_weight = reward_mix(step, cfg)
+    try:
+        for step in range(start, cfg.total_steps):
+            step_started = time.perf_counter()
+            spans = Spans(enabled=True, device=device)
+            buffer.reset()
+            level_weight = reward_mix(step, cfg)
 
-        with spans.span("collect"):
-            net.eval()
-            stats = collect(
-                net,
-                rng,
-                buffer,
-                n_hands=cfg.hands_per_step,
-                device=device,
-                cfg=model_cfg,
-                temperature=cfg.temperature,
-                level_weight=level_weight,
-                pool=cfg.pool,
-                # The behaviour log-probability must come from the
-                # same precision the learner will recompute in, or
-                # the importance ratio is not 1 even at identical
-                # weights and the clip silences whichever rows
-                # happened to round the wrong way.
-                amp=learner.amp,
-                spans=spans,
-            )
-
-        with spans.span("gae"):
-            compute_gae(buffer, gamma=cfg.gamma, lam=cfg.lam)
-
-        with spans.span("update"):
-            net.train()
-            metrics = learner.update(buffer)
-
-        # Before the metrics row is assembled, so that the evaluation's
-        # own span and its scores belong to the iteration that produced
-        # them and the row is logged exactly once.
-        scores: dict[str, float] = {}
-        if cfg.eval_every and (step + 1) % cfg.eval_every == 0:
-            with spans.span("evaluate"):
-                scores = evaluate(
-                    net,
-                    device=device,
-                    cfg=model_cfg,
-                    num_deals=cfg.eval_deals,
-                    # Fixed across iterations, so successive points differ
-                    # by the policy and not by which deals were drawn.
-                    seed=cfg.eval_seed,
-                )
-                # Merged into the same dict, and so into the same row as
-                # the reference evaluation and the iteration that
-                # produced it. A second row would put two points at one
-                # step on every chart that reads this run.
-                if cfg.eval_bots:
-                    scores.update(
-                        evaluate_against_bots(
-                            net,
-                            tuple(cfg.eval_bots),
-                            device=device,
-                            cfg=model_cfg,
-                            num_deals=cfg.eval_bot_deals,
-                            seed=cfg.eval_seed,
-                            workers=cfg.eval_bot_workers,
-                            budget_s=cfg.eval_bot_budget_s,
-                        )
+            with spans.span("collect"):
+                net.eval()
+                # The behaviour log-probability must come from the same
+                # precision the learner will recompute in, or the
+                # importance ratio is not 1 even at identical weights and
+                # the clip silences whichever rows happened to round the
+                # wrong way. Both paths take `amp` for that reason.
+                if rollout_pool is not None:
+                    buffer, stats = rollout_pool.collect(
+                        net,
+                        rng,
+                        buffer,
+                        n_hands=cfg.hands_per_step,
+                        device=device,
+                        temperature=cfg.temperature,
+                        level_weight=level_weight,
+                        pool=cfg.pool,
+                        amp=learner.amp,
+                        spans=spans,
+                    )
+                else:
+                    stats = collect(
+                        net,
+                        rng,
+                        buffer,
+                        n_hands=cfg.hands_per_step,
+                        device=device,
+                        cfg=model_cfg,
+                        temperature=cfg.temperature,
+                        level_weight=level_weight,
+                        pool=cfg.pool,
+                        amp=learner.amp,
+                        spans=spans,
                     )
 
-        now = time.perf_counter()
-        elapsed = now - started
-        step_s = now - step_started
-        decisions = int(stats.get("decisions", len(buffer)))
-        seen += decisions
-        row = {
-            "learner_steps": step,
-            "level_weight": level_weight,
-            "decisions": decisions,
-            # This step's rate, and the run's. Dividing one step's
-            # decisions by the run's elapsed time -- which an earlier
-            # revision did -- reads as a throughput collapse that is
-            # really just the denominator growing.
-            "decisions_per_s": decisions / max(step_s, 1e-9),
-            "decisions_per_s_mean": seen / max(elapsed, 1e-9),
-            "hands_per_s": stats.get("hands", 0) / max(step_s, 1e-9),
-            "step_s": step_s,
-            "buffer_fill": len(buffer) / max(cfg.buffer_capacity, 1),
-            "wall_s": elapsed,
-            **{f"rollout/{k}": v for k, v in stats.items()},
-            **{f"ppo/{k}": v for k, v in metrics.items()},
-            **{f"span/{k}": v["total"] for k, v in spans.summary().items()},
-            **{f"mem/{k}": v for k, v in memory_snapshot(device).items()},
-            **{f"eval/{k}": v for k, v in scores.items()},
+            with spans.span("gae"):
+                compute_gae(buffer, gamma=cfg.gamma, lam=cfg.lam)
+
+            with spans.span("update"):
+                net.train()
+                metrics = learner.update(buffer)
+
+            # Before the metrics row is assembled, so that the evaluation's
+            # own span and its scores belong to the iteration that produced
+            # them and the row is logged exactly once.
+            scores: dict[str, float] = {}
+            if cfg.eval_every and (step + 1) % cfg.eval_every == 0:
+                with spans.span("evaluate"):
+                    scores = evaluate(
+                        net,
+                        device=device,
+                        cfg=model_cfg,
+                        num_deals=cfg.eval_deals,
+                        # Fixed across iterations, so successive points differ
+                        # by the policy and not by which deals were drawn.
+                        seed=cfg.eval_seed,
+                    )
+                    # Merged into the same dict, and so into the same row as
+                    # the reference evaluation and the iteration that
+                    # produced it. A second row would put two points at one
+                    # step on every chart that reads this run.
+                    if cfg.eval_bots:
+                        scores.update(
+                            evaluate_against_bots(
+                                net,
+                                tuple(cfg.eval_bots),
+                                device=device,
+                                cfg=model_cfg,
+                                num_deals=cfg.eval_bot_deals,
+                                seed=cfg.eval_seed,
+                                workers=cfg.eval_bot_workers,
+                                budget_s=cfg.eval_bot_budget_s,
+                            )
+                        )
+
+            now = time.perf_counter()
+            elapsed = now - started
+            step_s = now - step_started
+            decisions = int(stats.get("decisions", len(buffer)))
+            seen += decisions
+            row = {
+                "learner_steps": step,
+                "level_weight": level_weight,
+                "decisions": decisions,
+                # This step's rate, and the run's. Dividing one step's
+                # decisions by the run's elapsed time -- which an earlier
+                # revision did -- reads as a throughput collapse that is
+                # really just the denominator growing.
+                "decisions_per_s": decisions / max(step_s, 1e-9),
+                "decisions_per_s_mean": seen / max(elapsed, 1e-9),
+                "hands_per_s": stats.get("hands", 0) / max(step_s, 1e-9),
+                "step_s": step_s,
+                "buffer_fill": len(buffer) / max(cfg.buffer_capacity, 1),
+                "wall_s": elapsed,
+                **{f"rollout/{k}": v for k, v in stats.items()},
+                **{f"ppo/{k}": v for k, v in metrics.items()},
+                **{f"span/{k}": v["total"] for k, v in spans.summary().items()},
+                **{f"mem/{k}": v for k, v in memory_snapshot(device).items()},
+                **{f"eval/{k}": v for k, v in scores.items()},
+            }
+            if run is not None:
+                run.log(row)
+            last = row
+
+            if cfg.checkpoint_every and (step + 1) % cfg.checkpoint_every == 0:
+                written = save_checkpoint(
+                    ckpt_dir / f"step_{step + 1:07d}.pt", net, learner, step + 1, cfg
+                )
+                _prune(ckpt_dir, cfg.keep_last)
+                if on_checkpoint is not None:
+                    on_checkpoint(written)
+
+        final = save_checkpoint(
+            ckpt_dir / "final.pt", net, learner, cfg.total_steps, cfg
+        )
+        if on_checkpoint is not None:
+            on_checkpoint(final)
+        summary = {
+            "steps": cfg.total_steps - start,
+            "wall_s": time.perf_counter() - started,
+            "final": last,
         }
         if run is not None:
-            run.log(row)
-        last = row
+            run.summary({k: v for k, v in summary.items() if k != "final"})
+    finally:
+        # The workers hold a shared-memory block, which on POSIX
+        # outlives the process that forgot to unlink it.
+        if rollout_pool is not None:
+            rollout_pool.close()
 
-        if cfg.checkpoint_every and (step + 1) % cfg.checkpoint_every == 0:
-            written = save_checkpoint(
-                ckpt_dir / f"step_{step + 1:07d}.pt", net, learner, step + 1, cfg
-            )
-            _prune(ckpt_dir, cfg.keep_last)
-            if on_checkpoint is not None:
-                on_checkpoint(written)
-
-    final = save_checkpoint(
-        ckpt_dir / "final.pt", net, learner, cfg.total_steps, cfg
-    )
-    if on_checkpoint is not None:
-        on_checkpoint(final)
-    summary = {
-        "steps": cfg.total_steps - start,
-        "wall_s": time.perf_counter() - started,
-        "final": last,
-    }
-    if run is not None:
-        run.summary({k: v for k, v in summary.items() if k != "final"})
     return summary

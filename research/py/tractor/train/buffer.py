@@ -39,7 +39,7 @@ log-probability of exactly the tensor stored in that row. See
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -260,7 +260,23 @@ class RolloutBuffer:
     grouping is by this field and never by contiguity.
     """
 
-    def __init__(self, capacity: int, cfg: ModelConfig | None = None) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        cfg: ModelConfig | None = None,
+        alloc: Callable[..., np.ndarray] = np.zeros,
+    ) -> None:
+        """``alloc(shape, dtype=...)`` supplies every field's storage.
+
+        It defaults to ``np.zeros`` and exists so the same buffer can be
+        built over shared memory: the parallel rollout has worker
+        processes fill rows that the parent reads without copying them
+        through a pipe. The allocator is called once per field in a
+        fixed order, so a carving allocator laying fields out end to end
+        produces the same layout in every process that runs this code.
+        Whatever it returns must be zeroed, the shape and dtype it was
+        asked for, and writable.
+        """
         cfg = cfg or ModelConfig()
         capacity = int(capacity)
         if capacity < 1:
@@ -281,28 +297,28 @@ class RolloutBuffer:
         self._n = 0
 
         c, h, k = capacity, cfg.max_history, cfg.max_candidates
-        self.history = np.zeros((c, h, HISTORY_DIM), dtype=np.float16)
-        self.history_len = np.zeros(c, dtype=np.int64)
-        self.context = np.zeros((c, CONTEXT_DIM), dtype=np.float16)
-        self.unseen = np.zeros((c, NUM_TYPES), dtype=np.float16)
-        self.planes = np.zeros((c, NUM_PLANES, NUM_TYPES), dtype=np.float16)
-        self.cards = np.zeros((c, NUM_TYPES, D_CARD), dtype=np.float16)
-        self.candidates = np.zeros((c, k, NUM_TYPES), dtype=np.float16)
-        self.candidate_mask = np.zeros((c, k), dtype=bool)
-        self.privileged = np.zeros(
+        self.history = alloc((c, h, HISTORY_DIM), dtype=np.float16)
+        self.history_len = alloc(c, dtype=np.int64)
+        self.context = alloc((c, CONTEXT_DIM), dtype=np.float16)
+        self.unseen = alloc((c, NUM_TYPES), dtype=np.float16)
+        self.planes = alloc((c, NUM_PLANES, NUM_TYPES), dtype=np.float16)
+        self.cards = alloc((c, NUM_TYPES, D_CARD), dtype=np.float16)
+        self.candidates = alloc((c, k, NUM_TYPES), dtype=np.float16)
+        self.candidate_mask = alloc((c, k), dtype=bool)
+        self.privileged = alloc(
             (c, NUM_PRIVILEGED_ROWS, NUM_TYPES), dtype=np.float16
         )
-        self.action = np.zeros(c, dtype=np.int64)
-        self.logp = np.zeros(c, dtype=np.float32)
-        self.value = np.zeros(c, dtype=np.float32)
-        self.reward = np.zeros(c, dtype=np.float32)
-        self.reward_points = np.zeros(c, dtype=np.float32)
-        self.reward_level = np.zeros(c, dtype=np.float32)
-        self.done = np.zeros(c, dtype=bool)
-        self.seat = np.zeros(c, dtype=np.int64)
-        self.episode = np.zeros(c, dtype=np.int64)
-        self.advantage = np.zeros(c, dtype=np.float32)
-        self.ret = np.zeros(c, dtype=np.float32)
+        self.action = alloc(c, dtype=np.int64)
+        self.logp = alloc(c, dtype=np.float32)
+        self.value = alloc(c, dtype=np.float32)
+        self.reward = alloc(c, dtype=np.float32)
+        self.reward_points = alloc(c, dtype=np.float32)
+        self.reward_level = alloc(c, dtype=np.float32)
+        self.done = alloc(c, dtype=bool)
+        self.seat = alloc(c, dtype=np.int64)
+        self.episode = alloc(c, dtype=np.int64)
+        self.advantage = alloc(c, dtype=np.float32)
+        self.ret = alloc(c, dtype=np.float32)
 
     # --- introspection ----------------------------------------------------
 
@@ -452,6 +468,55 @@ class RolloutBuffer:
 
         self._n = i + 1
         return i
+
+    def window(self, start: int, stop: int) -> "RolloutBuffer":
+        """A buffer over rows ``[start, stop)`` of this one, same storage.
+
+        Writes go through: the window's row 0 *is* this buffer's row
+        ``start``. The parallel rollout hands each worker a window on
+        the shared block, because ``add`` always writes at its own fill
+        mark -- give four workers the same buffer and all four write row
+        0. Give them windows and each fills its own range and nothing
+        else, with no lock, because the ranges are disjoint.
+
+        The window keeps its own fill count, starting at zero, so a
+        worker's ``len()`` is how many rows *it* wrote.
+        """
+        start, stop = int(start), int(stop)
+        if not 0 <= start < stop <= self.capacity:
+            raise ValueError(
+                f"window ({start}, {stop}) is not inside 0..{self.capacity}"
+            )
+
+        slices = [getattr(self, name)[start:stop] for name in self.fields]
+        taken: list[np.ndarray] = []
+
+        def hand_out(shape: Any, dtype: Any = np.float64) -> np.ndarray:
+            # Positional: the constructor allocates in the order
+            # ``fields`` lists, and this hands them back in that order.
+            # Checked rather than assumed, because the two drifting
+            # apart would alias one field onto another's storage and
+            # nothing downstream would raise.
+            if len(taken) >= len(slices):
+                raise AssertionError("more fields allocated than `fields` lists")
+            array = slices[len(taken)]
+            want = tuple(shape) if isinstance(shape, tuple) else (int(shape),)
+            if array.shape != want or array.dtype != np.dtype(dtype):
+                raise AssertionError(
+                    "RolloutBuffer allocates its fields in a different order "
+                    "than `fields` lists them, which window() relies on "
+                    f"(slot {len(taken)}: holds {array.shape}/{array.dtype}, "
+                    f"asked for {want}/{np.dtype(dtype)})"
+                )
+            taken.append(array)
+            return array
+
+        view = RolloutBuffer(stop - start, self.cfg, alloc=hand_out)
+        if len(taken) != len(slices):
+            raise AssertionError(
+                f"{len(taken)} fields allocated, {len(slices)} listed"
+            )
+        return view
 
     # --- reading ----------------------------------------------------------
 

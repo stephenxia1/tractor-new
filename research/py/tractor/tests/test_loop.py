@@ -323,6 +323,31 @@ def test_a_nonfinite_loss_never_reaches_the_weights() -> None:
     assert moved, "the learner stopped taking steps entirely"
 
 
+
+def test_the_loop_trains_through_the_parallel_rollout() -> None:
+    """`rollout_workers > 1` must be a change of venue, not of meaning.
+
+    The parallel path builds the buffer in worker processes, in shared
+    memory, and copies it back; everything after it -- GAE, the update,
+    the metrics row -- is the same code. So this checks the seam rather
+    than the arithmetic: the round is the size it was asked for, an
+    update ran on it, and the checkpoint the run leaves behind loads.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, total_steps=1, hands_per_step=4, rollout_workers=2,
+                   checkpoint_every=1)
+        out = train(cfg, device="cpu")
+
+    row = out["final"]
+    assert row["rollout/hands"] == 4
+    assert row["rollout/workers"] == 2.0
+    assert row["rollout/decisions"] > 0
+    # The update saw the rows the rollout wrote, so the seam carried
+    # them: a buffer that came back empty would still produce a row.
+    assert row["ppo/rows"] == row["rollout/decisions"]
+    assert row["ppo/n_minibatches"] > 0
+
+
 if __name__ == "__main__":
     import sys
     import traceback

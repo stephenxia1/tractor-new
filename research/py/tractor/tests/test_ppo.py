@@ -1283,3 +1283,109 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- 12. fitting a subset of the buffer -----------------------------------
+
+
+def test_update_rows_restricts_the_fit_to_the_selection() -> None:
+    """An excluded row is never read, so its poison never fires.
+
+    ``check_actions`` raises on an action that indexes a padded slot, so
+    an illegal action makes a sharp tracer: put one in a row, exclude
+    that row, and an update that still touches it says so. Checking
+    ``rows`` by looking at the weights instead would prove nothing --
+    every row shares every parameter, so all of them move whichever
+    subset was fitted.
+    """
+    buf = _FakeBuffer(12, seed=41)
+    poisoned = 5
+    buf.action[poisoned] = int(buf.candidate_mask[poisoned].sum())  # padded slot
+
+    keep = np.array([i for i in range(len(buf)) if i != poisoned], dtype=np.int64)
+    learner = PPOLearner(_net(11), PPOConfig(bf16=False, epochs=2, minibatch=4), DEVICE)
+    metrics = learner.update(buf, rows=keep)
+    assert metrics["rows"] == float(keep.size)
+
+    # The same buffer, with the poisoned row back in the selection.
+    learner = PPOLearner(_net(11), PPOConfig(bf16=False, epochs=2, minibatch=4), DEVICE)
+    try:
+        learner.update(buf, rows=np.arange(len(buf), dtype=np.int64))
+    except ValueError as exc:
+        assert "illegal candidate slot" in str(exc), exc
+    else:
+        raise AssertionError("the poisoned row was not read back")
+
+
+def test_update_rows_of_everything_is_the_unrestricted_update() -> None:
+    """``rows=arange(n)`` and ``rows=None`` are the same update.
+
+    Both build the same selection and shuffle it with the same draw, so
+    the minibatches are identical and every metric should agree to the
+    bit. A difference here would mean the restricted path takes a
+    different route through the buffer than the one every run so far
+    has used.
+    """
+
+    def run(rows: np.ndarray | None) -> dict[str, float]:
+        buf = _FakeBuffer(24, seed=42)
+        learner = PPOLearner(
+            _net(12), PPOConfig(bf16=False, epochs=2, minibatch=8), DEVICE
+        )
+        torch.manual_seed(99)
+        return learner.update(buf, rows=rows)
+
+    everything = run(None)
+    explicit = run(np.arange(24, dtype=np.int64))
+    assert set(everything) == set(explicit)
+    for key, a in everything.items():
+        b = explicit[key]
+        if math.isnan(a) and math.isnan(b):
+            continue
+        assert a == b, (key, a, b)
+
+
+def test_update_rows_outside_the_buffer_is_refused() -> None:
+    """Reading an unwritten row would train on a zeroed observation."""
+    buf = _FakeBuffer(8, seed=43)
+    learner = PPOLearner(_net(13), PPOConfig(bf16=False, epochs=1), DEVICE)
+    for bad in (np.array([0, 8], dtype=np.int64), np.array([-1, 2], dtype=np.int64)):
+        try:
+            learner.update(buf, rows=bad)
+        except IndexError as exc:
+            assert "outside" in str(exc), exc
+        else:
+            raise AssertionError(f"selection {bad} was accepted")
+
+    try:
+        learner.update(buf, rows=np.array([], dtype=np.int64))
+    except ValueError as exc:
+        assert "empty" in str(exc), exc
+    else:
+        raise AssertionError("an empty selection was accepted")
+
+
+def test_detach_critic_severs_the_shared_trunk() -> None:
+    """The flag's whole job: no value gradient reaches the actor's encoder.
+
+    The companion of ``test_critic_trains_when_the_learner_asks_it_to``,
+    which pins the default. Together they say the flag is wired to
+    something rather than merely stored.
+    """
+    buf = _FakeBuffer(8, seed=19)
+    buf.ret[:] = 0.5
+    net = _net(8)
+    learner = PPOLearner(net, PPOConfig(bf16=False, detach_critic=True), DEVICE)
+    obs, privileged, scalars = buf.as_torch(np.arange(len(buf)), DEVICE)
+    _, parts = learner.losses(obs, privileged, scalars)
+    learner.opt.zero_grad(set_to_none=True)
+    parts["value_loss"].backward()
+
+    trunk = net.actor.history.in_proj.weight
+    assert trunk.grad is None or float(trunk.grad.abs().max()) == 0.0, (
+        "the value loss reached the shared encoder despite detach_critic"
+    )
+    # The critic itself still learns; detaching cuts the trunk, not the head.
+    critic = net.critic.head[0].weight
+    assert critic.grad is not None and float(critic.grad.abs().max()) > 0.0
+    learner.opt.zero_grad(set_to_none=True)

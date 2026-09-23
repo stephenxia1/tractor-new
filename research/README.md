@@ -201,6 +201,100 @@ result was believed.
 - **Throughput**: tuned from 1.4k to ~4.1k decisions/s. The dominant term
   was torch thread count starving the Node actors, not the loop structure.
 
+## Two measurements on the PPO track (`py/tractor/`)
+
+Both are reproducible from the repo:
+`modal run modal_train.py::critic` and `modal run modal_train.py::rollout`.
+
+### The critic stops generalising as the reward anneal proceeds
+
+`explained_variance` as the learner logs it is measured on the rows the
+update is about to train on, so it says how well the behaviour critic fit
+the returns it already saw. `py/tractor/train/critic_diag.py` asks the
+other question: keep a quarter of the *hands* out of the fit, run the real
+update on the rest, and score the fitted critic on both halves. Hands, not
+rows — the critic reads a privileged view of all four hands, so a seat held
+out of a hand whose other seats were fitted is not held out at all.
+
+256 hands, 4 epochs, `gamma = 1`, against the step-2500 checkpoint:
+
+| `level_weight` | fitted hands | held-out hands | gap | calibration slope |
+| --- | --- | --- | --- | --- |
+| 0.00 | +0.842 | +0.405 | 0.437 | 0.71 |
+| 0.25 | +0.903 | +0.167 | 0.736 | 0.59 |
+| 0.50 | +0.919 | −0.105 | 1.025 | 0.45 |
+| 0.75 | +0.939 | −0.196 | 1.135 | 0.40 |
+| 1.00 | +0.941 | −0.324 | 1.265 | 0.34 |
+
+A negative held-out score is worse than predicting the mean, so past the
+middle of the anneal the value function adds variance to the policy
+gradient instead of removing it. The mechanism is the effective sample
+size: with `gamma = 1` and a terminal level reward, every row of a hand
+carries the same terminal term, so as the anneal moves weight onto it the
+returns within a hand converge and ~11,000 rows collapse towards ~512
+independent targets.
+
+Three remedies, measured at `level_weight = 1.0` on the same rollouts so
+the arms are paired:
+
+| change | held-out | gap |
+| --- | --- | --- |
+| baseline (4 epochs, `gamma = 1`) | −0.324 | 1.265 |
+| `gamma = 0.99` | −0.328 | 1.259 |
+| `detach_critic = True` | −0.320 | 1.256 |
+| 2 epochs | −0.226 | 1.038 |
+| **1 epoch** | **+0.030** | **0.567** |
+
+The discount and the detached trunk do nothing measurable. A hand is about
+22 decisions per seat, so `0.99^22 ≈ 0.80` barely separates rows that share
+a terminal term, and the memorisation is in the critic head reading the
+privileged view rather than in what the shared encoder holds. Epoch count
+is the only lever that moves the number, and one epoch is the only setting
+measured that is not actively harmful — it reaches break-even, not a useful
+critic. A useful one needs more independent targets, which means more hands
+per round.
+
+### The rollout was using one of eight reserved cores
+
+Span breakdown of a serial round on an A10G (128 hands, bf16): enumerate
+2.20 s, encode 1.54 s, simulator step 1.10 s, network forward 1.91 s. About
+two thirds is host work in pure Python, where threads cannot help because
+the enumerator holds the GIL.
+
+`py/tractor/train/parallel.py` moves the simulator into worker processes
+and keeps one batched forward in the parent. Two measurements shaped it.
+
+*The observations never travel through a queue.* `py/bench_ipc.py` puts a
+`multiprocessing.Queue` carrying the 28,466-byte observation per decision
+at ~1,150 decisions/s — slower than the loop it replaces — against ~23,600
+for a shared-memory ring with the queue carrying a row index, at a batch of
+32. So the buffer *is* the transport (`py/tractor/train/shared.py`) and the
+queues carry tags and integers.
+
+*The workers are persistent.* A spawned worker takes ~9.5 s to reach its
+first instruction, nearly all of it `import torch`. The first version
+spawned per round and measured 1.08x, with the entire gain inside the
+start-up. `RolloutPool` starts its workers once and a round is a message.
+
+| hands/round | serial | 4 workers | 7 workers |
+| --- | --- | --- | --- |
+| 128 | 6.16 s | 2.85 s (2.16x) | 2.70 s (2.28x) |
+| 512 | 19.59 s | 9.42 s (2.08x) | 8.15 s (2.40x) |
+
+Enable it with `rollout_workers` in `TrainConfig`, or `--rollout-workers`
+on the Modal entrypoints.
+
+### What the two together imply for a run
+
+One epoch over four times the hands is the same number of gradient steps on
+four times as many independent targets, and the update cost scales with
+rows times epochs, so those cancel. With the parallel rollout absorbing the
+larger round, 512 hands at one epoch costs close to what 128 hands at four
+epochs cost — which is why `launch` now defaults to `--hands 512 --epochs 1
+--rollout-workers 7`.
+
+---
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
