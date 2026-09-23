@@ -551,14 +551,19 @@ def _rollout_bench(checkpoint: str, hands: int, pool: int, worker_counts: list,
             del warm_t
 
             best_p, pstats = None, None
+            pspans = Spans()
             for r in range(rounds):
                 t0 = time.perf_counter()
                 _out, pstats = worker_pool.collect(
                     net, np.random.default_rng(seed + r), None,
                     n_hands=hands, device=device, pool=pool, amp=amp,
+                    spans=pspans if r == 0 else None,
                 )
                 secs = time.perf_counter() - t0
                 best_p = secs if best_p is None else min(best_p, secs)
+            pspans.flush()
+            parent = {k: round(float(v["total"]), 2)
+                      for k, v in pspans.summary().items()}
         finally:
             worker_pool.close()
 
@@ -569,13 +574,18 @@ def _rollout_bench(checkpoint: str, hands: int, pool: int, worker_counts: list,
                      "mean_batch": pstats["mean_batch"],
                      "startup_s": startup_s,
                      "shared_gib": block_gib, "rss_gib": rss_gib(),
-                     "speedup": serial_s / best_p})
+                     "speedup": serial_s / best_p,
+                     **{f"parent_{k}": v for k, v in parent.items()}})
         print(f"  parallel x{workers:<2d} {best_p:7.2f}s  "
               f"{pstats['decisions'] / best_p:8.0f} dec/s  "
               f"batch {pstats['mean_batch']:.0f}  "
               f"{serial_s / best_p:.2f}x serial  "
               f"(start-up {startup_s:.1f}s; shared block "
               f"{block_gib:.2f} GiB)", flush=True)
+        # What the parent did while its workers waited: this is the
+        # term that does not fall with the worker count.
+        print(f"              parent {parent}  "
+              f"sum {sum(parent.values()):.2f}s", flush=True)
     return rows
 
 

@@ -333,19 +333,28 @@ class RolloutPool:
                     if not pending:
                         break
 
-                    rows = np.concatenate([
-                        np.arange(first, first + count, dtype=np.int64)
-                        for first, count in (pending[w] for w in sorted(pending))
-                    ])
-                    obs = obs_batch_from_arrays(
-                        buf.history[rows], buf.history_len[rows],
-                        buf.context[rows], buf.unseen[rows], buf.planes[rows],
-                        buf.cards[rows], buf.candidates[rows],
-                        buf.candidate_mask[rows], device=device,
-                    )
-                    privileged = torch.from_numpy(
-                        buf.privileged[rows].astype(np.float32)
-                    ).to(device)
+                    # Fancy indexing, so each of these materialises a
+                    # copy: at 1024 hands a round moves about 2.4 GiB
+                    # through here. Timed apart from the forward because
+                    # the two have different remedies -- this one shrinks
+                    # by slicing each worker's contiguous run instead of
+                    # gathering, the forward only by a wider batch.
+                    with _span(spans, "gather"):
+                        rows = np.concatenate([
+                            np.arange(first, first + count, dtype=np.int64)
+                            for first, count in
+                            (pending[w] for w in sorted(pending))
+                        ])
+                        obs = obs_batch_from_arrays(
+                            buf.history[rows], buf.history_len[rows],
+                            buf.context[rows], buf.unseen[rows],
+                            buf.planes[rows], buf.cards[rows],
+                            buf.candidates[rows], buf.candidate_mask[rows],
+                            device=device,
+                        )
+                        privileged = torch.from_numpy(
+                            buf.privileged[rows].astype(np.float32)
+                        ).to(device)
                     with _span(spans, "forward"):
                         out, values = _evaluate(net, obs, privileged)
                     with _span(spans, "sample"):
@@ -353,21 +362,25 @@ class RolloutPool:
                             out.logits, obs.candidate_mask, temperature,
                             greedy, rng,
                         )
-                    buf.action[rows] = slots.astype(np.int64)
-                    buf.logp[rows] = chosen_logp.astype(np.float32)
-                    buf.value[rows] = (
-                        values.detach().float().cpu().numpy().astype(np.float32)
-                    )
+                    with _span(spans, "writeback"):
+                        buf.action[rows] = slots.astype(np.int64)
+                        buf.logp[rows] = chosen_logp.astype(np.float32)
+                        buf.value[rows] = (
+                            values.detach().float().cpu().numpy()
+                            .astype(np.float32)
+                        )
                     forwards += 1
                     batch_total += int(rows.size)
-                    for w in pending:
-                        self._rep_qs[w].put(("go",))
+                    with _span(spans, "release"):
+                        for w in pending:
+                            self._rep_qs[w].put(("go",))
 
-            filled = [
-                (self.ranges[w][0], self.ranges[w][0] + ends.get(w, 0))
-                for w in range(workers)
-            ]
-            rows_written = compact_ranges(buf, filled)
+            with _span(spans, "compact"):
+                filled = [
+                    (self.ranges[w][0], self.ranges[w][0] + ends.get(w, 0))
+                    for w in range(workers)
+                ]
+                rows_written = compact_ranges(buf, filled)
 
             out_buffer = buffer if buffer is not None else RolloutBuffer(
                 max(rows_written, 1), self.cfg
@@ -377,11 +390,15 @@ class RolloutPool:
                     f"the caller's buffer holds {out_buffer.capacity} rows "
                     f"and the round wrote {rows_written}"
                 )
-            for name in buf.fields:
-                getattr(out_buffer, name)[:rows_written] = getattr(buf, name)[
-                    :rows_written
-                ]
-            out_buffer._n = rows_written
+            # A second full pass over the round's bytes. Avoidable in
+            # principle -- the learner could read the shared block --
+            # but only once nothing downstream outlives the pool.
+            with _span(spans, "copy_out"):
+                for name in buf.fields:
+                    getattr(out_buffer, name)[:rows_written] = getattr(
+                        buf, name
+                    )[:rows_written]
+                out_buffer._n = rows_written
         finally:
             if was_training and hasattr(net, "train"):
                 net.train()

@@ -73,7 +73,15 @@ class TrainConfig:
     # GPU: a 4-hand step measured a mean batch of 3.5, against 80 at a
     # pool of 128. It costs memory in proportion, since each hand in
     # flight holds its own state and encoder output.
-    pool: int = 128
+    #
+    # 512 rather than 128 because it was measured: at 1024 hands a
+    # round it takes the mean batch from 114 to 385 and the round from
+    # 15.84 s to 13.80 s. The forward barely notices -- 7.58 s to
+    # 6.86 s for 3.4x the batch -- which is itself the finding: the
+    # forward is proportional to decisions rather than to launches, so
+    # it is arithmetic and not per-call overhead, and no batch size
+    # will remove it.
+    pool: int = 512
 
     # Reward anneal, described in the module docstring. Both zero:
     # the reward is trick points and the terminal level term is off.
