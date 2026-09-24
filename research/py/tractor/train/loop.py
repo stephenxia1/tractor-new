@@ -167,6 +167,9 @@ class TrainConfig:
     random_burial_frac: float = 0.2
     bury_rounds: int = 8
     bury_consider: int = 0
+    # What scores a burial: "actor" or "critic"; see ``sim.bury.BuryConfig``.
+    bury_evaluator: str = "actor"
+    bury_worlds: int = 8
     declare: dict = field(default_factory=dict)
     # Build the next step's play starts on a thread while this step's
     # update runs, from a frozen copy of the network (the update is
@@ -359,15 +362,16 @@ def train(
         start = load_checkpoint(Path(resume), net, learner)
 
     full_hand = cfg.declare_phase_steps > 0
+    bury_cfg = BuryConfig(
+        rounds=cfg.bury_rounds, consider=cfg.bury_consider,
+        evaluator=cfg.bury_evaluator, worlds=cfg.bury_worlds,
+    )
     declare_net = declare_learner = None
     phases_done = 0
     if full_hand:
         declare_cfg = DeclareTrainConfig(**{
             **cfg.declare,
-            "pre": PrePlayConfig(
-                random_burial_frac=0.0,
-                bury=BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider),
-            ),
+            "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg),
         })
         declare_net = DeclareNet().to(device)
         declare_learner = DeclareLearner(declare_net, declare_cfg, device)
@@ -382,8 +386,7 @@ def train(
             phases_done = int(saved["phases_done"])
         declare_net.eval()
     play_pre = PrePlayConfig(
-        random_burial_frac=cfg.random_burial_frac,
-        bury=BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider),
+        random_burial_frac=cfg.random_burial_frac, bury=bury_cfg
     )
 
     def extra() -> dict | None:

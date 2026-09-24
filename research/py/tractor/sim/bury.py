@@ -84,6 +84,20 @@ class BuryConfig:
     # array of kitties -- 54 bytes each, up to ~200 a hand -- and the
     # forward over them is chunked separately.
     group: int = 256
+    # What scores a candidate. "actor": the actor's own value head from
+    # the landlord's seat. "critic": the privileged critic averaged over
+    # ``worlds`` deals of the landlord's unseen cards, sampled once per
+    # hand and shared by every candidate of it. At play start nothing has
+    # been played, so a uniform deal of the other 75 cards is exactly
+    # what the landlord knows (declarations aside), and the critic reads
+    # only the hands, the burial and the context -- no actor forward.
+    #
+    # Measured at v4-full step 2400 against smart-v18/v28/v34: the actor
+    # climb won 0.52, its own heuristic starting point 0.544, and 0.45
+    # against 0.50 in the hands the network was landlord. Taking the best
+    # of ~100 noisy estimates picks the burials the estimate overrates.
+    evaluator: str = "actor"
+    worlds: int = 8
 
 
 def _keep_scores(pool: np.ndarray, ctx: Ctx) -> np.ndarray:
@@ -260,14 +274,69 @@ class _DeviceBases:
     was most of what a burial cost.
     """
 
-    def __init__(self, bases: Sequence[_Base], pools: np.ndarray, device: Any) -> None:
+    def __init__(self, bases: Sequence[_Base], pools: np.ndarray, device: Any,
+                 landlords: Sequence[int] | None = None, worlds: int = 0,
+                 rng: np.random.Generator | None = None) -> None:
         dev = torch.device(device)
         self.device = dev
+        # For the critic: ``worlds`` deals of each hand's unseen cards to
+        # the three other seats, in the landlord's relative order.
+        self.others = None
+        if worlds > 0:
+            rng = rng or np.random.default_rng(0)
+            n = len(bases)
+            others = np.zeros((n, worlds, 3, NUM_TYPES), dtype=np.float32)
+            for i in range(n):
+                unseen = full_deck(bases[i].num_decks).astype(np.int64) - pools[i]
+                cards = np.repeat(np.arange(NUM_TYPES), unseen)
+                size = len(cards) // 3
+                for w in range(worlds):
+                    rng.shuffle(cards)
+                    for s in range(3):
+                        others[i, w, s] = np.bincount(
+                            cards[s * size : (s + 1) * size], minlength=NUM_TYPES
+                        )
+            self.others = torch.from_numpy(others).to(dev)
         self.context = torch.from_numpy(np.stack([b.context for b in bases])).to(dev)
         self.unseen = torch.from_numpy(np.stack([b.unseen for b in bases])).to(dev)
         self.cards = torch.from_numpy(np.stack([b.cards for b in bases])).to(dev)
         self.decks = torch.tensor([float(b.num_decks) for b in bases], device=dev)
         self.pools = torch.from_numpy(pools.astype(np.float32)).to(dev)
+
+    def critic_values(self, net: Any, owner: np.ndarray, kitties: np.ndarray,
+                      chunk: int) -> np.ndarray:
+        """float32[N]: the critic's value, averaged over the sampled deals."""
+        critic = net.critic
+        cfg = net.cfg
+        dev = self.device
+        assert self.others is not None
+        worlds = self.others.shape[1]
+        own_all = torch.from_numpy(owner).to(dev)
+        kit_all = torch.from_numpy(kitties.astype(np.float32)).to(dev)
+        out = np.empty(len(owner), dtype=np.float32)
+        per = max(1, chunk // worlds)
+        with torch.no_grad():
+            for lo in range(0, len(owner), per):
+                hi = min(lo + per, len(owner))
+                b = hi - lo
+                own = own_all[lo:hi]
+                kit = kit_all[lo:hi]
+                hand = self.pools[own] - kit
+                priv = torch.empty(b, worlds, 5, NUM_TYPES, device=dev)
+                priv[:, :, 0] = hand[:, None]
+                priv[:, :, 1:4] = self.others[own]
+                priv[:, :, 4] = kit[:, None]
+                rows = b * worlds
+                # Empty histories: the critic's fast path reads only the
+                # batch size from this, so one position is enough.
+                v = critic(
+                    torch.zeros(rows, 1, cfg.d_model, device=dev),
+                    torch.zeros(rows, dtype=torch.int64, device=dev),
+                    priv.reshape(rows, 5, NUM_TYPES),
+                    context=self.context[own].repeat_interleave(worlds, dim=0),
+                )
+                out[lo:hi] = v.float().reshape(b, worlds).mean(1).cpu().numpy()
+        return out
 
     def values(self, net: Any, owner: np.ndarray, kitties: np.ndarray, chunk: int) -> np.ndarray:
         actor = _actor(net)
@@ -371,10 +440,14 @@ def value_burials(
     if n == 0:
         return [], {"value_start": 0.0, "value_end": 0.0, "rounds": 0.0}
     pool_arr = np.stack([np.asarray(p, dtype=np.int8) for p in pools])
+    use_critic = bury.evaluator == "critic"
     bases = _DeviceBases(
         [_base(ctxs[i], pool_arr[i], landlords[i], num_decks, cache) for i in range(n)],
-        pool_arr, device,
+        pool_arr, device, landlords,
+        worlds=bury.worlds if use_critic else 0,
+        rng=np.random.default_rng(int(pool_arr.sum(axis=1)[0]) * 7919 + n),
     )
+    score = bases.critic_values if use_critic else bases.values
     keep_scores = [_keep_scores(pool_arr[i], ctxs[i]) for i in range(n)]
     current = [heuristic_burial(pool_arr[i], ctxs[i]) for i in range(n)]
     value = np.full(n, -np.inf, dtype=np.float64)
@@ -402,7 +475,7 @@ def value_burials(
             spans.append((at, at + len(rows)))
             at += len(rows)
         all_k = np.concatenate(kitties)
-        v = bases.values(net, np.concatenate(owners), all_k, bury.chunk)
+        v = score(net, np.concatenate(owners), all_k, bury.chunk)
         rounds = r
         still: list[int] = []
         for i, (lo, hi) in zip(live, spans):

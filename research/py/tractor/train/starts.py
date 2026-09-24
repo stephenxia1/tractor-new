@@ -298,7 +298,9 @@ def critic_values(
         for lo in range(0, len(out), chunk):
             hi = min(lo + chunk, len(out))
             b = hi - lo
-            enc = torch.zeros(b, cfg.max_history, cfg.d_model, device=device)
+            # Empty histories: the critic's fast path reads only the batch
+            # size from this, so one position is enough.
+            enc = torch.zeros(b, 1, cfg.d_model, device=device)
             length = torch.zeros(b, dtype=torch.int64, device=device)
             v = critic(
                 enc, length,

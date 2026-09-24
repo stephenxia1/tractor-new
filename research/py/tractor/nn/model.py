@@ -1060,22 +1060,35 @@ class Critic(nn.Module):
         if detach:
             history_enc = history_enc.detach()
 
-        keep = _length_mask(history_len, self.cfg.max_history)
-        gate = keep.unsqueeze(-1).to(history_enc.dtype)
-        h = (self.in_proj(history_enc) + self.pos) * gate
+        b = history_enc.shape[0]
+        if b > 0 and int(history_len.max()) == 0:
+            # No history in any row: every key but the CLS token is
+            # masked, so CLS attends to itself alone and the pooled
+            # vector is the same for every row. Computed once, on the CLS
+            # token by itself -- exactly what the full sequence computes
+            # for it -- and broadcast. Play-start values (declaration
+            # rewards, critic-scored burials) are all this case.
+            x = self.cls.unsqueeze(0)
+            one = torch.ones(1, 1, 1, 1, dtype=torch.bool, device=x.device)
+            for block in self.blocks:
+                x = block(x, one)
+            pooled = self.norm(x[:, 0]).expand(b, self.cfg.critic_d)
+        else:
+            keep = _length_mask(history_len, self.cfg.max_history)
+            gate = keep.unsqueeze(-1).to(history_enc.dtype)
+            h = (self.in_proj(history_enc) + self.pos) * gate
 
-        b = h.shape[0]
-        cls = self.cls.unsqueeze(0).expand(b, 1, self.cfg.critic_d)
-        x = torch.cat((cls, h), dim=1)
-        seq_keep = torch.cat(
-            (torch.ones(b, 1, dtype=torch.bool, device=h.device), keep), dim=1
-        )
-        seq_gate = seq_keep.unsqueeze(-1).to(x.dtype)
-        attn = seq_keep[:, None, None, :]
+            cls = self.cls.unsqueeze(0).expand(b, 1, self.cfg.critic_d)
+            x = torch.cat((cls, h), dim=1)
+            seq_keep = torch.cat(
+                (torch.ones(b, 1, dtype=torch.bool, device=h.device), keep), dim=1
+            )
+            seq_gate = seq_keep.unsqueeze(-1).to(x.dtype)
+            attn = seq_keep[:, None, None, :]
 
-        for block in self.blocks:
-            x = block(x, attn) * seq_gate
-        pooled = self.norm(x[:, 0])  # [B, critic_d]
+            for block in self.blocks:
+                x = block(x, attn) * seq_gate
+            pooled = self.norm(x[:, 0])  # [B, critic_d]
 
         flat = privileged.reshape(b, NUM_PRIVILEGED_ROWS * NUM_TYPES)
         first = self.privileged[0](flat)

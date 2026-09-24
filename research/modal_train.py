@@ -215,7 +215,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            play_phase_steps: int = 250, declare_phase_steps: int = 0,
            declare_hands: int = 1024, random_burial_frac: float = 0.2,
            bury_rounds: int = 8, bury_consider: int = 0,
-           length_buckets: int = 0, prefetch_starts: bool = False) -> None:
+           length_buckets: int = 0, prefetch_starts: bool = False,
+           bury_evaluator: str = "actor") -> None:
     """Submit a run and return, rather than waiting on it.
 
     The defaults for `hands`, `epochs` and `rollout_workers` come from
@@ -289,6 +290,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             "bury_consider": bury_consider,
             "declare": {"hands_per_step": declare_hands},
             "prefetch_starts": prefetch_starts,
+            "bury_evaluator": bury_evaluator,
         },
     )
     print(f"submitted {name}: call {call.object_id}")

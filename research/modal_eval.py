@@ -79,9 +79,11 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
     # the network's seats never declare: what declaring is worth.
     # agent-heur keeps the declaration network and buries by the plain
     # heuristic the climb starts from: what the climb is worth.
+    # agent-critic climbs on the privileged critic averaged over 8 deals
+    # of the landlord's unseen cards instead of the actor's value head.
     host_pre = "agent" if pre_play.startswith("agent") else pre_play
     declare_net = None
-    if pre_play in ("agent", "agent-heur"):
+    if pre_play in ("agent", "agent-heur", "agent-critic"):
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if blob.get("declare") is not None:
             declare_net = DeclareNet()
@@ -93,9 +95,12 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
                              per_hand=True, pre_play=host_pre,
                              search=SearchConfig(**search) if search else None,
                              declare_net=declare_net,
-                             bury=BuryConfig(
-                                 rounds=0 if pre_play == "agent-heur" else 8,
-                                 consider=12))
+                             bury=(
+                                 BuryConfig(evaluator="critic", worlds=8, rounds=8)
+                                 if pre_play == "agent-critic" else
+                                 BuryConfig(
+                                     rounds=0 if pre_play == "agent-heur" else 8,
+                                     consider=12)))
     stats["seconds"] = time.perf_counter() - started
     stats["checkpoint"] = checkpoint
     stats["bot"] = bot

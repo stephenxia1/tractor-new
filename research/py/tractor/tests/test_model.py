@@ -714,3 +714,23 @@ def test_critic_context_starts_inert_then_matters() -> None:
         moved = critic(enc, lengths, priv, context=obs.context)
         other = critic(enc, lengths, priv, context=obs.context.flip(0))
     assert not torch.allclose(moved, other), "the critic ignores its context"
+
+
+def test_critic_empty_history_fast_path_is_exact() -> None:
+    """With no history the pooled vector is computed once and broadcast;
+    it must equal what the full sequence computes."""
+    cfg = ModelConfig()
+    torch.manual_seed(8)
+    critic = Critic(cfg).eval()
+    with torch.no_grad():
+        critic.context_proj.weight.normal_(0, 0.1)
+    obs, priv = dummy_batch(cfg, batch=5, seed=51)
+    enc = torch.randn(5, cfg.max_history, cfg.d_model)
+    zero = torch.zeros(5, dtype=torch.int64)
+    one_long = torch.tensor([0, 0, 0, 0, 1], dtype=torch.int64)
+    with torch.no_grad():
+        fast = critic(enc, zero, priv, context=obs.context)
+        # A batch with one real token takes the full path; its first four
+        # rows have empty histories and must agree with the fast path.
+        full = critic(enc, one_long, priv, context=obs.context)
+    assert torch.allclose(fast[:4], full[:4], atol=1e-6), (fast[:4], full[:4])
