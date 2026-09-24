@@ -9,6 +9,119 @@ Don't re-derive those numbers; extend them.
 
 ---
 
+## 0. Update, late 2026-09-23 — read this first
+
+A second session re-measured everything at 770 deals a bot, changed how
+evaluation is run, and added search at inference time. **Several claims
+below are superseded by this section**, notably §2's "at or above even
+against every rung".
+
+### What changed in evaluation
+
+- **Only fair bots.** `smart-v2` through `smart-v12` search on the true
+  deal (v2 simulates each trick with the other seats' real cards; v3+ read
+  opponent hands; see the `smart-v13` comment in
+  `packages/engine/src/bot.ts`). They are out of `LADDER`
+  (`py/tractor/eval/bots.py`) and out of `modal_eval.py`'s defaults. The
+  fair smart bots are `smart`, `smart-v18`, `smart-v28`, `smart-v34`
+  (v13+ sample hidden hands). The last three are near-copies; their results
+  on the same deals are strongly correlated.
+- **Random pre-play by default.** Before this, the opponent bot declared
+  and buried for all four seats, the network's included. Now
+  `GameSlot.randomPrePlay` (`src/env.ts`, `--pre-play random|bot` in
+  `src/evalhost.ts`, `pre_play=` in `play_against_bot`) draws the
+  declaration uniformly over legal (seat, declaration) pairs and the burial
+  uniformly — the training generator's distribution (`gen/episode.py`) —
+  from a stream keyed on the deal, so both duplicate halves still match.
+  This also changes what the in-training ladder evaluation measures.
+- **`modal_eval.py`** (separate Modal app, default `tractor-eval`,
+  overridable with `TRACTOR_EVAL_APP`): one container per
+  (checkpoint, bot), 770 deals (±0.025 on a win rate), per-hand results for
+  paired comparisons, appended to a JSONL as each pair lands and resumed on
+  rerun. Modal preempts containers; rerun the same command to fill gaps.
+
+### What was measured (all 770 deals, 1,540 hands a bot)
+
+The policy has been **flat since about step 500**. Paired on the same
+hands, step 1250 and step 1625 differ from step 500 by +0.004 and +0.002
+(±0.015) against v18/v28/v34. `v3-points` (resumed from `v2-points`) was
+stopped at step 2003; its last checkpoint is
+`/vol/v3-points/checkpoints/step_0002000.pt`.
+
+v3 step 2000, random pre-play:
+
+| opponent | | win rate | levels/deal | points/deal |
+| --- | --- | --- | --- | --- |
+| random | no search | 0.746 ± 0.022 | +0.850 ± 0.041 | +34.0 ± 1.6 |
+| smart | no search | 0.518 ± 0.025 | +0.037 ± 0.037 | +1.7 ± 1.4 |
+| smart | **search** | **0.539** | **+0.115** | **+4.6** |
+| smart-v18 | no search | 0.499 | −0.003 | +0.4 |
+| smart-v18 | **search** | **0.537** | **+0.080** | **+3.5** |
+| smart-v28 | no search | 0.499 | +0.004 | +0.6 |
+| smart-v28 | **search** | **0.537** | **+0.080** | **+3.3** |
+| smart-v34 | no search | 0.498 | −0.006 | +0.2 |
+| smart-v34 | **search** | **0.538** | **+0.088** | **+3.6** |
+
+Search's paired gain against v18/v28/v34 is +0.038 to +0.040 win rate
+(±0.022 each, every one excluding zero). Under the old bot pre-play the
+policy scored ~0.49 against those three; the old table in §2 came from 16
+deals a rung and is noise.
+
+Raw per-hand results: `evals/2026-09-23/*.jsonl` (copied from the
+gitignored `runs/`). Two runs were still in flight when this was written
+and may be missing there: search against `random`, and a deep search
+(16 worlds, top 4, 3 extra tricks, confident 0.95) against the four smart
+bots.
+
+### Inference-time search (`py/tractor/eval/search.py`)
+
+For a decision where the policy's top move has under `confident` (0.9)
+probability: sample `worlds` (8) deals of the unseen cards consistent with
+the seat's view (own hand, the table, hand sizes, suits a seat has shown
+itself out of, the kitty only if it buried it); play each of the policy's
+`top_k` (3) moves in every world; let the greedy policy play all seats to
+the end of the trick (+`extra_tricks`); score = points settled for the
+searching team + 400 × the privileged critic's value in that world (+ the
+kitty bonus if the hand ended); take the best mean. `tests/test_search.py`
+re-deals the hidden cards and requires identical worlds and choices.
+
+It must run on a GPU: a CPU forward is ~100 ms a row on one thread.
+`modal_eval.py --search-worlds 8` routes to an A10G container; about 40
+minutes a smart bot at 770 deals, a third of decisions searched.
+
+### Next steps, in order
+
+1. Read the deep-search result (or rerun it) to see if more search helps.
+2. Train on realistic declarations and burials instead of uniform ones,
+   and credit the kitty bonus in the reward (it is invisible to the
+   points-only reward and the critic).
+3. Opponent pool of past checkpoints instead of pure self-play (entropy has
+   been flat at ~0.31 since step 500).
+4. Distil search back into the policy.
+
+### Corrections to the commands below
+
+- `--steps` is the **absolute** step count. Resuming a step-1250
+  checkpoint with `--steps 1250` trains nothing; use `--steps 2500` for
+  1250 more. A `--resume` path that does not exist silently starts from
+  step 0 — confirm the first log line reads `[1251/...]`.
+- §6.1's `modal run modal_train.py::critic` is the critic diagnostic, not
+  a ladder evaluation. Use `modal_eval.py`.
+- Log lines carry ANSI colour codes, so `grep "^\[123/"` never matches.
+- The `modal` CLI is `/c/Users/xiast/anaconda3/envs/tractor/Scripts/modal.exe`
+  on the Windows machine; a cloud session needs its own Modal token
+  (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`) to run anything.
+
+```bash
+# The measurements above (from research/)
+modal run modal_eval.py::smart --checkpoints /vol/v3-points/checkpoints/step_0002000.pt \
+  --pre-play random --out runs/eval.jsonl                       # policy alone
+modal run modal_eval.py::smart --checkpoints /vol/v3-points/checkpoints/step_0002000.pt \
+  --pre-play random --search-worlds 8 --out runs/eval.jsonl     # with search
+```
+
+---
+
 ## 1. Where things stand
 
 **Branch `rl-research`, working tree clean, 4 commits unpushed:**
