@@ -10,6 +10,7 @@
 
 import {
   NATURAL_RANKS,
+  SUITS,
   applyEvent,
   cardKey,
   createGame,
@@ -65,6 +66,13 @@ export type SlotOptions = {
   readonly baselineBotBySeat?: ReadonlyArray<BotType | undefined>;
   // Bot used for declaration and kitty burial at every seat.
   readonly prePlayBot?: BotType;
+  // Replace the pre-play bot with the Python generator's draw
+  // (tractor/gen/episode.py): one declaration uniform over every legal
+  // (seat, declaration), no overrides, and a burial uniform over the
+  // landlord's cards. Evaluation uses it so neither side plays from a
+  // position its own heuristic set up. In duplicate mode the draws come
+  // from a stream keyed on the deal, so both halves agree.
+  readonly randomPrePlay?: boolean;
   // Probability that a hand's kitty is perturbed away from the pre-play
   // bot's choice, and the most cards that can be swapped when it is.
   readonly kittyNoise?: number;
@@ -129,6 +137,8 @@ export class GameSlot {
   private dealDigestValue = 0;
   private dealtCards: DealtCards | null = null;
   private buriedKitty: Card[] = [];
+  private prePlayRng: () => number = Math.random;
+  private declaredThisHand = false;
   private pending: Pending | null = null;
   private forcedLeads = 0;
   private assertNoForcedLead = false;
@@ -343,6 +353,15 @@ export class GameSlot {
     base = { ...base, landlord, teamLevels: levels };
     this.state = base;
     this.buriedKitty = [];
+    this.declaredThisHand = false;
+    // Not the slot's own chain: that is also drawn from by the seed of
+    // each half (different on purpose), so it would split the pair.
+    this.prePlayRng =
+      this.opts.dealSeedBase !== undefined
+        ? mulberry32(
+            mix32(this.opts.dealSeedBase ^ 0x5eed_b0b0, this.gameId, this.currentHandId),
+          )
+        : this.rng;
     this.apply({ kind: 'start_hand', seed: handSeed });
     this.dealDigestValue = this.computeDealDigest();
     this.dealtCards =
@@ -396,6 +415,10 @@ export class GameSlot {
   }
 
   private runDeclarePhase(): void {
+    if (this.opts.randomPrePlay === true) {
+      this.runRandomDeclare();
+      return;
+    }
     const numPlayers = this.state.config.numPlayers;
     for (let seat = 0; seat < numPlayers; seat++) {
       const action = pickBotAction(this.state, seat, this.prePlayBot);
@@ -419,6 +442,53 @@ export class GameSlot {
     this.apply({ kind: 'pick_up_kitty', seat: landlord });
   }
 
+  // The generator's declaration: every legal (seat, declaration) listed
+  // in the same order as `legal_declarations` in tractor/gen/episode.py
+  // -- per seat, per suit a single then a pair of the level card, then
+  // the joker pairs -- one drawn uniformly, and nobody overrides it. The
+  // landlord is already fixed here, so the draw sets only the trump suit.
+  // With nothing to declare, the lockout release flips the kitty.
+  private runRandomDeclare(): void {
+    const hand = this.state.currentHand;
+    if (hand === null) throw new Error('declare phase with no hand');
+    if (this.state.phase === 'declare_open') {
+      if (hand.landlord === null) throw new Error('declare_open with no landlord');
+      this.apply({ kind: 'pick_up_kitty', seat: hand.landlord });
+      return;
+    }
+    if (!this.declaredThisHand) {
+      this.declaredThisHand = true;
+      const level = hand.trumpRank;
+      const options: { seat: Seat; cards: Card[] }[] = [];
+      const numDecks = this.state.config.numDecks;
+      for (let s = 0; s < this.state.config.numPlayers; s++) {
+        const seat = s as Seat;
+        const held = hand.hands[seat] ?? [];
+        for (const suit of SUITS) {
+          const cards = held.filter(
+            (c) => c.kind === 'standard' && c.rank === level && c.suit === suit,
+          );
+          if (cards.length >= 1) options.push({ seat, cards: [cards[0]!] });
+          if (cards.length >= numDecks) {
+            options.push({ seat, cards: cards.slice(0, 2) });
+          }
+        }
+        for (const rank of ['small', 'big'] as const) {
+          const jokers = held.filter((c) => c.kind === 'joker' && c.rank === rank);
+          if (jokers.length >= numDecks) {
+            options.push({ seat, cards: jokers.slice(0, 2) });
+          }
+        }
+      }
+      if (options.length > 0) {
+        const pick = options[Math.floor(this.prePlayRng() * options.length)]!;
+        this.apply({ kind: 'declare', seat: pick.seat, cards: pick.cards });
+        return;
+      }
+    }
+    this.apply({ kind: 'release_lockout', seed: this.nextSeed() });
+  }
+
   // Every training game so far buried its kitty with one heuristic, so the
   // agent has only ever seen the positions that heuristic produces. That is
   // a distribution the agent can quietly fit to: measured, swapping the
@@ -435,6 +505,20 @@ export class GameSlot {
       throw new Error('kitty_replace with no landlord');
     }
     const seat = hand.landlord;
+    if (this.opts.randomPrePlay === true) {
+      // A uniform eight of the landlord's cards: a partial Fisher-Yates
+      // over the hand as it stands, which is the same in both halves.
+      const pool = [...(hand.hands[seat] ?? [])];
+      const k = this.state.config.kittySize;
+      for (let i = 0; i < k; i++) {
+        const j = i + Math.floor(this.prePlayRng() * (pool.length - i));
+        [pool[i], pool[j]] = [pool[j]!, pool[i]!];
+      }
+      const cards = pool.slice(0, k);
+      this.buriedKitty = [...cards];
+      this.apply({ kind: 'replace_kitty', seat, cards });
+      return;
+    }
     const action = pickBotAction(this.state, seat, this.prePlayBot);
     if (action.kind !== 'replace_kitty') {
       throw new Error(`expected replace_kitty from bot, got ${action.kind}`);

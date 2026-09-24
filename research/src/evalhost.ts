@@ -280,6 +280,14 @@ async function main(): Promise<void> {
   const seedBase = argOf('seed-base', 12345);
   const bot = strOf('bot', 'smart-v34') as BotType;
   const maxCandidates = argOf('max-candidates', 128);
+  // Who declares and buries. `random` is the training generator's draw,
+  // so neither side plays from a position its own heuristic set up;
+  // `bot` hands both to the opponent bot at every seat, the network's
+  // included, which is how every measurement before 2026-09-23 was taken.
+  const prePlay = strOf('pre-play', 'random');
+  if (prePlay !== 'random' && prePlay !== 'bot') {
+    throw new Error(`--pre-play must be random or bot, got ${prePlay}`);
+  }
   // Shard: this host plays the games congruent to `shard` modulo
   // `shards`. A deal is a pure function of the seed base and its game
   // id, so the shards are independent and their union is the whole set
@@ -321,6 +329,7 @@ async function main(): Promise<void> {
         learnerSeats: halves[half]!,
         baselineBot: bot,
         prePlayBot: bot,
+        randomPrePlay: prePlay === 'random',
         maxCandidates,
         randomize: false,
         dealSeedBase: seedBase,

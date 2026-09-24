@@ -60,6 +60,7 @@ from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, TrickRecord, team_of
 from ..train.buffer import obs_batch_from_arrays
 from ..train.rollout import _InFlight, _choose, _evaluate, _pack
+from .search import SearchConfig, search_move
 from .duplicate import (
     DECK_POINTS,
     HandOutcome,
@@ -90,15 +91,19 @@ HOST = REPO / "research" / "src" / "evalhost.ts"
 # that search cost 560 to 670 -- a factor of fifty. A measurement cut
 # short by its budget therefore still returns the cheap end, which is
 # the half that runs every time.
+#
+# Only bots that play from what a seat can see. smart-v2 through
+# smart-v12 search on the true deal -- v2 simulates the rest of a trick
+# with every other seat's real cards, v3 onward reads opponent hands
+# outright (see smart-v13 in packages/engine/src/bot.ts) -- so a loss
+# to them says nothing about the policy. smart-v13 onward determinize.
+# They still resolve by name when asked for explicitly.
 LADDER: tuple[str, ...] = (
     "random",
     "lowball",
     "point-hoarder",
     "aggressive",
     "smart",
-    "smart-v2",
-    "smart-v4",
-    "smart-v9",
     "smart-v18",
     "smart-v28",
     "smart-v34",
@@ -310,8 +315,10 @@ def _greedy_index(
     cfg: ModelConfig,
     device: torch.device,
     rng: np.random.Generator,
-) -> int:
-    """The network's move, as an index into the host's candidate list.
+    search: SearchConfig | None = None,
+) -> tuple[int, bool]:
+    """The network's move, as an index into the host's candidate list,
+    and whether it came from a search rather than the policy alone.
 
     Greedy, for the same reason ``train/evaluate.py`` is: a measurement
     wants the policy's considered move, and sampling would add variance
@@ -352,8 +359,13 @@ def _greedy_index(
     privileged = torch.from_numpy(packed.privileged[None].astype(np.float32)).to(device)
     with torch.no_grad():
         out, _value = _evaluate(net, obs, privileged)
+    if search is not None and len(candidates) > 1:
+        log_prior = out.log_probs[0, : len(candidates)].float().cpu().numpy()
+        return search_move(
+            net, state, candidates, log_prior, search, rng, cache, cfg, device
+        )
     slots, _logp = _choose(out.logits, obs.candidate_mask, 1.0, True, rng)
-    return int(slots[0])
+    return int(slots[0]), False
 
 
 # --- pairing and statistics -----------------------------------------------
@@ -506,7 +518,10 @@ def play_against_bot(
     max_candidates: int = 128,
     node: str | Sequence[str] | None = None,
     workers: int = 1,
-) -> dict[str, float]:
+    per_hand: bool = False,
+    pre_play: str = "random",
+    search: SearchConfig | None = None,
+) -> dict[str, Any]:
     """Duplicate-score ``net`` against the engine's ``bot``.
 
     ``num_deals`` deals, each played twice with the seats swapped, so
@@ -558,19 +573,21 @@ def play_against_bot(
             str(shards),
             "--shard",
             str(shard),
+            # Who declares and buries: "random" draws both as the
+            # training generator does, "bot" hands them to the opponent
+            # bot at every seat, the network's included.
+            "--pre-play",
+            str(pre_play),
         ]
         # One cache per shard, as in the rollout: it holds the static
         # per-trump-context block, which is shared across hands. Per
         # shard rather than shared, since a shard runs on its own thread
         # and the cache is not synchronised.
         cache = Cache()
-        # Greedy play never draws from this, but ``_choose`` takes a
-        # generator and a policy that silently became stochastic should
-        # not also become irreproducible.
-        rng = np.random.default_rng(seed + shard)
 
         games: dict[int, dict[int, _Half]] = {}
         pending_decisions: dict[tuple[int, int], int] = {}
+        searched[shard] = 0
         host = _Host(argv)
         try:
             while True:
@@ -579,7 +596,16 @@ def play_against_bot(
                 if kind == "pending":
                     key = (int(msg["game"]), int(msg["half"]))
                     pending_decisions[key] = pending_decisions.get(key, 0) + 1
-                    index = _greedy_index(net, msg, cache, cfg, device, rng)
+                    # Seeded by the decision's coordinates rather than
+                    # drawn from the shard's stream, so a search's worlds
+                    # do not depend on how the deals were sharded.
+                    decision_rng = np.random.default_rng(
+                        [int(seed), key[0], key[1], pending_decisions[key]]
+                    )
+                    index, did = _greedy_index(
+                        net, msg, cache, cfg, device, decision_rng, search
+                    )
+                    searched[shard] += int(did)
                     host.write({"t": "choose", "index": index})
                 elif kind == "hand":
                     game = int(msg["game"])
@@ -612,6 +638,7 @@ def play_against_bot(
             host.close()
         return games
 
+    searched: dict[int, int] = {}
     merged: dict[int, dict[int, _Half]] = {}
     try:
         if shards == 1:
@@ -629,7 +656,15 @@ def play_against_bot(
             f"asked for {num_deals} deals, {shards} shard(s) reported "
             f"{len(merged)}"
         )
-    return summarise(merged)
+    stats: dict[str, Any] = summarise(merged)
+    stats["searched_decisions"] = float(sum(searched.values()))
+    if per_hand:
+        # In deal order, half 0 then half 1, so two measurements taken
+        # at the same seed line up hand for hand and can be differenced.
+        _levels, points, wins, _taken, _attacked = _paired(merged)
+        stats["per_hand_wins"] = wins.tolist()
+        stats["per_deal_points"] = points.tolist()
+    return stats
 
 
 # --- cli ------------------------------------------------------------------
