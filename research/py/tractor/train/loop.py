@@ -174,6 +174,13 @@ class TrainConfig:
     # then one update stale, as a behaviour policy one step old is.
     # Never across a block boundary, whose starts need the declaration
     # phase that opens it.
+    #
+    # Off, because it was measured and bought nothing: on an L40S at
+    # 1024 hands the step went 28.2 s -> 26.4 s, and all of that was
+    # ``ppo.length_buckets``, on in the same arm. Building starts is
+    # Python-heavy (the deal, candidate generation), so on a thread it
+    # holds the GIL and the update -- whose kernel launches are Python
+    # too -- slowed by what the starts cost (9.4 s -> 18.5 s).
     prefetch_starts: bool = False
 
     model: dict = field(default_factory=dict)

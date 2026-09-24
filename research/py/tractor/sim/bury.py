@@ -276,9 +276,23 @@ class _DeviceBases:
         own_all = torch.from_numpy(owner).to(dev)
         kit_all = torch.from_numpy(kitties.astype(np.float32)).to(dev)
         out = np.empty(len(owner), dtype=np.float32)
+        # TF32 matmuls for this forward only. Measured on an L40S: plain
+        # fp32 took 9.7 s to bury 810 hands in a training step, against
+        # about 7 s with TF32 in the pipeline benchmark. bf16 would be
+        # faster again, but its rounding is the size of one swap's gain.
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            self._values_into(actor, cfg, dev, own_all, kit_all, out, chunk)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+        return out
+
+    def _values_into(self, actor: Any, cfg: Any, dev: Any, own_all: Any,
+                     kit_all: Any, out: np.ndarray, chunk: int) -> None:
         with torch.no_grad():
-            for lo in range(0, len(owner), chunk):
-                hi = min(lo + chunk, len(owner))
+            for lo in range(0, len(own_all), chunk):
+                hi = min(lo + chunk, len(own_all))
                 b = hi - lo
                 own = own_all[lo:hi]
                 kit = kit_all[lo:hi]
@@ -302,7 +316,6 @@ class _DeviceBases:
                 keep = torch.zeros(b, 1, dtype=torch.bool, device=dev)
                 summary = actor.query(obs, enc, keep)
                 out[lo:hi] = actor.heads.value(summary).squeeze(-1).float().cpu().numpy()
-        return out
 
 
 def _swaps(burial: np.ndarray, pool: np.ndarray, kept_types: np.ndarray) -> np.ndarray:
