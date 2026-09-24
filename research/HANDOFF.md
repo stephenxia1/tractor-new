@@ -33,22 +33,32 @@ four `modal_eval.py::smart` runs, each as its own app, in two waves:
 
 770 deals per bot, bots `smart,smart-v18,smart-v28,smart-v34`, seed
 20260923 (the default). A pair took 10–25 min for v4 final, so both
-waves should be done within about an hour of `final.pt`. That script
-lives only on the Windows machine and only as long as that session
-does, so **check before launching anything**:
+waves should be done within about an hour of `final.pt`.
+
+**The user closed the Windows session before the benchmarks could
+finish**, and that script died with it. Depending on when the session
+closed, none, some, or all of the four apps launched. The second wave
+starts only after the first finishes, so the likely states are "nothing
+launched" or "the first wave launched and the second never did". Any
+app that did launch is detached, so it keeps running and stores its
+results on the volume. **Check before launching anything**:
 
 ```bash
-modal app list | grep tractor-eval-v5      # running? then wait for them to stop
+modal app list | grep tractor-eval-v5
+# State column: "ephemeral" = still running (detached runs show this way),
+# "stopped" = finished or dead. No row = never launched.
 ```
 
-- If those apps **are running**, wait until they stop. Do not run the
-  same measurement from here meanwhile: a pair not yet stored on the
-  volume would be launched a second time.
-- If they **ran and stopped**, or **never started**, run the four
-  commands below. Each one first pulls every result already stored in
+- For any app still **ephemeral**, wait until it stops before running
+  its command. Otherwise a pair not yet stored on the volume would be
+  launched a second time.
+- For every app that is **stopped or missing**, run its command below.
+  Each command first pulls every result already stored in
   `/vol/evals/` (keyed on checkpoint path, bot, deals, seed, pre-play,
-  search) and measures only what is missing, so the same command
-  collects a finished run or starts a missing one.
+  search), then measures only what is missing. So the same command
+  collects a finished run, fills the pairs a dead run lost, or starts a
+  run that never launched. Run all four in the end, so that every
+  result lands in `runs/` here.
 
 ```bash
 # from research/. Separate app names so they don't stop each other.
