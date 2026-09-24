@@ -53,6 +53,7 @@ v3 step 2000, random pre-play:
 | opponent | | win rate | levels/deal | points/deal |
 | --- | --- | --- | --- | --- |
 | random | no search | 0.746 ± 0.022 | +0.850 ± 0.041 | +34.0 ± 1.6 |
+| random | **search** | **0.762** | **+0.897** | **+36.5** |
 | smart | no search | 0.518 ± 0.025 | +0.037 ± 0.037 | +1.7 ± 1.4 |
 | smart | **search** | **0.539** | **+0.115** | **+4.6** |
 | smart-v18 | no search | 0.499 | −0.003 | +0.4 |
@@ -67,11 +68,14 @@ Search's paired gain against v18/v28/v34 is +0.038 to +0.040 win rate
 policy scored ~0.49 against those three; the old table in §2 came from 16
 deals a rung and is noise.
 
+Against `random` search adds +0.016 ± 0.018 win rate and +2.6 ± 1.6
+points a deal, paired (the random bot draws from `Math.random`, so its
+own moves differ between the two runs).
+
 Raw per-hand results: `evals/2026-09-23/*.jsonl` (copied from the
-gitignored `runs/`). Two runs were still in flight when this was written
-and may be missing there: search against `random`, and a deep search
-(16 worlds, top 4, 3 extra tricks, confident 0.95) against the four smart
-bots.
+gitignored `runs/`). A deep search (16 worlds, top 4, 3 extra tricks,
+confident 0.95) against the four smart bots was still in flight when
+this was written and may be missing there.
 
 ### Inference-time search (`py/tractor/eval/search.py`)
 
