@@ -16,9 +16,13 @@ Three properties are load-bearing and are enforced by
 candidates are always ``cfg.max_candidates`` slots, padded and masked. A
 265,032-decision audit put the observed maximum history at 99 tokens and
 the candidate count at mean 12.1, p99 105, p99.9 375; 128 slots covers
-the p99 and matches the enumerator's own cap. Nothing here branches on a
-tensor value, calls ``.item()``, or changes shape with the batch, so
-``torch.compile`` sees a single graph.
+the p99 and matches the enumerator's own cap. Inputs and outputs keep
+these shapes. One thing inside does not: the history encoder runs only
+to the batch's longest real history (a host read of ``history_len``)
+and pads its output back, which is exact because the padding is a
+suffix and attention is causal. That costs ``torch.compile`` a single
+static graph, but the model runs eager -- compiling the update was
+measured at 9.6x slower (``train/ppo.py``).
 
 *Masking is arithmetic, not etiquette.* Padded history positions are
 zeroed after every block and excluded as attention keys; because the
@@ -507,13 +511,34 @@ class HistoryEncoder(nn.Module):
         _scale_residual_outputs(self.blocks)
 
     def forward(self, history: Tensor, history_len: Tensor) -> tuple[Tensor, Tensor]:
-        """[B, L, HISTORY_DIM] -> ([B, L, d_model], bool[B, L] keep mask)."""
-        keep = _length_mask(history_len, self.cfg.max_history)
-        gate = keep.unsqueeze(-1).to(history.dtype)
-        x = (self.in_proj(history) + self.pos) * gate
+        """[B, L, HISTORY_DIM] -> ([B, L, d_model], bool[B, L] keep mask).
+
+        Only the prefix up to the batch's longest history is encoded.
+        Padding is a suffix and attention is causal, so no real position
+        can read past it, and past it every output is zero anyway: the
+        prefix is the whole computation, and the rest is padded back on.
+        Encoding all ``max_history`` positions whatever the real lengths
+        was most of the rollout's forward (HANDOFF §6.2); a burial or a
+        search batch, whose rows all sit at one point of the hand, now
+        costs what its history does. One host sync per call reads the
+        length; the model is run eager, so a varying width costs no
+        recompilation.
+        """
+        size = self.cfg.max_history
+        keep = _length_mask(history_len, size)
+        # At least one position, so an all-empty batch still runs the
+        # same code and comes back zero in the same dtype.
+        n = max(int(history_len.max()), 1) if history_len.numel() else 1
+        n = min(n, size)
+        k = keep[:, :n]
+        gate = k.unsqueeze(-1).to(history.dtype)
+        x = (self.in_proj(history[:, :n]) + self.pos[:n]) * gate
         for block in self.blocks:
             x = block(x) * gate
-        return self.norm(x) * gate, keep
+        out = self.norm(x) * gate
+        if n < size:
+            out = F.pad(out, (0, 0, 0, size - n))
+        return out, keep
 
     # -- incremental path --------------------------------------------------
 
@@ -1006,14 +1031,32 @@ class Critic(nn.Module):
             nn.init.normal_(p, std=0.02)
         _scale_residual_outputs(self.blocks)
 
+        # The context vector -- the seat's role, the level rank, the trump
+        # suit, the points so far. Without it the critic learns the trump
+        # context only from the card features inside history tokens, so
+        # at play start, with no history, it cannot tell one trump suit
+        # from another or the landlord from an attacker: exactly the
+        # position declaration is scored at. Added into the first layer
+        # of the privileged branch, and zero at initialisation, so a
+        # checkpoint from before it existed loads (see ``load_model``)
+        # and computes what it always did until training moves it.
+        # Defined last, so its parameters come last in ``parameters()``
+        # and an older optimiser state can be extended rather than
+        # remapped.
+        self.context_proj = nn.Linear(CONTEXT_DIM, 2 * cd)
+        nn.init.zeros_(self.context_proj.weight)
+        nn.init.zeros_(self.context_proj.bias)
+
     def forward(
         self,
         history_enc: Tensor,
         history_len: Tensor,
         privileged: Tensor,
         detach: bool = True,
+        context: Tensor | None = None,
     ) -> Tensor:
-        """-> [B]. ``privileged`` is float[B, 5, 54] of raw counts."""
+        """-> [B]. ``privileged`` is float[B, 5, 54] of raw counts;
+        ``context`` the observation's float[B, CONTEXT_DIM] vector."""
         if detach:
             history_enc = history_enc.detach()
 
@@ -1035,7 +1078,10 @@ class Critic(nn.Module):
         pooled = self.norm(x[:, 0])  # [B, critic_d]
 
         flat = privileged.reshape(b, NUM_PRIVILEGED_ROWS * NUM_TYPES)
-        priv = self.privileged(flat)  # [B, critic_d]
+        first = self.privileged[0](flat)
+        if context is not None:
+            first = first + self.context_proj(context)
+        priv = self.privileged[3](self.privileged[2](self.privileged[1](first)))
         return self.head(torch.cat((pooled, priv), dim=-1)).squeeze(-1)
 
 
@@ -1053,7 +1099,11 @@ class ActorCritic(nn.Module):
     ) -> tuple[ActorOutput, Tensor]:
         out = self.actor(obs)
         value = self.critic(
-            out.history_enc, obs.history_len, privileged, detach=detach_critic
+            out.history_enc,
+            obs.history_len,
+            privileged,
+            detach=detach_critic,
+            context=obs.context,
         )
         return out, value
 
@@ -1116,6 +1166,27 @@ def batch_observations(
         candidate_mask=torch.from_numpy(mask),
     )
     return batch.to(device) if device is not None else batch
+
+
+# Parameters a checkpoint may predate. Each is initialised so that its
+# absence changes nothing, which is what makes loading without it sound.
+_OPTIONAL_KEYS = ("critic.context_proj.weight", "critic.context_proj.bias")
+
+
+def load_model(net: nn.Module, state: dict) -> list[str]:
+    """``load_state_dict`` that tolerates the parameters in ``_OPTIONAL_KEYS``.
+
+    Returns the keys the checkpoint did not have. Anything else missing,
+    or anything unexpected, still raises.
+    """
+    result = net.load_state_dict(state, strict=False)
+    missing = [k for k in result.missing_keys if k not in _OPTIONAL_KEYS]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"checkpoint does not fit the model: missing {missing}, "
+            f"unexpected {list(result.unexpected_keys)}"
+        )
+    return [k for k in result.missing_keys if k in _OPTIONAL_KEYS]
 
 
 def privileged_view(
@@ -1255,10 +1326,10 @@ def dummy_batch(
 # Critic at width 128, 2 heads, ff 256, 2 layers:
 #   in_proj 49,280; cls 128; positional 16,384; 2 blocks 2*132,480 =
 #   264,960; LayerNorm 256; privileged 69,376 + 32,896; head 32,896 +
-#   129.
-#                                                          466,305
+#   129; context_proj 37*256 + 256 = 9,728.
+#                                                          476,033
 ANALYTIC_ACTOR_PARAMS = 10_676_046
-ANALYTIC_CRITIC_PARAMS = 466_305
+ANALYTIC_CRITIC_PARAMS = 476_033
 
 
 def analytic_flops(
@@ -1434,6 +1505,8 @@ def analytic_flops(
         crit += elem(lc * cd)  # * keep gate
     crit += norm(1, cd)  # pooled CLS
     crit += lin(1, NUM_PRIVILEGED_ROWS * NUM_TYPES, 2 * cd)
+    crit += lin(1, CONTEXT_DIM, 2 * cd)  # context_proj
+    crit += elem(2 * cd)  # added into the first layer
     crit += gelu(2 * cd)
     crit += lin(1, 2 * cd, cd)
     crit += gelu(cd)

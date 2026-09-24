@@ -196,6 +196,17 @@ class PPOConfig:
     detach_critic: bool = False
 
     weight_decay: float = 0.0
+    # Minibatches drawn within history-length buckets. The history
+    # encoder runs only to a batch's longest history, so a minibatch of
+    # rows from one stage of the hand costs what that stage's history
+    # does, where a uniformly shuffled one costs the longest in it --
+    # nearly the whole hand, every time. Each epoch the rows are split
+    # into this many length quantiles, each bucket is shuffled and cut
+    # into minibatches, and the minibatches are shuffled together; 0
+    # draws them uniformly, as before. The price is minibatches drawn
+    # from one stage of the hand rather than all of them, which only a
+    # measured run can say is free.
+    length_buckets: int = 0
     adam_eps: float = 1e-8
     betas: tuple[float, float] = (0.9, 0.999)
     check_actions: bool = True
@@ -396,6 +407,24 @@ def _bf16_supported(device: torch.device) -> bool:
     # correct if not fast; leaving it on keeps the CPU smoke test
     # exercising the same code path the GPU run takes.
     return device.type == "cpu"
+
+
+def _minibatches(
+    order: np.ndarray, buffer: Any, size: int, buckets: int
+) -> list[np.ndarray]:
+    """Minibatch row indices for one epoch; see ``length_buckets``."""
+    if buckets <= 1:
+        return [order[s : s + size] for s in range(0, len(order), size)]
+    lengths = np.asarray(buffer.history_len)[order]
+    # A stable sort of an already shuffled order keeps rows of equal
+    # length in random order, then the sorted run is cut into buckets.
+    ranked = order[np.argsort(lengths, kind="stable")]
+    out: list[np.ndarray] = []
+    for part in np.array_split(ranked, buckets):
+        part = part[torch.randperm(len(part)).numpy()] if len(part) else part
+        out.extend(part[s : s + size] for s in range(0, len(part), size))
+    perm = torch.randperm(len(out)).numpy()
+    return [out[i] for i in perm]
 
 
 def _make_optimiser(
@@ -687,8 +716,7 @@ class PPOLearner:
         self.net.train()
         for epoch in range(max(0, int(cfg.epochs))):
             order = selected[torch.randperm(m).numpy()]
-            for start in range(0, m, size):
-                idx = order[start : start + size]
+            for idx in _minibatches(order, buffer, size, int(cfg.length_buckets)):
                 obs, privileged, batch = buffer.as_torch(idx, self.device)
                 loss, parts = self.losses(obs, privileged, batch)
 

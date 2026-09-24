@@ -72,6 +72,7 @@ from .rollout import (
     _span,
 )
 from .shared import SharedBuffer, compact_ranges, partition
+from .starts import pack_start, start_state
 
 __all__ = ["RolloutPool", "collect_parallel", "DEFAULT_WORKERS"]
 
@@ -111,7 +112,7 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
             cmd = rep_q.get(timeout=WORKER_TIMEOUT_S)
             if cmd[0] == "stop":
                 return
-            _tag, n_hands, episode_base, seed, level_weight, pool = cmd
+            _tag, n_hands, episode_base, seed, level_weight, pool, starts = cmd
 
             window.reset()
             rng = np.random.default_rng(seed)
@@ -126,7 +127,10 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                     and started < n_hands
                     and _room_for_another(window, active, max_decisions)
                 ):
-                    state, _info = generate(rng, DECKS)
+                    if starts is not None:
+                        state = start_state(starts[started])
+                    else:
+                        state, _info = generate(rng, DECKS)
                     active.append(
                         _InFlight(state=state, episode=episode_base + started)
                     )
@@ -260,8 +264,12 @@ class RolloutPool:
         amp: bool = False,
         spans: Any = None,
         episode_base: int = 0,
+        starts: Any = None,
     ) -> tuple[RolloutBuffer, dict[str, float]]:
         """One round. -> ``(buffer, stats)``, same keys as ``collect``.
+
+        ``starts``, when given, are the round's play starts (``train.starts.
+        Start``), one per hand, in place of the workers' own uniform draw.
 
         ``spans`` records the parent's own work -- "forward" and
         "sample" -- and nothing else. Encode, enumerate and step happen
@@ -295,15 +303,22 @@ class RolloutPool:
         buf = self._shared.buffer
 
         try:
+            if starts is not None and len(starts) < n_hands:
+                raise ValueError(f"{len(starts)} starts for {n_hands} hands")
             live = set()
             base = episode_base
             for w in range(workers):
                 if hands_each[w] == 0:
                     continue
+                lo = base - episode_base
+                mine = (
+                    None if starts is None
+                    else [pack_start(s) for s in starts[lo : lo + hands_each[w]]]
+                )
                 self._rep_qs[w].put((
                     "round", hands_each[w], base,
                     int(rng.integers(0, 2**31 - 1)), float(level_weight),
-                    per_worker_pool,
+                    per_worker_pool, mine,
                 ))
                 base += hands_each[w]
                 live.add(w)

@@ -33,7 +33,10 @@ failing.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
+from concurrent.futures import Future, ThreadPoolExecutor
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -42,7 +45,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..nn.model import ActorCritic, ModelConfig
+from ..nn.declare import DeclareNet
+from ..nn.features import Cache
+from ..nn.model import ActorCritic, ModelConfig, load_model
+from ..sim.bury import BuryConfig
+from .declare_loop import DeclareLearner, DeclareTrainConfig
+from .starts import PrePlayConfig, make_starts
 from ..telemetry import Spans, memory_snapshot
 from .buffer import RolloutBuffer
 from .evaluate import evaluate, evaluate_against_bots
@@ -140,6 +148,34 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     keep_last: int = 3
 
+    # The full hand: declaration and burial by the agent, trained in
+    # alternation with play. Off when ``declare_phase_steps`` is 0, and
+    # every play start is then ``gen.episode``'s uniform draw, as before.
+    #
+    # On: the first ``warmup_steps`` play steps still start from the
+    # uniform draw. Then, at the start of every block of
+    # ``play_phase_steps`` play steps, a declaration phase runs
+    # ``declare_phase_steps`` steps of ``train.declare_loop`` against the
+    # play network as it stands (read only, so it is frozen for the
+    # phase), and the block's play starts come from that frozen
+    # declaration policy and the value network's burial climb -- all but
+    # ``random_burial_frac`` of them, which are buried at random so the
+    # value head stays accurate on burials the climb would not propose.
+    warmup_steps: int = 0
+    play_phase_steps: int = 250
+    declare_phase_steps: int = 0
+    random_burial_frac: float = 0.2
+    bury_rounds: int = 8
+    bury_consider: int = 0
+    declare: dict = field(default_factory=dict)
+    # Build the next step's play starts on a thread while this step's
+    # update runs, from a frozen copy of the network (the update is
+    # changing the live one) on a CUDA stream of its own. The starts are
+    # then one update stale, as a behaviour policy one step old is.
+    # Never across a block boundary, whose starts need the declaration
+    # phase that opens it.
+    prefetch_starts: bool = False
+
     model: dict = field(default_factory=dict)
     ppo: dict = field(default_factory=dict)
 
@@ -158,20 +194,31 @@ def save_checkpoint(
     learner: PPOLearner,
     step: int,
     cfg: TrainConfig,
+    extra: dict | None = None,
 ) -> Path:
-    """Weights, optimiser state and step, so a run resumes exactly."""
+    """Weights, optimiser state and step, so a run resumes exactly.
+
+    ``extra`` carries the declaration agent and the schedule's position
+    when the full hand is being trained.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": step,
-            "model": net.state_dict(),
-            "optimizer": learner.opt.state_dict(),
-            "config": asdict(cfg),
-            "model_config": asdict(net.cfg),
-        },
-        path,
-    )
+    blob = {
+        "step": step,
+        "model": net.state_dict(),
+        "optimizer": learner.opt.state_dict(),
+        "config": asdict(cfg),
+        "model_config": asdict(net.cfg),
+    }
+    if extra:
+        blob.update(extra)
+    torch.save(blob, path)
     return path
+
+
+def load_declare(path: Path) -> dict | None:
+    """The declaration agent a checkpoint carries, if any."""
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    return blob.get("declare")
 
 
 def load_checkpoint(
@@ -179,9 +226,20 @@ def load_checkpoint(
 ) -> int:
     """-> the step the checkpoint was written at."""
     blob = torch.load(path, map_location="cpu", weights_only=False)
-    net.load_state_dict(blob["model"])
+    added = load_model(net, blob["model"])
     if learner is not None and "optimizer" in blob:
-        learner.opt.load_state_dict(blob["optimizer"])
+        state = blob["optimizer"]
+        if added:
+            # Parameters the checkpoint predates come last in
+            # ``parameters()`` (see ``Critic.context_proj``), so the old
+            # optimiser state is extended with fresh slots for them
+            # rather than remapped; AdamW fills their moments lazily.
+            state = copy.deepcopy(state)
+            group = state["param_groups"][0]
+            have = len(group["params"])
+            want = sum(1 for p in net.parameters() if p.requires_grad)
+            group["params"] = list(group["params"]) + list(range(have, want))
+        learner.opt.load_state_dict(state)
     return int(blob.get("step", 0))
 
 
@@ -195,6 +253,68 @@ def _prune(directory: Path, keep: int) -> None:
     )
     for stale in found[:-keep]:
         stale.unlink(missing_ok=True)
+
+
+def _prefetch_starts(
+    executor: ThreadPoolExecutor,
+    net: ActorCritic,
+    declare_net: Any,
+    device: torch.device,
+    hands: int,
+    pre: PrePlayConfig,
+    rng: np.random.Generator,
+) -> Future:
+    """Start building the next step's play starts; see ``prefetch_starts``."""
+    frozen = copy.deepcopy(net).eval()
+    stream = torch.cuda.Stream(device) if device.type == "cuda" else None
+
+    def work() -> tuple[list, dict]:
+        ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+        with ctx:
+            starts, _rows, st = make_starts(
+                rng, hands, frozen, declare_net, device, pre=pre, cache=Cache()
+            )
+        if stream is not None:
+            stream.synchronize()
+        return starts, st
+
+    return executor.submit(work)
+
+
+def _declare_phase(
+    learner: DeclareLearner,
+    play_net: ActorCritic,
+    rng: np.random.Generator,
+    steps: int,
+    block: int,
+) -> dict[str, float]:
+    """Train the declaration policy for ``steps`` steps on frozen play.
+
+    Returns the phase's mean statistics under ``phase/*``, which ride on
+    the first play row of the block rather than logging rows of their
+    own -- a second row at one learner step puts two points on every
+    chart.
+    """
+    totals: dict[str, float] = {}
+    started = time.perf_counter()
+    for i in range(steps):
+        t0 = time.perf_counter()
+        st = learner.step(play_net, rng)
+        for k, v in st.items():
+            totals[k] = totals.get(k, 0.0) + float(v)
+        print(
+            f"  [declare {block}:{i + 1}/{steps}] {time.perf_counter() - t0:5.1f}s"
+            f"  rows {st.get('declare/rows', 0):5.0f}"
+            f"  return {st.get('declare/return_mean', 0.0):+.3f}"
+            f"  declared {st.get('declare/declared_frac', 0.0):.2f}"
+            f"  nt {st.get('declare/no_trump_frac', 0.0):.2f}"
+            f"  ent {st.get('declare/entropy', 0.0):.3f}",
+            flush=True,
+        )
+    out = {f"phase/{k}": v / max(steps, 1) for k, v in totals.items()}
+    out["phase/seconds"] = time.perf_counter() - started
+    out["phase/block"] = float(block)
+    return out
 
 
 def train(
@@ -231,6 +351,43 @@ def train(
     if resume is not None and Path(resume).exists():
         start = load_checkpoint(Path(resume), net, learner)
 
+    full_hand = cfg.declare_phase_steps > 0
+    declare_net = declare_learner = None
+    phases_done = 0
+    if full_hand:
+        declare_cfg = DeclareTrainConfig(**{
+            **cfg.declare,
+            "pre": PrePlayConfig(
+                random_burial_frac=0.0,
+                bury=BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider),
+            ),
+        })
+        declare_net = DeclareNet().to(device)
+        declare_learner = DeclareLearner(declare_net, declare_cfg, device)
+        saved = (
+            load_declare(Path(resume))
+            if resume is not None and Path(resume).exists()
+            else None
+        )
+        if saved is not None:
+            declare_net.load_state_dict(saved["model"])
+            declare_learner.opt.load_state_dict(saved["optimizer"])
+            phases_done = int(saved["phases_done"])
+        declare_net.eval()
+    play_pre = PrePlayConfig(
+        random_burial_frac=cfg.random_burial_frac,
+        bury=BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider),
+    )
+
+    def extra() -> dict | None:
+        if not full_hand:
+            return None
+        return {"declare": {
+            "model": declare_net.state_dict(),
+            "optimizer": declare_learner.opt.state_dict(),
+            "phases_done": phases_done,
+        }}
+
     # A hand can take one deal's worth of rows per seat, and `collect`
     # refuses to start a hand it cannot guarantee room for -- so a
     # buffer too small for `hands_per_step` does not raise, it quietly
@@ -259,6 +416,8 @@ def train(
         else None
     )
     ckpt_dir = Path(cfg.checkpoint_dir)
+    prefetched: Any = None
+    executor = ThreadPoolExecutor(max_workers=1) if cfg.prefetch_starts else None
     started = time.perf_counter()
     seen = 0
     last: dict = {}
@@ -269,6 +428,33 @@ def train(
             spans = Spans(enabled=True, device=device)
             buffer.reset()
             level_weight = reward_mix(step, cfg)
+
+            # The schedule. A declaration phase opens every block of play
+            # steps after the warm-up, once; ``phases_done`` is saved, so
+            # a resume at a block boundary does not run it twice.
+            starts = None
+            pre_stats: dict[str, float] = {}
+            if full_hand and step >= cfg.warmup_steps:
+                block = (step - cfg.warmup_steps) // cfg.play_phase_steps
+                if block >= phases_done:
+                    prefetched = None  # built before this phase; stale
+                    with spans.span("declare_phase"):
+                        net.eval()
+                        pre_stats = _declare_phase(
+                            declare_learner, net, rng, cfg.declare_phase_steps, block
+                        )
+                    phases_done = block + 1
+                with spans.span("starts"):
+                    if prefetched is not None:
+                        starts, st = prefetched.result()
+                        prefetched = None
+                    else:
+                        net.eval()
+                        starts, _rows, st = make_starts(
+                            rng, cfg.hands_per_step, net, declare_net, device,
+                            pre=play_pre, cache=declare_learner.cache,
+                        )
+                    pre_stats.update(st)
 
             with spans.span("collect"):
                 net.eval()
@@ -289,6 +475,7 @@ def train(
                         pool=cfg.pool,
                         amp=learner.amp,
                         spans=spans,
+                        starts=starts,
                     )
                 else:
                     stats = collect(
@@ -303,10 +490,24 @@ def train(
                         pool=cfg.pool,
                         amp=learner.amp,
                         spans=spans,
+                        starts=starts,
                     )
 
             with spans.span("gae"):
                 compute_gae(buffer, gamma=cfg.gamma, lam=cfg.lam)
+
+            nxt = step + 1
+            if (
+                cfg.prefetch_starts
+                and full_hand
+                and nxt < cfg.total_steps
+                and nxt >= cfg.warmup_steps
+                and (nxt - cfg.warmup_steps) // cfg.play_phase_steps < phases_done
+            ):
+                prefetched = _prefetch_starts(
+                    executor, net, declare_net, device, cfg.hands_per_step, play_pre,
+                    np.random.default_rng(int(rng.integers(0, 2**31 - 1))),
+                )
 
             with spans.span("update"):
                 net.train()
@@ -369,6 +570,7 @@ def train(
                 **{f"span/{k}": v["total"] for k, v in spans.summary().items()},
                 **{f"mem/{k}": v for k, v in memory_snapshot(device).items()},
                 **{f"eval/{k}": v for k, v in scores.items()},
+                **{f"pre/{k}": v for k, v in pre_stats.items()},
             }
             if run is not None:
                 run.log(row)
@@ -400,14 +602,15 @@ def train(
 
             if cfg.checkpoint_every and (step + 1) % cfg.checkpoint_every == 0:
                 written = save_checkpoint(
-                    ckpt_dir / f"step_{step + 1:07d}.pt", net, learner, step + 1, cfg
+                    ckpt_dir / f"step_{step + 1:07d}.pt", net, learner, step + 1,
+                    cfg, extra(),
                 )
                 _prune(ckpt_dir, cfg.keep_last)
                 if on_checkpoint is not None:
                     on_checkpoint(written)
 
         final = save_checkpoint(
-            ckpt_dir / "final.pt", net, learner, cfg.total_steps, cfg
+            ckpt_dir / "final.pt", net, learner, cfg.total_steps, cfg, extra()
         )
         if on_checkpoint is not None:
             on_checkpoint(final)
@@ -423,5 +626,7 @@ def train(
         # outlives the process that forgot to unlink it.
         if rollout_pool is not None:
             rollout_pool.close()
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     return summary

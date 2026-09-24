@@ -60,6 +60,8 @@ from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, TrickRecord, team_of
 from ..train.buffer import obs_batch_from_arrays
 from ..train.rollout import _InFlight, _choose, _evaluate, _pack
+from ..sim.bury import BuryConfig, value_burials
+from ..sim.deal import declare_features
 from .search import SearchConfig, search_move
 from .duplicate import (
     DECK_POINTS,
@@ -368,6 +370,51 @@ def _greedy_index(
     return int(slots[0]), False
 
 
+# --- the learner's own pre-play (--pre-play agent) --------------------------
+
+
+def _declare_choice(declare_net: Any, msg: dict, device: Any) -> int:
+    """The declaration network's greedy action for a host ``declare``.
+
+    The host's mask is the engine's own legal set and is what the choice
+    is restricted to. With no network the seat never declares -- the
+    baseline a declaration policy has to beat.
+    """
+    mask = np.asarray(msg["mask"], dtype=bool)
+    if declare_net is None:
+        return 0
+    obs = declare_features(
+        revealed=np.asarray(msg["hand"], dtype=np.int8),
+        num_decks=2,
+        level_rank=int(msg["level_rank"]),
+        landlord=int(msg["landlord"]),
+        seat=int(msg["seat"]),
+        dealt=int(msg["dealt"]),
+        total=100,
+        closing=bool(msg["closing"]),
+        standing_tier=int(msg["standing_tier"]),
+        standing_suit=int(msg["standing_suit"]),
+        standing_seat=int(msg["standing_seat"]),
+        mask=mask,
+    )
+    with torch.no_grad():
+        logits = declare_net.logits(
+            torch.from_numpy(obs[None]).to(device),
+            torch.from_numpy(mask[None]).to(device),
+        )
+    return int(logits.argmax(dim=1).item())
+
+
+def _bury_choice(net: Any, msg: dict, device: Any, bury: Any, cache: Cache) -> list[int]:
+    """The value climb's burial for a host ``bury``, as 54 counts."""
+    pool = np.asarray(msg["pool"], dtype=np.int8)
+    ctx = Ctx(int(msg["level_rank"]), int(msg["trump_suit"]))
+    burials, _stats = value_burials(
+        net, [pool], [ctx], [int(msg["seat"])], device, bury, cache
+    )
+    return [int(x) for x in burials[0]]
+
+
 # --- pairing and statistics -----------------------------------------------
 
 
@@ -381,6 +428,11 @@ class _Half:
     attacker_gain: int
     digest: int
     decisions: int
+    # Who made the standing declaration at play start (-1: a kitty flip),
+    # and the points buried in the kitty. -1 and 0 from hosts that
+    # predate them.
+    declarer: int = -1
+    kitty_points: int = 0
 
 
 def _paired(
@@ -501,6 +553,36 @@ def summarise(games: dict[int, dict[int, _Half]]) -> dict[str, float]:
         # Positive only when the whole interval is, which is the
         # question a training chart is actually being asked.
         "ahead": float(lo > 0.0),
+        **_pre_play_split(games, wins, attacked),
+    }
+
+
+def _pre_play_split(
+    games: dict[int, dict[int, _Half]], wins: np.ndarray, attacked: np.ndarray
+) -> dict[str, float]:
+    """Who declared, and how each side did as landlord and as attacker.
+
+    In the order ``_paired`` walks the halves, so the rows line up with
+    ``wins`` and ``attacked``.
+    """
+    net_declared: list[bool] = []
+    bot_declared: list[bool] = []
+    kitty: list[float] = []
+    for game in sorted(games):
+        for half in (0, 1):
+            h = games[game][half]
+            team = NET_TEAM[half]
+            net_declared.append(h.declarer >= 0 and team_of(h.declarer) == team)
+            bot_declared.append(h.declarer >= 0 and team_of(h.declarer) != team)
+            kitty.append(float(h.kitty_points))
+    k = np.array(kitty, dtype=np.float64)
+    return {
+        "net_declared_frac": _mean(np.array(net_declared, dtype=np.float64)),
+        "bot_declared_frac": _mean(np.array(bot_declared, dtype=np.float64)),
+        "winrate_defending": _mean(wins[~attacked]),
+        "winrate_attacking": _mean(wins[attacked]),
+        "kitty_points_net_landlord": _mean(k[~attacked]),
+        "kitty_points_bot_landlord": _mean(k[attacked]),
     }
 
 
@@ -521,6 +603,8 @@ def play_against_bot(
     per_hand: bool = False,
     pre_play: str = "random",
     search: SearchConfig | None = None,
+    declare_net: Any = None,
+    bury: BuryConfig | None = None,
 ) -> dict[str, Any]:
     """Duplicate-score ``net`` against the engine's ``bot``.
 
@@ -619,7 +703,19 @@ def play_against_bot(
                         attacker_gain=int(msg["attacker_gain"]),
                         digest=int(msg["digest"]),
                         decisions=pending_decisions.pop((game, half), 0),
+                        declarer=int(msg.get("declarer", -1)),
+                        kitty_points=int(msg.get("kitty_points", 0)),
                     )
+                elif kind == "declare":
+                    host.write({
+                        "t": "declare_choice",
+                        "action": _declare_choice(declare_net, msg, device),
+                    })
+                elif kind == "bury":
+                    host.write({
+                        "t": "bury_choice",
+                        "kitty": _bury_choice(net, msg, device, bury, cache),
+                    })
                 elif kind == "done":
                     got = int(msg["deals"])
                     # This shard plays the game ids congruent to its own
@@ -673,7 +769,7 @@ def play_against_bot(
 def main() -> int:
     import argparse
 
-    from ..nn.model import ActorCritic
+    from ..nn.model import ActorCritic, load_model
 
     ap = argparse.ArgumentParser(description="Network against a TypeScript bot.")
     ap.add_argument("--deals", type=int, default=4)
@@ -690,7 +786,7 @@ def main() -> int:
         blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         cfg = ModelConfig(**blob["model_config"])
         net = ActorCritic(cfg)
-        net.load_state_dict(blob["model"])
+        load_model(net, blob["model"])
     net.to(args.device)
 
     started = time.perf_counter()

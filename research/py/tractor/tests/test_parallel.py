@@ -271,3 +271,29 @@ def test_it_fills_a_buffer_the_caller_brought() -> None:
     )
     assert out is mine
     assert len(mine) == stats["decisions"] > 0
+
+
+def test_workers_play_the_starts_they_are_given() -> None:
+    """Hand ``i`` of a round begins from ``starts[i]``, across workers."""
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.starts import make_starts
+
+    starts, _rows, _stats = make_starts(np.random.default_rng(9), 4, None, None)
+    pool = RolloutPool(cfg=SMALL, workers=2, hands_per_round=4)
+    try:
+        buf, stats = pool.collect(
+            _net(), np.random.default_rng(1), None, n_hands=4, device=DEVICE,
+            pool=4, starts=starts,
+        )
+    finally:
+        pool.close()
+    assert stats["hands"] == 4
+    n = len(buf)
+    for i, st in enumerate(starts):
+        rows = np.nonzero(buf.episode[:n] == i)[0]
+        first = int(rows[0])
+        assert int(buf.seat[first]) == st.landlord  # the landlord leads
+        view = buf.privileged[first].astype(np.int8)
+        for rel in range(NUM_SEATS):
+            assert np.array_equal(view[rel], st.hands[(st.landlord + rel) % NUM_SEATS])
+        assert np.array_equal(view[NUM_SEATS], st.kitty)

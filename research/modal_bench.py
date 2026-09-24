@@ -86,13 +86,13 @@ def _bench_body(batch: int, candidates: int, history: int, quick: bool) -> dict:
     obs, priv = obs.to(dev), priv.to(dev)
     net = ActorCritic(cfg).to(dev).eval()
 
-    # HistoryEncoder.forward runs all `max_history` positions densely
-    # and applies the length mask multiplicatively, so the work does
-    # not shrink when rows are shorter. Pricing it at the ragged
-    # length would divide real work by a smaller number and
-    # understate every rate derived from it.
+    # HistoryEncoder.forward runs only to the batch's longest history
+    # (since 2026-09-24; before that it ran all `max_history`
+    # positions whatever the lengths). `dummy_batch` draws each row's
+    # length from 0..`history`, so at any real batch size the longest is
+    # `history`, and that is the length the encoder's work is priced at.
     flops = analytic_flops(cfg, batch=batch, n_candidates=candidates,
-                           history_len=cfg.max_history)
+                           history_len=history)
     fwd_flops = flops["total"]
 
     def timed(fn, warmup: int = 3) -> tuple[float, dict]:

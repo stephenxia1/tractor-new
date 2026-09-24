@@ -33,8 +33,9 @@ Dense, zero-sum, and always from the acting seat's team's point of view.
 Teams are seats ``{0, 2}`` and ``{1, 3}``; ``team_of`` is the authority.
 
 *Trick credit* (``reward_points``). A trick has exactly four decisions,
-one per seat. When it closes carrying ``p`` points, each of those four
-decisions is credited
+one per seat. When it closes carrying ``p`` points -- for the trick that
+ends the hand, its points plus the kitty bonus the attackers won with it
+-- each of those four decisions is credited
 
     + p / (2 * 200)   when the deciding seat's team took the trick
     - p / (2 * 200)   otherwise
@@ -56,16 +57,21 @@ hand -- the row carrying ``done`` -- is credited
     + (attacker_gain - defender_gain) / 3   for an attacking seat
     - (attacker_gain - defender_gain) / 3   for a defending seat
 
-so the terminal term lands in [-1, 1]. It is also the only place the
-kitty bonus can appear: when the attackers take the last trick,
+so the terminal term lands in [-1, 1].
+
+*The kitty bonus.* When the attackers take the last trick,
 ``PlayState._finish`` folds the kitty's points into their total
 multiplied by *twice the number of cards in the winning play*
-(rules.md §8.2), not by a flat two. A single-card last trick doubles
+(rules.md §8.2), not by a flat two: a single-card last trick doubles
 them, a pair quadruples them, and the largest seen over 300 sampled
-hands was eight times. Those points were never in a trick record for
-the rule above to credit, so the dense term cannot see them at all and
-the size of the swing they cause is one more reason the terminal term
-is not something ``level_weight`` should sit at zero forever.
+hands was eight times. Those points are in no trick record, so until
+2026-09-24 the dense term could not see them at all. They are now
+credited with the last trick, whose four decisions exist as rows even
+when forced. Earlier decisions learn of the bonus through the critic,
+which reads the kitty in its privileged view, and the landlord's own
+value head sees what it buried -- which is what value-guided burial
+needs, since a reward blind to the bonus would rate burying every
+point card as free.
 
 The two terms are stored apart and combined as
 ``reward = reward_points + level_weight * reward_level``. A run that
@@ -299,15 +305,27 @@ def _credit_trick(
     point_norm: float,
     level_weight: np.float32,
 ) -> None:
-    """Split the closed trick's points between the two teams."""
-    trick = hand.state.tricks[-1]
+    """Split the closed trick's points between the two teams.
+
+    The trick that ends the hand also carries the kitty bonus, which
+    ``PlayState._finish`` has folded into ``attacker_points`` by the
+    time this runs. It is nonzero only when the attackers took that
+    trick, so it goes to the trick's winners like the trick's own
+    points, and a team's credits over a hand sum to the margin the game
+    actually scores.
+    """
+    state = hand.state
+    trick = state.tricks[-1]
+    points = trick.points
+    if state.done:
+        points += state.attacker_points - state.trick_points_attacker
     rows = hand.trick_rows
     if len(rows) != NUM_SEATS:
         raise RuntimeError(
             f"trick closed with {len(rows)} recorded decisions, expected "
             f"{NUM_SEATS}"
         )
-    share = np.float32(trick.points / (SEATS_PER_TEAM_PER_TRICK * point_norm))
+    share = np.float32(points / (SEATS_PER_TEAM_PER_TRICK * point_norm))
     winners = team_of(trick.winner)
     for row in rows:
         sign = np.float32(1.0 if team_of(int(buffer.seat[row])) == winners else -1.0)
@@ -365,8 +383,12 @@ def collect(
     level_weight: float = 1.0,
     pool: int | None = None,
     amp: bool = False,
+    starts: Any = None,
 ) -> dict[str, float]:
     """Play ``n_hands`` self-play hands into ``buffer``.
+
+    ``starts``, when given, are the play starts (``train.starts.Start``),
+    one per hand, in place of ``gen.episode.generate``'s uniform draw.
 
     ``net`` is an ``ActorCritic`` -- the actor picks the move and the
     critic, reading the four hands and the kitty through
@@ -452,7 +474,10 @@ def collect(
                     and started < n_hands
                     and _room_for_another(buffer, active, max_decisions)
                 ):
-                    state, _info = generate(rng, DECKS)
+                    if starts is not None:
+                        state = starts[started].state(DECKS)
+                    else:
+                        state, _info = generate(rng, DECKS)
                     active.append(_InFlight(state=state, episode=next_episode))
                     next_episode += 1
                     started += 1

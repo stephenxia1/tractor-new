@@ -263,6 +263,37 @@ def test_history_padding_is_inert() -> None:
     print(f"    lengths {lengths.tolist()}: summary, logits, heads and critic all fixed")
 
 
+def test_history_truncation_is_exact() -> None:
+    """Encoding only the longest real prefix changes no row's output.
+
+    The encoder runs to the batch's longest history. A row must come
+    out the same whether its batch forces the full width (a row of
+    ``max_history`` tokens beside it) or lets it stop early.
+    """
+    cfg = ModelConfig()
+    net = _net(5, cfg)
+    critic = Critic(cfg).eval()
+    obs, priv = dummy_batch(cfg, batch=4, seed=43)
+    short = torch.tensor([0, 3, 17, 40], dtype=torch.int64)
+    obs = obs._replace(history_len=short)
+    full = torch.tensor([0, 3, 17, cfg.max_history], dtype=torch.int64)
+    with torch.no_grad():
+        a = net(obs)
+        a_v = critic(a.history_enc, obs.history_len, priv)
+        b = net(obs._replace(history_len=full))
+        b_v = critic(b.history_enc, full, priv)
+    for name in ("logits", "value", "summary", "belief_logits", "history_enc"):
+        x, y = getattr(a, name)[:3], getattr(b, name)[:3]
+        assert torch.allclose(x, y, atol=1e-5, rtol=1e-5), name
+    assert torch.allclose(a_v[:3], b_v[:3], atol=1e-5, rtol=1e-5)
+    assert a.history_enc.shape == b.history_enc.shape
+    # An all-empty batch -- a burial's -- still runs and is zero.
+    with torch.no_grad():
+        e = net(obs._replace(history_len=torch.zeros(4, dtype=torch.int64)))
+    assert torch.all(e.history_enc == 0.0)
+    assert torch.isfinite(e.value).all()
+
+
 # --- 5. gradients ---------------------------------------------------------
 
 
@@ -505,6 +536,7 @@ def test_analytic_flops_matches_hand_arithmetic() -> None:
         + 5 * 4  # * keep gate
         + 1 * 4 * 7  # LayerNorm on the pooled CLS
         + (2 * 270 * 8 + 8) + 8 * 8 + (2 * 8 * 4 + 4) + 8 * 4  # privileged MLP
+        + (2 * CONTEXT_DIM * 8 + 8) + 8  # context_proj, added into layer one
         + (2 * 8 * 4 + 4) + 8 * 4 + (2 * 4 * 1 + 1)  # head
     )
     assert got["critic"] == critic, (got["critic"], critic)
@@ -664,3 +696,21 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_critic_context_starts_inert_then_matters() -> None:
+    cfg = ModelConfig()
+    torch.manual_seed(6)
+    critic = Critic(cfg).eval()
+    obs, priv = dummy_batch(cfg, batch=3, seed=47)
+    enc = torch.zeros(3, cfg.max_history, cfg.d_model)
+    lengths = torch.zeros(3, dtype=torch.int64)
+    with torch.no_grad():
+        without = critic(enc, lengths, priv)
+        with_ctx = critic(enc, lengths, priv, context=obs.context)
+    assert torch.equal(without, with_ctx), "a zero-initialised context moved the critic"
+    with torch.no_grad():
+        critic.context_proj.weight.normal_()
+        moved = critic(enc, lengths, priv, context=obs.context)
+        other = critic(enc, lengths, priv, context=obs.context.flip(0))
+    assert not torch.allclose(moved, other), "the critic ignores its context"

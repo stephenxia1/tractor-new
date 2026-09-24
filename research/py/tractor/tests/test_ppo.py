@@ -1389,3 +1389,23 @@ def test_detach_critic_severs_the_shared_trunk() -> None:
     critic = net.critic.head[0].weight
     assert critic.grad is not None and float(critic.grad.abs().max()) > 0.0
     learner.opt.zero_grad(set_to_none=True)
+
+
+def test_length_buckets_cover_every_row_once() -> None:
+    """Bucketed minibatches are a partition of the rows, each drawn from
+    one band of history lengths."""
+    from types import SimpleNamespace
+
+    from ..train.ppo import _minibatches
+
+    rng = np.random.default_rng(0)
+    lengths = rng.integers(0, 100, size=1000)
+    buf = SimpleNamespace(history_len=lengths)
+    order = rng.permutation(1000)
+    for buckets in (0, 1, 4):
+        batches = _minibatches(order, buf, 64, buckets)
+        rows = np.concatenate(batches)
+        assert sorted(rows.tolist()) == list(range(1000)), buckets
+        assert all(len(b) <= 64 for b in batches)
+    spans = [int(lengths[b].max() - lengths[b].min()) for b in _minibatches(order, buf, 64, 4)]
+    assert max(spans) < 40, spans  # one quartile of 0..99, not the whole range

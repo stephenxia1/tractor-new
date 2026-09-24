@@ -41,6 +41,21 @@ VOLUME = modal_train.VOLUME
 SMART = ("smart", "smart-v18", "smart-v28", "smart-v34")
 Z95 = 1.959963984540054
 
+# Where each pair's result is kept, keyed by everything that defines it.
+# Written from inside the container that measured it, so a result
+# survives the client that asked for it: twice a local client lost its
+# connection and the app stopped with it, once after 2.5 hours with
+# every pair still running.
+RESULTS = f"{VOLUME}/evals"
+
+
+def _key(checkpoint: str, bot: str, deals: int, seed: int, pre_play: str,
+         search: dict | None) -> str:
+    import hashlib
+
+    spec = json.dumps([checkpoint, bot, deals, seed, pre_play, search], sort_keys=True)
+    return hashlib.sha1(spec.encode()).hexdigest()[:16]
+
 
 def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
           pre_play: str, search: dict | None, device: str) -> dict:
@@ -50,23 +65,61 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
 
     from tractor.eval.bots import play_against_bot
     from tractor.eval.search import SearchConfig
+    from tractor.nn.declare import DeclareNet
+    from tractor.sim.bury import BuryConfig
 
     # Each host shard scores its own decisions on its own thread; intra-op
     # threads on top of that would only fight over the same cores.
     torch.set_num_threads(1)
     net, cfg = modal_train._load_net(checkpoint, device)
     net.eval()
+    # --pre-play agent: the checkpoint's own declaration network (none
+    # means its seats never declare) and the value climb for burial.
+    # agent-pass is the same with the declaration network withheld, so
+    # the network's seats never declare: what declaring is worth.
+    host_pre = "agent" if pre_play.startswith("agent") else pre_play
+    declare_net = None
+    if pre_play == "agent":
+        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if blob.get("declare") is not None:
+            declare_net = DeclareNet()
+            declare_net.load_state_dict(blob["declare"]["model"])
+            declare_net = declare_net.to(device).eval()
     started = time.perf_counter()
     stats = play_against_bot(net, bot, device=device, cfg=cfg,
                              num_deals=deals, seed=seed, workers=workers,
-                             per_hand=True, pre_play=pre_play,
-                             search=SearchConfig(**search) if search else None)
+                             per_hand=True, pre_play=host_pre,
+                             search=SearchConfig(**search) if search else None,
+                             declare_net=declare_net,
+                             bury=BuryConfig(rounds=8, consider=12))
     stats["seconds"] = time.perf_counter() - started
     stats["checkpoint"] = checkpoint
     stats["bot"] = bot
     stats["pre_play"] = pre_play
     stats["search"] = search
+    stats["declare_net"] = declare_net is not None
+    stats["seed"] = seed
+    os.makedirs(RESULTS, exist_ok=True)
+    key = _key(checkpoint, bot, deals, seed, pre_play, search)
+    with open(f"{RESULTS}/{key}.json", "w") as fh:
+        json.dump(stats, fh)
+    volume.commit()
     return stats
+
+
+@app.function(image=image, volumes={VOLUME: volume}, timeout=600)
+def fetch(keys: list) -> list:
+    """The stored result for each key, or None."""
+    volume.reload()
+    out = []
+    for key in keys:
+        path = f"{RESULTS}/{key}.json"
+        if os.path.exists(path):
+            with open(path) as fh:
+                out.append(json.load(fh))
+        else:
+            out.append(None)
+    return out
 
 
 @app.function(image=image, volumes={VOLUME: volume}, cpu=32.0,
@@ -107,7 +160,9 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
         search = {"worlds": search_worlds, "top_k": search_top,
                   "extra_tricks": search_extra_tricks,
                   "confident": search_confident}
-    fn = play_gpu if search else play
+    # Search, and the burial climb of --pre-play agent, are batched
+    # forwards that a CPU thread runs at ~100 ms a row.
+    fn = play_gpu if (search or pre_play.startswith("agent")) else play
     ckpts = [c.strip() for c in checkpoints.split(",") if c.strip()]
     names = [b.strip() for b in bots.split(",") if b.strip()]
     pairs = [(c, b) for c in ckpts for b in names]
@@ -126,15 +181,27 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
                         and r.get("pre_play", "bot") == pre_play
                         and r.get("search") == search):
                     results[(r["checkpoint"], r["bot"])] = r
+    # Results a previous client asked for and never received are on the
+    # volume; take them before measuring anything again.
+    missing = [p for p in pairs if p not in results]
+    stored = fetch.remote([_key(c, b, deals, seed, pre_play, search) for c, b in missing])
+    with open(path, "a") as fh:
+        for (c, b), r in zip(missing, stored):
+            if r is not None:
+                results[(c, b)] = r
+                fh.write(json.dumps(r) + "\n")
     todo = [p for p in pairs if p not in results]
-    print(f"{len(pairs)} pairs, {len(pairs) - len(todo)} already in {path}, "
+    print(f"{len(pairs)} pairs, {len(pairs) - len(todo)} already measured, "
           f"{deals} deals each, seed {seed}, pre-play {pre_play}, "
           f"search {search}")
 
     with open(path, "a") as fh:
         for r in fn.starmap([(c, b, deals, seed, workers, pre_play, search)
                                  for c, b in todo],
-                              order_outputs=False):
+                              order_outputs=False, return_exceptions=True):
+            if isinstance(r, BaseException):
+                print(f"  a pair failed: {type(r).__name__}: {r}")
+                continue
             results[(r["checkpoint"], r["bot"])] = r
             fh.write(json.dumps(r) + "\n")
             fh.flush()
@@ -142,6 +209,9 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
                   f"win {r['winrate']:.3f}  {r['seconds'] / 60:5.1f} min  "
                   f"searched {int(r.get('searched_decisions', 0))}"
                   f"/{int(r['decisions'])}")
+    if any(p not in results for p in pairs):
+        print("some pairs are unmeasured; rerun the same command to fill them")
+        return
 
     print()
     print(f"{'checkpoint':28} {'bot':10} {'win':>6} {'95% CI':>15} "

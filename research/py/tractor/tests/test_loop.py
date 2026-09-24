@@ -364,3 +364,96 @@ if __name__ == "__main__":
             print(f"FAIL {name}")
             traceback.print_exc()
     sys.exit(1 if failures else 0)
+
+
+def test_a_checkpoint_from_before_the_critic_context_resumes() -> None:
+    """Weights and optimiser state from before ``Critic.context_proj``.
+
+    The new layer starts at zero, so the old critic's values are
+    unchanged; the old optimiser state is extended rather than refused;
+    and one optimiser step afterwards runs.
+    """
+    cfg_model = _tiny()
+    net = ActorCritic(cfg_model)
+    learner = PPOLearner(net, PPOConfig(), "cpu")
+    loss = sum(p.sum() for p in net.parameters())
+    loss.backward()
+    learner.opt.step()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ck.pt"
+        with tempfile.TemporaryDirectory() as tmp2:
+            save_checkpoint(path, net, learner, 3, _cfg(tmp2))
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        for key in ("critic.context_proj.weight", "critic.context_proj.bias"):
+            del blob["model"][key]
+        group = blob["optimizer"]["param_groups"][0]
+        dropped = group["params"][-2:]
+        group["params"] = group["params"][:-2]
+        for i in dropped:
+            blob["optimizer"]["state"].pop(i, None)
+        torch.save(blob, path)
+
+        fresh = ActorCritic(cfg_model)
+        fresh_learner = PPOLearner(fresh, PPOConfig(), "cpu")
+        assert load_checkpoint(path, fresh, fresh_learner) == 3
+
+    assert torch.all(fresh.critic.context_proj.weight == 0)
+    for (name, a), b in zip(net.named_parameters(), fresh.parameters()):
+        if "context_proj" not in name:
+            assert torch.equal(a, b), name
+    loss = sum(p.sum() for p in fresh.parameters())
+    loss.backward()
+    fresh_learner.opt.step()
+
+
+def test_the_full_hand_schedule_runs_and_resumes() -> None:
+    """Warm-up, a declaration phase, play from the agent's starts; a
+    resume inside a block does not rerun its phase, one at the next
+    block boundary does."""
+    from dataclasses import replace
+
+    from ..train.loop import train
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(
+            tmp, total_steps=3, warmup_steps=1, play_phase_steps=2,
+            declare_phase_steps=1, bury_rounds=1, bury_consider=3,
+            checkpoint_every=1, keep_last=5,
+            declare={"hands_per_step": 4, "epochs": 1, "minibatch": 16},
+        )
+        out = train(cfg)
+        assert out["final"]["pre/bury/value_frac"] >= 0.0
+        final = torch.load(Path(tmp) / "final.pt", weights_only=False)
+        assert final["declare"]["phases_done"] == 1
+
+        # Step 2 lies inside block 0, whose phase already ran.
+        mid = Path(tmp) / "step_0000002.pt"
+        saved = torch.load(mid, weights_only=False)["declare"]["model"]
+        train(replace(cfg, total_steps=3, checkpoint_dir=tmp + "/b"), resume=mid)
+        again = torch.load(Path(tmp) / "b" / "final.pt", weights_only=False)
+        assert again["declare"]["phases_done"] == 1
+        for k, v in saved.items():
+            assert torch.equal(v, again["declare"]["model"][k]), k
+
+        # Step 3 opens block 1: its phase runs on resume.
+        train(replace(cfg, total_steps=4, checkpoint_dir=tmp + "/c"),
+              resume=Path(tmp) / "final.pt")
+        later = torch.load(Path(tmp) / "c" / "final.pt", weights_only=False)
+        assert later["declare"]["phases_done"] == 2
+
+
+def test_prefetched_starts_run_the_same_schedule() -> None:
+    from ..train.loop import train
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(
+            tmp, total_steps=4, warmup_steps=1, play_phase_steps=2,
+            declare_phase_steps=1, bury_rounds=1, bury_consider=3,
+            prefetch_starts=True,
+            declare={"hands_per_step": 4, "epochs": 1, "minibatch": 16},
+        )
+        out = train(cfg)
+        final = torch.load(Path(tmp) / "final.pt", weights_only=False)
+        assert final["declare"]["phases_done"] == 2
+        assert out["final"]["pre/bury/value_frac"] >= 0.0

@@ -478,6 +478,19 @@ def test_reward_points_account_for_every_captured_point() -> None:
         expected_points = np.zeros(len(rows), dtype=np.float64)
         expected_level = np.zeros(len(rows), dtype=np.float64)
         captured = {0: 0, 1: 0}
+        # The kitty bonus rides on the last trick: nonzero only when the
+        # attackers took it, and computed here from the replay's own
+        # totals rather than from anything the crediting code touched.
+        bonus = state.attacker_points - sum(
+            p for p, w, _r in tricks if team_of(w) != state.defenders
+        )
+        assert bonus >= 0
+        if bonus:
+            assert team_of(tricks[-1][1]) != state.defenders
+        tricks = [
+            (p + (bonus if i == len(tricks) - 1 else 0), w, r)
+            for i, (p, w, r) in enumerate(tricks)
+        ]
         for points, winner, trick_rows in tricks:
             assert len(trick_rows) == NUM_SEATS
             captured[team_of(winner)] += points

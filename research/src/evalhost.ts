@@ -27,7 +27,7 @@
 
 import { createInterface } from 'node:readline';
 
-import { NATURAL_RANKS, type BotType, type Card } from '@tractor/engine';
+import { NATURAL_RANKS, sumPoints, type BotType, type Card } from '@tractor/engine';
 
 import { NUM_SLOTS, cardSlot } from './cards';
 import { trumpSuitIndex, type EpisodeSummary } from './encode';
@@ -102,6 +102,11 @@ function installPipeGuards(): void {
 
 type HalfResult = {
   readonly digest: number;
+  // At the moment play began: who made the standing declaration (-1 for
+  // a kitty flip), the trump suit, and the points buried in the kitty.
+  readonly declarer: number;
+  readonly trumpSuit: number;
+  readonly kittyPoints: number;
   // Everything about the position at the moment play began: the dealt
   // hands, the burial, the landlord and the trump context. See
   // `fingerprintPlayStart`.
@@ -146,6 +151,9 @@ async function playHand(
 ): Promise<HalfResult> {
   let decisions = 0;
   let playStart: string | null = null;
+  let declarer = -1;
+  let trumpAtStart = -1;
+  let kittyPoints = 0;
 
   for (;;) {
     let advanced;
@@ -175,7 +183,50 @@ async function playHand(
     if (episodes.length > 0) {
       const episode = episodes[0]!;
       if (playStart === null) throw new Error('hand ended with no learner decision');
-      return { digest: episode.dealDigest, playStart, episode, decisions };
+      return {
+        digest: episode.dealDigest, playStart, episode, decisions,
+        declarer, trumpSuit: trumpAtStart, kittyPoints,
+      };
+    }
+
+    // The learner's own declarations and burial (--pre-play agent).
+    const pre = advanced.prePending ?? null;
+    if (pre !== null) {
+      const hs = slot.gameState.currentHand;
+      if (hs === null || hs.trumpRank === null || hs.landlord === null) {
+        throw new Error('pre-play decision outside a live hand');
+      }
+      const levelRank = NATURAL_RANKS.indexOf(hs.trumpRank);
+      if (pre.kind === 'declare') {
+        const st = slot.standing();
+        await writeLine({
+          t: 'declare', game, half, seat: pre.seat, level_rank: levelRank,
+          landlord: hs.landlord, dealt: slot.dealtCount, closing: pre.closing,
+          standing_tier: st.tier, standing_suit: st.suit, standing_seat: st.seat,
+          hand: plane(slot.revealedFor(pre.seat)), mask: pre.mask,
+        });
+        const reply = await readLine();
+        if (reply === null) throw new Error('client closed the stream mid-deal');
+        const parsed = JSON.parse(reply) as { t?: string; action?: number };
+        if (parsed.t !== 'declare_choice' || typeof parsed.action !== 'number') {
+          throw new Error(`expected a declare_choice, got ${reply.slice(0, 120)}`);
+        }
+        slot.answerDeclare(parsed.action);
+      } else {
+        await writeLine({
+          t: 'bury', game, half, seat: pre.seat, level_rank: levelRank,
+          trump_suit: trumpSuitIndex(hs), landlord: hs.landlord,
+          pool: plane(hs.hands[pre.seat] ?? []),
+        });
+        const reply = await readLine();
+        if (reply === null) throw new Error('client closed the stream mid-burial');
+        const parsed = JSON.parse(reply) as { t?: string; kitty?: number[] };
+        if (parsed.t !== 'bury_choice' || !Array.isArray(parsed.kitty)) {
+          throw new Error(`expected a bury_choice, got ${reply.slice(0, 120)}`);
+        }
+        slot.answerBury(parsed.kitty);
+      }
+      continue;
     }
     if (pending === null) throw new Error('slot stalled with nothing pending');
 
@@ -232,6 +283,9 @@ async function playHand(
     const levelRank = NATURAL_RANKS.indexOf(hand.trumpRank);
     const trumpSuit = trumpSuitIndex(hand);
     if (playStart === null) {
+      declarer = slot.standing().seat;
+      trumpAtStart = trumpSuit;
+      kittyPoints = sumPoints(hand.kitty);
       playStart = fingerprintPlayStart(
         hands,
         playedBySeat,
@@ -285,8 +339,8 @@ async function main(): Promise<void> {
   // `bot` hands both to the opponent bot at every seat, the network's
   // included, which is how every measurement before 2026-09-23 was taken.
   const prePlay = strOf('pre-play', 'random');
-  if (prePlay !== 'random' && prePlay !== 'bot') {
-    throw new Error(`--pre-play must be random or bot, got ${prePlay}`);
+  if (prePlay !== 'random' && prePlay !== 'bot' && prePlay !== 'agent') {
+    throw new Error(`--pre-play must be random, bot or agent, got ${prePlay}`);
   }
   // Shard: this host plays the games congruent to `shard` modulo
   // `shards`. A deal is a pure function of the seed base and its game
@@ -330,6 +384,7 @@ async function main(): Promise<void> {
         baselineBot: bot,
         prePlayBot: bot,
         randomPrePlay: prePlay === 'random',
+        agentPrePlay: prePlay === 'agent',
         maxCandidates,
         randomize: false,
         dealSeedBase: seedBase,
@@ -348,6 +403,9 @@ async function main(): Promise<void> {
         defender_gain: e.defendersWon ? e.levelDelta : 0,
         attacker_gain: e.defendersWon ? 0 : e.levelDelta,
         digest: result.digest,
+        declarer: result.declarer,
+        trump_suit: result.trumpSuit,
+        kitty_points: result.kittyPoints,
       });
     }
 
@@ -357,7 +415,10 @@ async function main(): Promise<void> {
         `deal ${game}: halves were dealt different cards (digest ${a.digest} vs ${b.digest})`,
       );
     }
-    if (a.playStart !== b.playStart) {
+    // With the learner declaring and burying for itself the two halves
+    // enter play from different positions by design; only the shuffle is
+    // shared.
+    if (prePlay !== 'agent' && a.playStart !== b.playStart) {
       throw new Error(
         `deal ${game}: halves entered play from different positions ` +
           `(same shuffle, different declaration or burial)`,

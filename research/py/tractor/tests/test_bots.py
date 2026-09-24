@@ -559,3 +559,32 @@ def test_a_budget_leaves_the_expensive_end_unmeasured() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_the_agent_declares_and_buries_for_itself() -> None:
+    """``--pre-play agent``: the host asks the network to declare and to
+    bury for its own seats, and both answers are played."""
+    import torch
+
+    from ..eval.bots import play_against_bot
+    from ..nn.declare import DeclareNet
+    from ..nn.model import ActorCritic, ModelConfig
+    from ..sim.bury import BuryConfig
+
+    torch.manual_seed(0)
+    cfg = ModelConfig()
+    net = ActorCritic(cfg).eval()
+    eager = DeclareNet().eval()
+    with torch.no_grad():
+        eager.actor[-1].bias[1:] = 3.0
+    got = play_against_bot(
+        net, "smart", cfg=cfg, num_deals=2, seed=11, workers=2,
+        pre_play="agent", declare_net=eager, bury=BuryConfig(rounds=1, consider=4),
+    )
+    assert got["hands"] == 4
+    assert got["net_declared_frac"] > 0.0
+    never = play_against_bot(
+        net, "smart", cfg=cfg, num_deals=2, seed=11, workers=2,
+        pre_play="agent", declare_net=None, bury=BuryConfig(rounds=1, consider=4),
+    )
+    assert never["net_declared_frac"] == 0.0

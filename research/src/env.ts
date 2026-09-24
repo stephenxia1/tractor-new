@@ -73,6 +73,14 @@ export type SlotOptions = {
   // position its own heuristic set up. In duplicate mode the draws come
   // from a stream keyed on the deal, so both halves agree.
   readonly randomPrePlay?: boolean;
+  // The learner makes its own seats' pre-play decisions: the engine deals
+  // card by card (``incrementalDeal``), a learner seat is asked at every
+  // card it receives that it could declare with, the bots declare
+  // whenever their own logic says to (as they do live), a closing round
+  // follows the last card, and a learner landlord buries. Surfaced
+  // through ``AdvanceResult.prePending`` and answered with
+  // ``answerDeclare`` / ``answerBury``.
+  readonly agentPrePlay?: boolean;
   // Probability that a hand's kitty is perturbed away from the pre-play
   // bot's choice, and the most cards that can be swapped when it is.
   readonly kittyNoise?: number;
@@ -118,10 +126,26 @@ export type Pending = {
   readonly candidates: ReadonlyArray<Candidate>;
 };
 
+// A pre-play decision for a learner seat (``agentPrePlay`` only).
+// ``mask`` covers the 11 declaration actions of py/tractor/sim/deal.py:
+// pass, a single then a pair of the level rank per suit, the small- and
+// big-joker pairs.
+export type PrePending =
+  | {
+      readonly kind: 'declare';
+      readonly seat: Seat;
+      readonly mask: ReadonlyArray<boolean>;
+      readonly closing: boolean;
+    }
+  | { readonly kind: 'bury'; readonly seat: Seat };
+
 export type AdvanceResult = {
   readonly episodes: ReadonlyArray<EpisodeSummary>;
   readonly pending: Pending | null;
+  readonly prePending?: PrePending | null;
 };
+
+const DECLARE_ACTIONS = 11;
 
 const MAX_STEPS_PER_ADVANCE = 20000;
 
@@ -140,6 +164,11 @@ export class GameSlot {
   private prePlayRng: () => number = Math.random;
   private declaredThisHand = false;
   private pending: Pending | null = null;
+  private prePending: PrePending | null = null;
+  private dealIndex = 0;
+  private closingActive = false;
+  private closingCursor = 0;
+  private closingPasses = 0;
   private forcedLeads = 0;
   private assertNoForcedLead = false;
 
@@ -186,7 +215,11 @@ export class GameSlot {
   // otherwise it would play until the step budget and report nothing.
   advance(): AdvanceResult {
     const episodes: EpisodeSummary[] = [];
+    if (this.prePending !== null) {
+      return { episodes, pending: null, prePending: this.prePending };
+    }
     if (this.pending !== null) return { episodes, pending: this.pending };
+    const agent = this.opts.agentPrePlay === true;
     const hasLearnerSeats = this.opts.learnerSeats.some((x) => x === true);
 
     for (let step = 0; step < MAX_STEPS_PER_ADVANCE; step++) {
@@ -197,12 +230,33 @@ export class GameSlot {
         continue;
       }
 
+      if (phase === 'dealing') {
+        this.runDealing();
+        if (this.prePending !== null) {
+          return { episodes, pending: null, prePending: this.prePending };
+        }
+        continue;
+      }
+
+      if (agent && (phase === 'declare_lockout' || phase === 'declare_open')) {
+        this.runAgentClosing();
+        if (this.prePending !== null) {
+          return { episodes, pending: null, prePending: this.prePending };
+        }
+        continue;
+      }
+
       if (phase === 'declare_lockout' || phase === 'declare_open') {
         this.runDeclarePhase();
         continue;
       }
 
       if (phase === 'kitty_replace') {
+        const landlord = this.state.currentHand?.landlord ?? null;
+        if (agent && landlord !== null && this.opts.learnerSeats[landlord] === true) {
+          this.prePending = { kind: 'bury', seat: landlord };
+          return { episodes, pending: null, prePending: this.prePending };
+        }
         this.runKittyReplace();
         continue;
       }
@@ -314,7 +368,13 @@ export class GameSlot {
   }
 
   private startHand(): void {
-    const config = defaultV1Config();
+    const config =
+      this.opts.agentPrePlay === true
+        ? { ...defaultV1Config(), incrementalDeal: true }
+        : defaultV1Config();
+    this.dealIndex = 0;
+    this.closingActive = false;
+    this.prePending = null;
     let base = createGame(config);
     this.handCounter += 1;
     this.currentHandId = this.handCounter;
@@ -412,6 +472,181 @@ export class GameSlot {
       hand.trumpRank === null ? 255 : NATURAL_RANKS.indexOf(hand.trumpRank),
     );
     return h >>> 0;
+  }
+
+  // --- the learner's own pre-play (agentPrePlay) --------------------------
+
+  get dealtCount(): number {
+    return this.dealIndex;
+  }
+
+  // The cards a seat can see: its revealed prefix while dealing, its
+  // whole hand after.
+  revealedFor(seat: Seat): ReadonlyArray<Card> {
+    const hand = this.state.currentHand;
+    if (hand === null) return [];
+    const all = hand.hands[seat] ?? [];
+    if (this.state.phase !== 'dealing') return all;
+    return all.slice(0, hand.cardsDealtBySeat[seat] ?? 0);
+  }
+
+  // The cards declaration action ``a`` would show, or null if not held.
+  private declareCards(seat: Seat, a: number): Card[] | null {
+    const hand = this.state.currentHand;
+    if (hand === null || hand.trumpRank === null) return null;
+    const level = hand.trumpRank;
+    const held = this.revealedFor(seat);
+    const take = (pred: (c: Card) => boolean, n: number): Card[] | null => {
+      const got = held.filter(pred);
+      return got.length >= n ? got.slice(0, n) : null;
+    };
+    if (a >= 1 && a <= 4) {
+      const suit = SUITS[a - 1];
+      return take((c) => c.kind === 'standard' && c.suit === suit && c.rank === level, 1);
+    }
+    if (a >= 5 && a <= 8) {
+      const suit = SUITS[a - 5];
+      return take((c) => c.kind === 'standard' && c.suit === suit && c.rank === level, 2);
+    }
+    if (a === 9) return take((c) => c.kind === 'joker' && c.rank === 'small', 2);
+    if (a === 10) return take((c) => c.kind === 'joker' && c.rank === 'big', 2);
+    return null;
+  }
+
+  // Which of the 11 actions the engine would accept from ``seat`` now.
+  declarationMask(seat: Seat): boolean[] {
+    const mask = [true];
+    for (let a = 1; a < DECLARE_ACTIONS; a++) {
+      const cards = this.declareCards(seat, a);
+      mask.push(
+        cards !== null && applyEvent(this.state, { kind: 'declare', seat, cards }).ok,
+      );
+    }
+    return mask;
+  }
+
+  // Tier (0 none, 1 single, 2 pair, 3/4 joker pairs), suit (0..3, 4 for
+  // no-trump, -1 none) and seat (-1 none) of the standing declaration.
+  standing(): { tier: number; suit: number; seat: number } {
+    const d = this.state.currentHand?.standingDeclaration ?? null;
+    if (d === null) return { tier: 0, suit: -1, seat: -1 };
+    if (d.kind === 'joker-pair') {
+      return { tier: d.jokerRank === 'big' ? 4 : 3, suit: 4, seat: d.seat };
+    }
+    return { tier: d.kind === 'pair' ? 2 : 1, suit: SUITS.indexOf(d.suit), seat: d.seat };
+  }
+
+  private botDeclares(seat: Seat): boolean {
+    const action = pickBotAction(this.state, seat, this.prePlayBot);
+    if (action.kind !== 'declare') return false;
+    const event = this.toEvent(action, seat);
+    if (event === null) return false;
+    const result = applyEvent(this.state, event);
+    if (!result.ok) return false;
+    this.state = result.state;
+    return true;
+  }
+
+  private runDealing(): void {
+    const hand = this.state.currentHand;
+    if (hand === null || hand.landlord === null) {
+      throw new Error('agent pre-play needs a landlord set before the deal');
+    }
+    const numPlayers = this.state.config.numPlayers;
+    const total =
+      this.state.config.numDecks * 54 - this.state.config.kittySize;
+    if (this.dealIndex >= total) {
+      this.apply({ kind: 'finish_dealing' });
+      return;
+    }
+    const seat = ((hand.landlord + this.dealIndex) % numPlayers) as Seat;
+    this.apply({ kind: 'reveal_card', seat });
+    this.dealIndex += 1;
+    // The bots may declare at any card, as they do in a live game.
+    for (let s = 0; s < numPlayers; s++) {
+      if (this.opts.learnerSeats[s] === true) continue;
+      this.botDeclares(s as Seat);
+    }
+    if (this.opts.learnerSeats[seat] === true) {
+      const mask = this.declarationMask(seat);
+      if (mask.slice(1).some(Boolean)) {
+        this.prePending = { kind: 'declare', seat, mask, closing: false };
+      }
+    }
+  }
+
+  // After the last card: every seat in turn from the landlord, cycling
+  // until four in a row pass, then the kitty is picked up.
+  private runAgentClosing(): void {
+    const hand = this.state.currentHand;
+    if (hand === null || hand.landlord === null) {
+      throw new Error('declaration window with no landlord');
+    }
+    if (this.state.phase === 'declare_open') {
+      this.apply({ kind: 'pick_up_kitty', seat: hand.landlord });
+      return;
+    }
+    const numPlayers = this.state.config.numPlayers;
+    if (!this.closingActive) {
+      this.closingActive = true;
+      this.closingCursor = hand.landlord;
+      this.closingPasses = 0;
+    }
+    while (this.closingPasses < numPlayers) {
+      const seat = this.closingCursor as Seat;
+      if (this.opts.learnerSeats[seat] === true) {
+        const mask = this.declarationMask(seat);
+        if (mask.slice(1).some(Boolean)) {
+          this.prePending = { kind: 'declare', seat, mask, closing: true };
+          return;
+        }
+        this.closingPasses += 1;
+      } else {
+        this.closingPasses = this.botDeclares(seat) ? 0 : this.closingPasses + 1;
+      }
+      this.closingCursor = (seat + 1) % numPlayers;
+    }
+    this.closingActive = false;
+    this.apply({ kind: 'release_lockout', seed: this.nextSeed() });
+  }
+
+  answerDeclare(action: number): void {
+    const p = this.prePending;
+    if (p === null || p.kind !== 'declare') throw new Error('no declaration pending');
+    if (p.mask[action] !== true) throw new Error(`action ${action} is not legal here`);
+    this.prePending = null;
+    if (action > 0) {
+      const cards = this.declareCards(p.seat, action);
+      if (cards === null) throw new Error(`seat ${p.seat} cannot show action ${action}`);
+      this.apply({ kind: 'declare', seat: p.seat, cards });
+    }
+    if (p.closing) {
+      this.closingPasses = action > 0 ? 0 : this.closingPasses + 1;
+      this.closingCursor = (p.seat + 1) % this.state.config.numPlayers;
+    }
+  }
+
+  // ``counts`` is the burial as copies per slot of cards.ts.
+  answerBury(counts: ReadonlyArray<number>): void {
+    const p = this.prePending;
+    if (p === null || p.kind !== 'bury') throw new Error('no burial pending');
+    const hand = this.state.currentHand;
+    if (hand === null) throw new Error('burial with no hand');
+    const need = [...counts];
+    const cards: Card[] = [];
+    for (const c of hand.hands[p.seat] ?? []) {
+      const slot = cardSlot(c);
+      if ((need[slot] ?? 0) > 0) {
+        need[slot] = (need[slot] ?? 0) - 1;
+        cards.push(c);
+      }
+    }
+    if (cards.length !== this.state.config.kittySize || need.some((n) => n !== 0)) {
+      throw new Error(`burial of ${cards.length} cards does not match the landlord's hand`);
+    }
+    this.prePending = null;
+    this.buriedKitty = [...cards];
+    this.apply({ kind: 'replace_kitty', seat: p.seat, cards });
   }
 
   private runDeclarePhase(): void {

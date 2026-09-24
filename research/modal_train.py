@@ -15,6 +15,7 @@ image carries Node and the npm workspace as well as torch.
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import modal
@@ -24,7 +25,9 @@ REPO = "/repo"
 RESEARCH = f"{REPO}/research"
 VOLUME = "/vol"
 
-app = modal.App("tractor-train")
+# Overridable because two `modal run`s of one app stop each other: a
+# smoke run started beside a live training run needs a name of its own.
+app = modal.App(os.environ.get("TRACTOR_TRAIN_APP", "tractor-train"))
 volume = modal.Volume.from_name("tractor-rl", create_if_missing=True)
 
 # Node as well as torch, because `eval_bots` measures the network against
@@ -208,7 +211,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            checkpoint_every: int = 125, rollout_workers: int = 7,
            epochs: int = 1, buffer_capacity: int = 0,
            keep_last: int = 24, anneal_steps: int = 0,
-           final_level_weight: float = 0.0) -> None:
+           final_level_weight: float = 0.0, warmup_steps: int = 0,
+           play_phase_steps: int = 250, declare_phase_steps: int = 0,
+           declare_hands: int = 1024, random_burial_frac: float = 0.2,
+           bury_rounds: int = 8, bury_consider: int = 0,
+           length_buckets: int = 0, prefetch_starts: bool = False) -> None:
     """Submit a run and return, rather than waiting on it.
 
     The defaults for `hands`, `epochs` and `rollout_workers` come from
@@ -267,10 +274,21 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             "anneal_steps": anneal_steps,
             "final_level_weight": final_level_weight,
             "rollout_workers": rollout_workers,
-            "ppo": {"epochs": epochs},
+            # `length_buckets` 4 took a 1024-hand update from 9.7 s to
+            # 7.9 s on an L40S with the same losses and KL (modal_perf.py).
+            "ppo": {"epochs": epochs, "length_buckets": length_buckets},
             # A hand writes at most 100 rows, and a round that cannot
             # fit every hand silently collects fewer of them.
             "buffer_capacity": buffer_capacity or hands * 100,
+            # The full hand (``declare_phase_steps`` > 0): see TrainConfig.
+            "warmup_steps": warmup_steps,
+            "play_phase_steps": play_phase_steps,
+            "declare_phase_steps": declare_phase_steps,
+            "random_burial_frac": random_burial_frac,
+            "bury_rounds": bury_rounds,
+            "bury_consider": bury_consider,
+            "declare": {"hands_per_step": declare_hands},
+            "prefetch_starts": prefetch_starts,
         },
     )
     print(f"submitted {name}: call {call.object_id}")
@@ -316,7 +334,7 @@ def _load_net(checkpoint: str, device: str):
     """``(net, model_cfg)`` from a checkpoint path, or a fresh net."""
     import torch
 
-    from tractor.nn.model import ActorCritic, ModelConfig
+    from tractor.nn.model import ActorCritic, ModelConfig, load_model
 
     if not checkpoint:
         cfg = ModelConfig()
@@ -324,7 +342,7 @@ def _load_net(checkpoint: str, device: str):
     blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
     cfg = ModelConfig(**blob["model_config"])
     net = ActorCritic(cfg)
-    net.load_state_dict(blob["model"])
+    load_model(net, blob["model"])
     return net.to(device), cfg
 
 
@@ -750,3 +768,83 @@ def critic_hands(checkpoint: str = "", hands: str = "128,256,512,1024,2048",
               f"{r['ev_fit']:+7.3f} {r['ev_held']:+7.3f} {ci:>17} "
               f"{r['gap']:+7.3f} {r['slope_held']:+6.2f} "
               f"{r['collect_s']:7.1f}s")
+
+
+# --- the full-hand pipeline -------------------------------------------------
+
+
+def _pipeline_bench(checkpoint: str, hands: int, configs: list) -> list:
+    """Time dealing, declaring, burying and scoring ``hands`` play starts.
+
+    One row per burial configuration, then one declaration training
+    step. ``bury/value_end - bury/value_start`` is what the climb bought,
+    in critic units (x400 for points).
+    """
+    import time
+
+    import numpy as np
+    import torch
+
+    from tractor.nn.declare import DeclareNet
+    from tractor.sim.bury import BuryConfig
+    from tractor.train.declare_loop import DeclareLearner, DeclareTrainConfig
+    from tractor.train.starts import PrePlayConfig, critic_values, make_starts
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    net, _cfg = _load_net(checkpoint, "cuda")
+    net.eval()
+    dnet = DeclareNet().cuda().eval()
+    out = []
+    for c in configs:
+        bury = BuryConfig(
+            rounds=c["rounds"], consider=c["consider"],
+            group=c.get("group", 16), chunk=c.get("chunk", 4096),
+        )
+        pre = PrePlayConfig(random_burial_frac=c.get("random", 0.0), bury=bury)
+        torch.cuda.synchronize()
+        starts, _rows, st = make_starts(
+            np.random.default_rng(0), hands, net, dnet, "cuda", pre=pre
+        )
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        critic_values(net, starts, "cuda")
+        torch.cuda.synchronize()
+        out.append({**c, **st, "critic_s": time.perf_counter() - t0})
+        print(out[-1], flush=True)
+    learner = DeclareLearner(dnet, DeclareTrainConfig(
+        hands_per_step=hands,
+        pre=PrePlayConfig(random_burial_frac=0.0, bury=BuryConfig(
+            rounds=configs[-1]["rounds"], consider=configs[-1]["consider"],
+            group=configs[-1].get("group", 16))),
+    ), "cuda")
+    t0 = time.perf_counter()
+    st = learner.step(net, np.random.default_rng(1))
+    out.append({"declare_step_s": time.perf_counter() - t0, **st})
+    return out
+
+
+@app.function(image=image, gpu="L40S", volumes={VOLUME: volume},
+              timeout=3600, cpu=12.0, memory=65536)
+def pipeline_bench_l40s(checkpoint: str, hands: int, configs: list) -> list:
+    return _pipeline_bench(checkpoint, hands, configs)
+
+
+@app.local_entrypoint()
+def pipeline(checkpoint: str = "", hands: int = 1024) -> None:
+    configs = [
+        {"rounds": 8, "consider": 0, "group": 256},
+        {"rounds": 16, "consider": 0, "group": 256},
+        {"rounds": 8, "consider": 10, "group": 256},
+        {"rounds": 8, "consider": 0, "group": 1024},
+    ]
+    rows = pipeline_bench_l40s.remote(checkpoint, hands, configs)
+    print()
+    for r in rows:
+        if "declare_step_s" in r:
+            print(f"declare step: {r['declare_step_s']:.1f}s  rows {r.get('declare/rows', 0):.0f}")
+            continue
+        gain = (r["bury/value_end"] - r["bury/value_start"]) * 400
+        print(f"rounds {r['rounds']} consider {r['consider']:2d} group {r.get('group', 16):3d}: "
+              f"declare {r['time/declare_s']:5.1f}s  bury {r['time/bury_s']:5.1f}s  "
+              f"critic {r['critic_s']:4.1f}s  climb +{gain:.1f} pts  "
+              f"rounds used {r['bury/rounds']:.0f}")
