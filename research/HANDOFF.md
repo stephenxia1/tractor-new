@@ -9,7 +9,42 @@ Don't re-derive those numbers; extend them.
 
 ---
 
-## 0. Update, late 2026-09-23 — read this first
+## 00. Update, 2026-09-24 — the full hand. Read this first.
+
+The agent now declares trump and buries the kitty itself (landlord-set
+hands), trained in alternation with play. Design and measured step costs
+are in `README.md` § *The full hand* and § *Where a full-hand step goes*.
+What a new session needs beyond that:
+
+- **Run `v4-full`** (Modal app `tractor-train`, detached): resumed from
+  `v3-points/step_0002000.pt`; warm-up to step 2150 on uniform starts,
+  then 5 blocks of a 50-step declaration phase + 200 play steps, to 3150.
+  1024 hands, `bury_consider 12`, `random_burial_frac 0.2`,
+  `length_buckets 4`. Checkpoints `/vol/v4-full/checkpoints/`; each
+  carries the declaration network under `"declare"`. It was restarted
+  once at step 2100 to pick up the TF32 burial and length buckets.
+- **The critic changed shape** (`Critic.context_proj`). `load_model`
+  loads older checkpoints with it at zero, and `load_checkpoint` extends
+  an older optimiser state. Anything that calls `load_state_dict`
+  directly on a pre-2026-09-24 checkpoint will now raise.
+- **The reward changed**: the kitty bonus is credited with the last
+  trick. Critic numbers from before are not comparable.
+- **Evaluation modes** (`modal_eval.py --pre-play`): `random` (play only,
+  the default), `bot` (the bots declare and bury for everyone), `agent`
+  (the network declares with the checkpoint's declaration network and
+  buries by the value climb; runs on a GPU container), `agent-pass`
+  (same, but the network never declares). Each result is written to
+  `/vol/evals/<key>.json` from inside its container; rerun the same
+  command to collect what a dropped client missed.
+- **Run separate apps side by side**: `TRACTOR_TRAIN_APP` and
+  `TRACTOR_EVAL_APP` override the app names. Two `modal run`s of one
+  app stop each other.
+- **Not built**: the population of 8 (task 7 of the plan). Everything
+  up to it is single-agent.
+
+---
+
+## 0. Update, late 2026-09-23
 
 A second session re-measured everything at 770 deals a bot, changed how
 evaluation is run, and added search at inference time. **Several claims
