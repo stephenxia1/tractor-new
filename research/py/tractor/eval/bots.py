@@ -60,7 +60,7 @@ from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, TrickRecord, team_of
 from ..train.buffer import obs_batch_from_arrays
 from ..train.rollout import _InFlight, _choose, _evaluate, _pack
-from ..sim.bury import BuryConfig, value_burials
+from ..sim.bury import BuryConfig, policy_burials, value_burials
 from ..sim.deal import declare_features
 from .search import SearchConfig, search_move
 from .duplicate import (
@@ -405,13 +405,23 @@ def _declare_choice(declare_net: Any, msg: dict, device: Any) -> int:
     return int(logits.argmax(dim=1).item())
 
 
-def _bury_choice(net: Any, msg: dict, device: Any, bury: Any, cache: Cache) -> list[int]:
-    """The value climb's burial for a host ``bury``, as 54 counts."""
+def _bury_choice(
+    net: Any, msg: dict, device: Any, bury: Any, cache: Cache, bury_net: Any = None
+) -> list[int]:
+    """The burial for a host ``bury``, as 54 counts: the burial policy's
+    greedy picks when there is one, the value climb otherwise."""
     pool = np.asarray(msg["pool"], dtype=np.int8)
     ctx = Ctx(int(msg["level_rank"]), int(msg["trump_suit"]))
-    burials, _stats = value_burials(
-        net, [pool], [ctx], [int(msg["seat"])], device, bury, cache
-    )
+    seat = int(msg["seat"])
+    if bury_net is not None:
+        declarer = int(msg.get("standing_seat", -1))
+        rel = -1 if declarer < 0 else (declarer - seat) % NUM_SEATS
+        burials, _rows = policy_burials(
+            bury_net, [pool], [ctx], [(int(msg.get("standing_tier", 0)), rel)],
+            np.random.default_rng(0), device, greedy=True, cache=cache,
+        )
+        return [int(x) for x in burials[0]]
+    burials, _stats = value_burials(net, [pool], [ctx], [seat], device, bury, cache)
     return [int(x) for x in burials[0]]
 
 
@@ -605,6 +615,7 @@ def play_against_bot(
     search: SearchConfig | None = None,
     declare_net: Any = None,
     bury: BuryConfig | None = None,
+    bury_net: Any = None,
 ) -> dict[str, Any]:
     """Duplicate-score ``net`` against the engine's ``bot``.
 
@@ -714,7 +725,7 @@ def play_against_bot(
                 elif kind == "bury":
                     host.write({
                         "t": "bury_choice",
-                        "kitty": _bury_choice(net, msg, device, bury, cache),
+                        "kitty": _bury_choice(net, msg, device, bury, cache, bury_net),
                     })
                 elif kind == "done":
                     got = int(msg["deals"])

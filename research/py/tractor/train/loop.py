@@ -45,10 +45,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from ..nn.bury_net import BuryNet
 from ..nn.declare import DeclareNet
 from ..nn.features import Cache
 from ..nn.model import ActorCritic, ModelConfig, load_model
 from ..sim.bury import BuryConfig
+from .bury_loop import BuryLearner
 from .declare_loop import DeclareLearner, DeclareTrainConfig
 from .starts import PrePlayConfig, make_starts
 from ..telemetry import Spans, memory_snapshot
@@ -170,6 +172,14 @@ class TrainConfig:
     # What scores a burial: "actor" or "critic"; see ``sim.bury.BuryConfig``.
     bury_evaluator: str = "actor"
     bury_worlds: int = 8
+    # Bury by a learned policy of eight picks (``nn/bury_net.py``) in
+    # place of the climb. It trains in the declaration phase, on the same
+    # hands, rewarded by the critic's play-start value from the landlord's
+    # seat (``train/bury_loop.py``).
+    bury_policy: bool = False
+    # Count declaration phases from zero again, for a run resumed from a
+    # checkpoint written under a different schedule.
+    restart_schedule: bool = False
     declare: dict = field(default_factory=dict)
     # Build the next step's play starts on a thread while this step's
     # update runs, from a frozen copy of the network (the update is
@@ -273,6 +283,7 @@ def _prefetch_starts(
     hands: int,
     pre: PrePlayConfig,
     rng: np.random.Generator,
+    bury_net: Any = None,
 ) -> Future:
     """Start building the next step's play starts; see ``prefetch_starts``."""
     frozen = copy.deepcopy(net).eval()
@@ -282,7 +293,8 @@ def _prefetch_starts(
         ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         with ctx:
             starts, _rows, st = make_starts(
-                rng, hands, frozen, declare_net, device, pre=pre, cache=Cache()
+                rng, hands, frozen, declare_net, device, pre=pre, cache=Cache(),
+                bury_net=bury_net,
             )
         if stream is not None:
             stream.synchronize()
@@ -312,13 +324,18 @@ def _declare_phase(
         st = learner.step(play_net, rng)
         for k, v in st.items():
             totals[k] = totals.get(k, 0.0) + float(v)
+        bury = (
+            f"  bury ret {st['bury/return_mean']:+.3f} ent {st['bury/entropy']:.3f}"
+            f" pts {st.get('bury/kitty_points', 0.0):4.1f}"
+            if "bury/return_mean" in st else ""
+        )
         print(
             f"  [declare {block}:{i + 1}/{steps}] {time.perf_counter() - t0:5.1f}s"
             f"  rows {st.get('declare/rows', 0):5.0f}"
             f"  return {st.get('declare/return_mean', 0.0):+.3f}"
             f"  declared {st.get('declare/declared_frac', 0.0):.2f}"
             f"  nt {st.get('declare/no_trump_frac', 0.0):.2f}"
-            f"  ent {st.get('declare/entropy', 0.0):.3f}",
+            f"  ent {st.get('declare/entropy', 0.0):.3f}" + bury,
             flush=True,
         )
     out = {f"phase/{k}": v / max(steps, 1) for k, v in totals.items()}
@@ -367,36 +384,55 @@ def train(
         evaluator=cfg.bury_evaluator, worlds=cfg.bury_worlds,
     )
     declare_net = declare_learner = None
+    bury_net = bury_learner = None
+    burial = "policy" if cfg.bury_policy else "climb"
     phases_done = 0
     if full_hand:
+        blob = (
+            torch.load(Path(resume), map_location="cpu", weights_only=False)
+            if resume is not None and Path(resume).exists()
+            else {}
+        )
+        if cfg.bury_policy:
+            bury_net = BuryNet().to(device)
+            bury_learner = BuryLearner(bury_net, device=device)
+            if blob.get("bury") is not None:
+                bury_net.load_state_dict(blob["bury"]["model"])
+                bury_learner.opt.load_state_dict(blob["bury"]["optimizer"])
+            bury_net.eval()
         declare_cfg = DeclareTrainConfig(**{
             **cfg.declare,
-            "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg),
+            "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial=burial),
         })
         declare_net = DeclareNet().to(device)
-        declare_learner = DeclareLearner(declare_net, declare_cfg, device)
-        saved = (
-            load_declare(Path(resume))
-            if resume is not None and Path(resume).exists()
-            else None
+        declare_learner = DeclareLearner(
+            declare_net, declare_cfg, device, bury=bury_learner
         )
+        saved = blob.get("declare")
         if saved is not None:
             declare_net.load_state_dict(saved["model"])
             declare_learner.opt.load_state_dict(saved["optimizer"])
-            phases_done = int(saved["phases_done"])
+            phases_done = 0 if cfg.restart_schedule else int(saved["phases_done"])
         declare_net.eval()
+        del blob
     play_pre = PrePlayConfig(
-        random_burial_frac=cfg.random_burial_frac, bury=bury_cfg
+        random_burial_frac=cfg.random_burial_frac, bury=bury_cfg, burial=burial
     )
 
     def extra() -> dict | None:
         if not full_hand:
             return None
-        return {"declare": {
+        out = {"declare": {
             "model": declare_net.state_dict(),
             "optimizer": declare_learner.opt.state_dict(),
             "phases_done": phases_done,
         }}
+        if bury_net is not None:
+            out["bury"] = {
+                "model": bury_net.state_dict(),
+                "optimizer": bury_learner.opt.state_dict(),
+            }
+        return out
 
     # A hand can take one deal's worth of rows per seat, and `collect`
     # refuses to start a hand it cannot guarantee room for -- so a
@@ -463,6 +499,7 @@ def train(
                         starts, _rows, st = make_starts(
                             rng, cfg.hands_per_step, net, declare_net, device,
                             pre=play_pre, cache=declare_learner.cache,
+                            bury_net=bury_net,
                         )
                     pre_stats.update(st)
 
@@ -517,6 +554,7 @@ def train(
                 prefetched = _prefetch_starts(
                     executor, net, declare_net, device, cfg.hands_per_step, play_pre,
                     np.random.default_rng(int(rng.integers(0, 2**31 - 1))),
+                    bury_net,
                 )
 
             with spans.span("update"):

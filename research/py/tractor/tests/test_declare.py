@@ -48,7 +48,31 @@ def test_starts_are_legal_play_positions() -> None:
         assert all(int(state.hands[s].sum()) == 25 for s in range(4))
         assert int(state.kitty.sum()) == 8
         assert len(state.legal_moves().moves) > 0
-    assert rows is not None and rows.mask.shape[1] == NUM_ACTIONS
+    assert rows is not None and rows.bury is None
+    rows = rows.declare
+    assert rows.mask.shape[1] == NUM_ACTIONS
     assert np.all(rows.mask[np.arange(len(rows)), rows.action])
     v = critic_values(play, starts)
     assert v.shape == (5, 4) and np.isfinite(v).all()
+
+
+def test_the_pre_play_phase_trains_the_burial_policy_too() -> None:
+    from ..nn.bury_net import BuryNet
+    from ..train.bury_loop import BuryLearner
+
+    torch.manual_seed(2)
+    play = ActorCritic(ModelConfig()).eval()
+    before = {k: v.clone() for k, v in play.state_dict().items()}
+    bnet = BuryNet()
+    b_before = [p.clone() for p in bnet.parameters()]
+    cfg = DeclareTrainConfig(
+        hands_per_step=6, epochs=1, minibatch=16,
+        pre=PrePlayConfig(random_burial_frac=0.0, burial="policy"),
+    )
+    learner = DeclareLearner(DeclareNet(), cfg, bury=BuryLearner(bnet))
+    stats = learner.step(play, np.random.default_rng(0))
+    for k, v in play.state_dict().items():
+        assert torch.equal(v, before[k]), k
+    assert any(not torch.equal(x, y) for x, y in zip(b_before, bnet.parameters()))
+    assert stats["bury/rows"] == 8 * 6
+    assert np.isfinite(stats["bury/return_mean"])

@@ -124,3 +124,31 @@ def test_device_rows_score_as_the_host_rows_do() -> None:
     assert np.allclose(fast, slow, atol=1e-6), np.abs(fast - slow).max()
     # Every swap moves exactly one card out and one in.
     assert np.all(np.abs(kits[1:5] - kits[0]).sum(1) == 2)
+
+
+def test_policy_burials_are_legal_and_blind_to_hidden_hands() -> None:
+    """Eight legal picks; the other hands feed only the value head, so
+    changing them changes no pick."""
+    from ..nn.bury_net import BuryNet
+    from ..sim.bury import policy_burials
+
+    torch.manual_seed(5)
+    net = BuryNet().eval()
+    with torch.no_grad():
+        net.score.weight.normal_()  # a non-uniform policy
+    pools = _pools(6, 21)
+    ps = [p for p, _c, _l in pools]
+    cs = [c for _p, c, _l in pools]
+    standings = [(1, 0)] * 6
+    a, rows = policy_burials(net, ps, cs, standings, np.random.default_rng(1),
+                             others=np.zeros((6, 3, NUM_TYPES)), record=True)
+    b, _ = policy_burials(net, ps, cs, standings, np.random.default_rng(1),
+                          others=np.random.default_rng(2).integers(0, 3, (6, 3, NUM_TYPES)))
+    for pool, x, y in zip(ps, a, b):
+        assert int(x.sum()) == 8 and np.all(x <= pool)
+        assert np.array_equal(x, y)
+    assert rows is not None and len(rows) == 8 * 6
+    assert np.all(rows.mask[np.arange(len(rows)), rows.action])
+    g1, _ = policy_burials(net, ps, cs, standings, np.random.default_rng(3), greedy=True)
+    g2, _ = policy_burials(net, ps, cs, standings, np.random.default_rng(4), greedy=True)
+    assert all(np.array_equal(x, y) for x, y in zip(g1, g2))

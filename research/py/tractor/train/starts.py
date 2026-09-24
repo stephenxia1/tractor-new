@@ -34,7 +34,14 @@ import torch
 from ..nn.features import Cache, context_vector
 from ..nn.model import privileged_view
 from ..rules.cards import Ctx
-from ..sim.bury import BuryConfig, play_start, random_burial, value_burials
+from ..sim.bury import (
+    BuryConfig,
+    BuryRows,
+    play_start,
+    policy_burials,
+    random_burial,
+    value_burials,
+)
 from ..sim.deal import (
     DECLARE_OBS_DIM,
     DECLARE_PRIV_DIM,
@@ -45,6 +52,7 @@ from ..sim.deal import (
     declare_privileged,
 )
 from ..sim.state import NUM_SEATS, PlayState
+from ..rules.cards import POINTS as _POINTS
 
 __all__ = [
     "Start",
@@ -106,6 +114,11 @@ class PrePlayConfig:
     # Burials by the value network's climb, except this share at random.
     random_burial_frac: float = 0.2
     bury: BuryConfig = field(default_factory=BuryConfig)
+    # "climb": ``sim.bury.value_burials``. "policy": the learned burial
+    # network's eight picks (``nn/bury_net.py``), sampled unless
+    # ``greedy_bury``.
+    burial: str = "climb"
+    greedy_bury: bool = False
 
 
 @dataclass
@@ -123,6 +136,14 @@ class DeclareRows:
 
     def __len__(self) -> int:
         return len(self.action)
+
+
+@dataclass
+class PrePlayRows:
+    """Everything a pre-play phase trains on, for one batch of hands."""
+
+    declare: DeclareRows
+    bury: BuryRows | None
 
 
 def _declare_round(
@@ -167,11 +188,13 @@ def make_starts(
     record: bool = False,
     cache: Cache | None = None,
     num_decks: int = 2,
-) -> tuple[list[Start], DeclareRows | None, dict[str, float]]:
+    bury_net: Any = None,
+) -> tuple[list[Start], PrePlayRows | None, dict[str, float]]:
     """Deal, declare and bury ``n`` hands.
 
     ``declare_net`` of ``None`` declares uniformly over the legal
-    actions; ``play_net`` of ``None`` buries every hand at random.
+    actions; ``play_net`` of ``None`` buries every hand at random, as
+    does ``pre.burial == "policy"`` with no ``bury_net``.
     """
     pre = pre or PrePlayConfig()
     t_start = time.perf_counter()
@@ -213,13 +236,36 @@ def make_starts(
     landlords = [env.landlord for env in envs]
     burials: list[np.ndarray | None] = [None] * n
     by_value = []
+    use_policy = pre.burial == "policy"
+    able = bury_net is not None if use_policy else play_net is not None
     for i in range(n):
-        if play_net is None or rng.random() < pre.random_burial_frac:
+        if not able or rng.random() < pre.random_burial_frac:
             burials[i] = random_burial(pools[i], rng)
         else:
             by_value.append(i)
     bury_stats = {"value_start": 0.0, "value_end": 0.0, "rounds": 0.0}
-    if by_value:
+    bury_rows = None
+    if by_value and use_policy:
+        standings = []
+        others = np.zeros((len(by_value), 3, pools[0].shape[0]), dtype=np.float32)
+        for j, i in enumerate(by_value):
+            env = envs[i]
+            st = env.standing
+            rel = -1 if st is None else (st.seat - env.landlord) % NUM_SEATS
+            standings.append((env.standing_tier, rel))
+            for k in range(3):
+                others[j, k] = env.final[(env.landlord + 1 + k) % NUM_SEATS]
+        got, bury_rows = policy_burials(
+            bury_net, [pools[i] for i in by_value], [ctxs[i] for i in by_value],
+            standings, rng, device, greedy=pre.greedy_bury, others=others,
+            record=record, cache=cache, num_decks=num_decks,
+        )
+        for i, b in zip(by_value, got):
+            burials[i] = b
+        if bury_rows is not None:
+            # Rows index the policy's own batch; point them at the hands.
+            bury_rows.hand = np.asarray(by_value, dtype=np.int64)[bury_rows.hand]
+    elif by_value:
         got, bury_stats = value_burials(
             play_net, [pools[i] for i in by_value], [ctxs[i] for i in by_value],
             [landlords[i] for i in by_value], device, pre.bury, cache, num_decks,
@@ -241,7 +287,7 @@ def make_starts(
     if record:
         def cat(k: str, empty: tuple[int, ...], dtype: Any) -> np.ndarray:
             return np.concatenate(parts[k]) if parts[k] else np.zeros(empty, dtype=dtype)
-        rows = DeclareRows(
+        rows = PrePlayRows(declare=DeclareRows(
             obs=cat("obs", (0, DECLARE_OBS_DIM), np.float32),
             privileged=cat("privileged", (0, DECLARE_PRIV_DIM), np.float32),
             mask=cat("mask", (0, NUM_ACTIONS), bool),
@@ -250,7 +296,7 @@ def make_starts(
             value=cat("value", (0,), np.float32),
             hand=cat("hand", (0,), np.int64),
             seat=cat("seat", (0,), np.int64),
-        )
+        ), bury=bury_rows)
     declared = [env.standing is not None for env in envs]
     stats = {
         "declare/decisions_per_hand": decisions / max(n, 1),
@@ -261,6 +307,9 @@ def make_starts(
             (e.standing is not None and (e.standing.seat - e.landlord) % 2 == 0) for e in envs
         ])) if n else 0.0,
         "bury/value_frac": len(by_value) / max(n, 1),
+        "bury/kitty_points": float(np.mean([
+            float((b.astype(np.int64) * _POINTS).sum()) for b in burials
+        ])) if n else 0.0,
         "bury/value_start": bury_stats["value_start"],
         "bury/value_end": bury_stats["value_end"],
         "bury/rounds": bury_stats["rounds"],

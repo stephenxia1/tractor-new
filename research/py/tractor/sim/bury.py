@@ -497,3 +497,116 @@ def value_burials(
         "rounds": float(rounds),
     }
     return current, stats
+
+
+# --- a learned policy: eight picks, one card each ----------------------------
+
+
+@dataclass
+class BuryRows:
+    """The eight picks of every landlord in a batch, for training."""
+
+    cards: np.ndarray  # float32[R, 54, BURY_CARD_DIM]
+    ctx: np.ndarray  # float32[R, BURY_CTX_DIM]
+    mask: np.ndarray  # bool[R, 54]
+    privileged: np.ndarray  # float32[R, BURY_PRIV_DIM]
+    action: np.ndarray  # int64[R], a card type
+    logp: np.ndarray  # float32[R]
+    value: np.ndarray  # float32[R]
+    hand: np.ndarray  # int64[R], index into the batch
+
+    def __len__(self) -> int:
+        return len(self.action)
+
+
+def bury_context(
+    level_rank: int, trump_suit: int, step: int, standing_tier: int,
+    declarer_rel: int,
+) -> np.ndarray:
+    """float32[BURY_CTX_DIM]. ``declarer_rel`` is the standing
+    declaration's seat relative to the landlord, or -1 for none."""
+    from ..nn.bury_net import BURY_CTX_DIM, BURY_STEPS
+
+    out = np.zeros(BURY_CTX_DIM, dtype=np.float32)
+    out[level_rank] = 1.0
+    out[13 + trump_suit] = 1.0
+    out[18 + step] = 1.0
+    out[18 + BURY_STEPS + standing_tier] = 1.0
+    if declarer_rel >= 0:
+        out[18 + BURY_STEPS + 5 + declarer_rel] = 1.0
+    return out
+
+
+def policy_burials(
+    net: Any,
+    pools: Sequence[np.ndarray],
+    ctxs: Sequence[Ctx],
+    standings: Sequence[tuple[int, int]],
+    rng: np.random.Generator,
+    device: Any = "cpu",
+    greedy: bool = False,
+    others: np.ndarray | None = None,
+    record: bool = False,
+    cache: Cache | None = None,
+    num_decks: int = 2,
+) -> tuple[list[np.ndarray], BuryRows | None]:
+    """Bury for many landlords at once by the policy's eight picks.
+
+    ``standings[i]`` is ``(tier, declarer seat relative to the landlord
+    or -1)``. ``others`` is float32[n, 3, 54], the other hands after the
+    landlord, and only feeds the value head; it may be omitted where
+    nothing is trained. Picks are sampled unless ``greedy``.
+    """
+    from ..nn.bury_net import BURY_STEPS
+
+    cache = cache or Cache()
+    n = len(pools)
+    pool = np.stack([np.asarray(p, dtype=np.float32) for p in pools])
+    buried = np.zeros_like(pool)
+    static = np.stack([cache.static_card_features(c, num_decks) for c in ctxs])
+    priv = (
+        np.zeros((n, 3 * NUM_TYPES), dtype=np.float32)
+        if others is None else np.asarray(others, dtype=np.float32).reshape(n, -1)
+    )
+    parts: dict[str, list[np.ndarray]] = {k: [] for k in
+        ("cards", "ctx", "mask", "privileged", "action", "logp", "value", "hand")}
+    for step in range(BURY_STEPS):
+        held = pool - buried
+        cards = np.concatenate(
+            (static, (held / num_decks)[..., None], (buried / num_decks)[..., None],
+             (pool / num_decks)[..., None]),
+            axis=2,
+        ).astype(np.float32)
+        ctx = np.stack([
+            bury_context(ctxs[i].level_rank, ctxs[i].trump_suit, step,
+                         standings[i][0], standings[i][1])
+            for i in range(n)
+        ])
+        mask = held > 0
+        with torch.no_grad():
+            _logits, lp, v = net(
+                torch.from_numpy(cards).to(device), torch.from_numpy(ctx).to(device),
+                torch.from_numpy(mask).to(device), torch.from_numpy(priv).to(device),
+            )
+        logp_all = lp.float().cpu().numpy()
+        if greedy:
+            action = logp_all.argmax(axis=1)
+        else:
+            action = (logp_all + rng.gumbel(size=logp_all.shape)).argmax(axis=1)
+        if not np.all(mask[np.arange(n), action]):
+            raise RuntimeError("a burial pick fell outside the held cards")
+        buried[np.arange(n), action] += 1
+        if record:
+            parts["cards"].append(cards)
+            parts["ctx"].append(ctx)
+            parts["mask"].append(mask)
+            parts["privileged"].append(priv)
+            parts["action"].append(action.astype(np.int64))
+            parts["logp"].append(logp_all[np.arange(n), action].astype(np.float32))
+            parts["value"].append(v.float().cpu().numpy().astype(np.float32))
+            parts["hand"].append(np.arange(n, dtype=np.int64))
+    burials = [buried[i].astype(np.int8) for i in range(n)]
+    rows = None
+    if record:
+        rows = BuryRows(**{k: np.concatenate(v) for k, v in parts.items()})
+    return burials, rows

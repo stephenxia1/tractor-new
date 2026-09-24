@@ -44,30 +44,46 @@ class DeclareTrainConfig:
     # The critic's units are margin / 400; a seat's return is scaled up
     # into something nearer unit variance before the baseline fits it.
     reward_scale: float = 10.0
-    # Declaration decisions only; burial is always by the value climb in
-    # this phase, so the reward is the position the real pipeline makes.
+    # No random burials in this phase: the reward should be the position
+    # the real pipeline makes. ``pre.burial`` says what buries -- the
+    # value climb, or the burial policy, which then trains here too.
     pre: PrePlayConfig = field(default_factory=lambda: PrePlayConfig(random_burial_frac=0.0))
 
 
 class DeclareLearner:
     def __init__(
-        self, net: DeclareNet, cfg: DeclareTrainConfig | None = None, device: Any = "cpu"
+        self, net: DeclareNet, cfg: DeclareTrainConfig | None = None, device: Any = "cpu",
+        bury: Any = None,
     ) -> None:
+        """``bury``, a ``train.bury_loop.BuryLearner``, trains the burial
+        policy on the same hands in the same phase."""
         self.net = net
         self.cfg = cfg or DeclareTrainConfig()
         self.device = torch.device(device)
         self.opt = torch.optim.AdamW(net.parameters(), lr=self.cfg.lr)
         self.cache = Cache()
+        self.bury = bury
 
     def step(self, play_net: Any, rng: np.random.Generator) -> dict[str, float]:
         cfg = self.cfg
         self.net.eval()
-        starts, rows, stats = make_starts(
+        bury_net = None if self.bury is None else self.bury.net
+        if bury_net is not None:
+            bury_net.eval()
+        starts, pre_rows, stats = make_starts(
             rng, cfg.hands_per_step, play_net, self.net, self.device,
-            pre=cfg.pre, record=True, cache=self.cache,
+            pre=cfg.pre, record=True, cache=self.cache, bury_net=bury_net,
         )
         values = critic_values(play_net, starts, self.device)
-        assert rows is not None
+        assert pre_rows is not None
+        if self.bury is not None and pre_rows.bury is not None and len(pre_rows.bury):
+            # The landlord's play-start value is the return of all eight
+            # of its picks.
+            landlord = np.array([s.landlord for s in starts], dtype=np.int64)
+            hand = pre_rows.bury.hand
+            ret = values[hand, landlord[hand]].astype(np.float32) * cfg.reward_scale
+            stats.update(self.bury.update(pre_rows.bury, ret))
+        rows = pre_rows.declare
         if len(rows) == 0:
             return {**stats, "declare/rows": 0.0}
         ret = values[rows.hand, rows.seat].astype(np.float32) * cfg.reward_scale

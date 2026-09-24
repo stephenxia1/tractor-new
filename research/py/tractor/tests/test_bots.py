@@ -588,3 +588,19 @@ def test_the_agent_declares_and_buries_for_itself() -> None:
         pre_play="agent", declare_net=None, bury=BuryConfig(rounds=1, consider=4),
     )
     assert never["net_declared_frac"] == 0.0
+
+
+def test_the_agent_buries_by_its_policy_when_given_one() -> None:
+    import torch
+
+    from ..eval.bots import play_against_bot
+    from ..nn.bury_net import BuryNet
+    from ..nn.model import ActorCritic, ModelConfig
+
+    torch.manual_seed(1)
+    cfg = ModelConfig()
+    got = play_against_bot(
+        ActorCritic(cfg).eval(), "smart", cfg=cfg, num_deals=2, seed=13, workers=2,
+        pre_play="agent", declare_net=None, bury_net=BuryNet().eval(),
+    )
+    assert got["hands"] == 4

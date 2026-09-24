@@ -213,10 +213,12 @@ async function playHand(
         }
         slot.answerDeclare(parsed.action);
       } else {
+        const st = slot.standing();
         await writeLine({
           t: 'bury', game, half, seat: pre.seat, level_rank: levelRank,
           trump_suit: trumpSuitIndex(hs), landlord: hs.landlord,
           pool: plane(hs.hands[pre.seat] ?? []),
+          standing_tier: st.tier, standing_seat: st.seat,
         });
         const reply = await readLine();
         if (reply === null) throw new Error('client closed the stream mid-burial');

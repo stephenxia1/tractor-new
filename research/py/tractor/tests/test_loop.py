@@ -457,3 +457,24 @@ def test_prefetched_starts_run_the_same_schedule() -> None:
         final = torch.load(Path(tmp) / "final.pt", weights_only=False)
         assert final["declare"]["phases_done"] == 2
         assert out["final"]["pre/bury/value_frac"] >= 0.0
+
+
+def test_the_schedule_trains_a_burial_policy_and_can_restart() -> None:
+    from dataclasses import replace
+
+    from ..train.loop import train
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(
+            tmp, total_steps=3, warmup_steps=1, play_phase_steps=2,
+            declare_phase_steps=1, bury_policy=True,
+            declare={"hands_per_step": 4, "epochs": 1, "minibatch": 16},
+        )
+        train(cfg)
+        final = torch.load(Path(tmp) / "final.pt", weights_only=False)
+        assert final["bury"] is not None and final["declare"]["phases_done"] == 1
+        # A new schedule from that checkpoint counts its phases afresh.
+        train(replace(cfg, total_steps=4, warmup_steps=3, restart_schedule=True,
+                      checkpoint_dir=tmp + "/b"), resume=Path(tmp) / "final.pt")
+        again = torch.load(Path(tmp) / "b" / "final.pt", weights_only=False)
+        assert again["declare"]["phases_done"] == 1

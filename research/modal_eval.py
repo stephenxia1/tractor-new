@@ -81,20 +81,31 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
     # heuristic the climb starts from: what the climb is worth.
     # agent-critic climbs on the privileged critic averaged over 8 deals
     # of the landlord's unseen cards instead of the actor's value head.
+    # agent-policy buries by the checkpoint's learned burial policy.
     host_pre = "agent" if pre_play.startswith("agent") else pre_play
     declare_net = None
-    if pre_play in ("agent", "agent-heur", "agent-critic"):
+    bury_net = None
+    if pre_play in ("agent", "agent-heur", "agent-critic", "agent-policy"):
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if blob.get("declare") is not None:
             declare_net = DeclareNet()
             declare_net.load_state_dict(blob["declare"]["model"])
             declare_net = declare_net.to(device).eval()
+        if pre_play == "agent-policy":
+            from tractor.nn.bury_net import BuryNet
+
+            if blob.get("bury") is None:
+                raise ValueError(f"{checkpoint} carries no burial policy")
+            bury_net = BuryNet()
+            bury_net.load_state_dict(blob["bury"]["model"])
+            bury_net = bury_net.to(device).eval()
     started = time.perf_counter()
     stats = play_against_bot(net, bot, device=device, cfg=cfg,
                              num_deals=deals, seed=seed, workers=workers,
                              per_hand=True, pre_play=host_pre,
                              search=SearchConfig(**search) if search else None,
                              declare_net=declare_net,
+                             bury_net=bury_net,
                              bury=(
                                  BuryConfig(evaluator="critic", worlds=8, rounds=8)
                                  if pre_play == "agent-critic" else
@@ -144,8 +155,13 @@ def play(checkpoint: str, bot: str, deals: int, seed: int,
 # shards share the device from their own threads; the work is small
 # batches, bound by kernel launches, which an A10G serves as well as a
 # larger card.
+#
+# At most 8 at once. The workspace may run 10 GPUs, and a launch that
+# asked for 12 of them beside a training run queued the rest; a cap here
+# keeps one launch from taking the device a training run needs. Pairs
+# past the cap wait their turn rather than fail.
 @app.function(image=image, volumes={VOLUME: volume}, gpu="A10G", cpu=32.0,
-              memory=32768, timeout=8 * 3600)
+              memory=32768, timeout=8 * 3600, max_containers=8)
 def play_gpu(checkpoint: str, bot: str, deals: int, seed: int,
              workers: int, pre_play: str, search: dict | None) -> dict:
     return _play(checkpoint, bot, deals, seed, workers, pre_play, search, "cuda")
