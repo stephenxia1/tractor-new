@@ -36,8 +36,11 @@ What a new session needs beyond that:
 - **Evaluation modes** (`modal_eval.py --pre-play`): `random` (play only,
   the default), `bot` (the bots declare and bury for everyone), `agent`
   (the network declares with the checkpoint's declaration network and
-  buries by the value climb; runs on a GPU container), `agent-pass`
-  (same, but the network never declares). Each result is written to
+  buries by the actor-scored value climb; runs on a GPU container),
+  `agent-critic` (declares, buries by the critic-scored climb — the
+  configuration training uses from step 2550), `agent-heur` (declares,
+  buries by the heuristic the climb starts from), `agent-pass`
+  (actor climb, never declares). Each result is written to
   `/vol/evals/<key>.json` from inside its container; rerun the same
   command to collect what a dropped client missed.
 - **Run separate apps side by side**: `TRACTOR_TRAIN_APP` and
@@ -45,6 +48,21 @@ What a new session needs beyond that:
   app stop each other.
 - **Not built**: the population of 8 (task 7 of the plan). Everything
   up to it is single-agent.
+
+**Where it ended** (README § *Where v4-full ended*): `v4-full` finished
+at step 3150, `/vol/v4-full/checkpoints/final.pt`. Play-only it beats v3
+step 2000 by +0.075 against smart-v18/v28/v34 (paired), all of it gained
+by step 2400 — it has plateaued again. The full hand wins 0.525 as
+trained, 0.553 with the heuristic burial, 0.566 with search on top.
+
+**Next, in order:**
+1. Fix burial: the value-guided climb (actor- or critic-scored) loses
+   to its own heuristic starting point, most in landlord hands. Try a
+   trust region, more deals per candidate, or a learned burial policy.
+2. The population of 8 (plan task 7), now that pre-play is in place.
+3. Separate what broke the plateau between steps 2000 and 2400 — the
+   critic's context input, the kitty bonus, or agent-made starts — with
+   one-change-at-a-time runs from v3 step 2000.
 
 ---
 

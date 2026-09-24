@@ -432,6 +432,48 @@ v34, averaged:
   switched to it at step 2550. Value-guided burial has not yet beaten
   a plain rule.
 
+### Where v4-full ended (step 3150)
+
+Same protocol. **Play only**, paired against earlier checkpoints on the
+same positions:
+
+| bot | v3 step 2000 | v4 step 2400 | v4 final | final − v3 | final − 2400 |
+| --- | --- | --- | --- | --- | --- |
+| smart | 0.518 | 0.614 | 0.619 | +0.101 ± 0.021 | +0.005 ± 0.019 |
+| smart-v18 | 0.499 | 0.569 | 0.574 | +0.075 ± 0.022 | +0.005 ± 0.021 |
+| smart-v28 | 0.499 | 0.570 | 0.577 | +0.077 ± 0.022 | +0.006 ± 0.021 |
+| smart-v34 | 0.498 | 0.574 | 0.571 | +0.073 ± 0.022 | −0.003 ± 0.021 |
+
+The whole gain over v3 (+8 points a deal against the fair bots) arrived
+by step 2400; the last 750 steps added nothing measurable. The policy
+has plateaued again, one level higher.
+
+**The full hand** at the final checkpoint, averaged over smart-v18 /
+v28 / v34:
+
+| configuration | win | levels | points | win as landlord | win attacking | vs smart |
+| --- | --- | --- | --- | --- | --- | --- |
+| declares, critic-scored burial (as trained) | 0.525 | +0.08 | +3.7 | 0.454 | 0.596 | 0.706 |
+| declares, heuristic burial | 0.553 | +0.11 | +4.8 | 0.510 | 0.596 | 0.718 |
+| declares, critic-scored burial, + search (8 worlds, top 3) | **0.566** | **+0.17** | **+6.7** | 0.507 | 0.625 | **0.729** |
+
+- **Value-guided burial still loses to the heuristic**, and by more at
+  the end than at step 2400: 0.056 in the hands the network is
+  landlord. Six hundred steps of training on its own burials did not
+  close it. What a new session should try: a trust region around the
+  heuristic (swap only when the estimated gain exceeds the estimate's
+  own noise), more deals per candidate, or a burial *policy* trained
+  from play outcomes rather than a climb on a value estimate.
+- **Search adds about +0.04** on top of the full hand, as it did on the
+  play-only policy.
+- The network declares in 61% of hands; the bots in the rest.
+
+**Deep search** (v3 step 2000, play only, 16 worlds, top 4, three
+tricks past the current one before the critic): 0.575 / 0.556 / 0.555
+against smart / v18 / v28, paired +0.056 over no search and +0.02 over
+the shallow search (±0.022), at about 7× the cost — five hours a bot
+at 770 deals. The v34 pair hit the 8-hour container limit.
+
 ---
 
 ## Next steps
