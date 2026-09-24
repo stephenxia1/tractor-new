@@ -77,9 +77,11 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
     # means its seats never declare) and the value climb for burial.
     # agent-pass is the same with the declaration network withheld, so
     # the network's seats never declare: what declaring is worth.
+    # agent-heur keeps the declaration network and buries by the plain
+    # heuristic the climb starts from: what the climb is worth.
     host_pre = "agent" if pre_play.startswith("agent") else pre_play
     declare_net = None
-    if pre_play == "agent":
+    if pre_play in ("agent", "agent-heur"):
         blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if blob.get("declare") is not None:
             declare_net = DeclareNet()
@@ -91,7 +93,9 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
                              per_hand=True, pre_play=host_pre,
                              search=SearchConfig(**search) if search else None,
                              declare_net=declare_net,
-                             bury=BuryConfig(rounds=8, consider=12))
+                             bury=BuryConfig(
+                                 rounds=0 if pre_play == "agent-heur" else 8,
+                                 consider=12))
     stats["seconds"] = time.perf_counter() - started
     stats["checkpoint"] = checkpoint
     stats["bot"] = bot
