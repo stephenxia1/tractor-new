@@ -330,6 +330,63 @@ from 15.72 s to 13.87 s at 1024 hands, which against a ~35 s update is
 under 4% of the step, for about 20% more per hour. `cpu=8.0` and seven
 workers is the configuration the training functions use.
 
+### The full hand: declaration and burial, trained in alternation with play
+
+Play used to start from `gen/episode.py`'s draw — a declaration uniform
+over the legal ones, a burial uniform over the landlord's cards. The
+agent now makes both decisions itself (landlord-set hands only):
+
+- **Declaration** is its own environment, `sim/deal.py`: 100 cards dealt
+  one at a time from the landlord, every card a decision for the seat
+  that received it (pass, or one of 10 declarations), then a closing
+  round until four seats pass. Legality matches the engine on 600
+  scenarios dumped by `src/dumpDeclare.ts`. A small network
+  (`nn/declare.py`) is trained by PPO (`train/declare_loop.py`) with
+  play frozen; each seat's reward is its privileged critic's value at
+  play start, i.e. its team's expected point margin from there.
+- **Burial** (`sim/bury.py`) is a hill climb over complete burials —
+  swap one buried card for one kept card, keep the best improvement —
+  scored by the actor's own value head from the landlord's seat. Every
+  position it scores is a legal 25-card play start, which the value head
+  was trained on; removing cards one at a time would pass through
+  32-card hands it has never seen.
+- **The schedule** (`train/loop.py`): `warmup_steps` of play on the
+  uniform draw, then blocks of `play_phase_steps`, each opened by
+  `declare_phase_steps` of declaration training. A block's play starts
+  come from the frozen declaration policy and the burial climb, except
+  `random_burial_frac` (20%) buried at random so the value head stays
+  accurate on burials the climb would not propose.
+
+Two changes the design forced:
+
+- **The kitty bonus is credited** with the last trick (`_credit_trick`).
+  A reward blind to it rates burying every point card as free.
+- **The critic reads the context vector.** It knew the trump context
+  only through the card features inside history tokens, so at play
+  start, with no history, it could not tell one trump suit from another
+  or the landlord from an attacker — exactly the position declaration
+  is scored at. The new input starts at zero, so old checkpoints load
+  and compute what they did (`load_model`). On resuming v3 step 2000 its
+  explained variance went from ~0.37 to ~0.55 within 16 steps.
+
+### Where a full-hand step goes, and what was bought back
+
+L40S, 1024 hands, v3 step 2000 weights:
+
+| change | measured |
+| --- | --- |
+| history encoder runs to the batch's longest history (exact) | rollout forward 3.4 s → 2.4 s a step |
+| burial rows built on the device from per-hand bases | burial 22.5 s → 17.1 s (1024 hands, every swap) |
+| burial considers the 12 lowest-scoring kept types, not all | 17.1 s → ~7.4 s, keeping ~83% of the value gain (+4.03 of +4.85 pts) |
+| burial forward in TF32 | ~9.7 s → ~7 s at training scale |
+| `ppo.length_buckets = 4` | update 9.7 s → 7.9 s, same losses and KL |
+| prefetching starts on a thread | **no gain** (GIL): step 28.2 → 26.4 s, all of it the buckets |
+
+A warm-up step went from ~19 s to ~16 s with these. The declaration
+phase costs ~9–14 s a step at 1024 hands, nearly all of it burial.
+`modal run modal_perf.py::update` and `modal_train.py::pipeline`
+reproduce the numbers.
+
 ---
 
 ## Next steps
@@ -340,6 +397,7 @@ workers is the configuration the training functions use.
    `smart-v13` at 12 s/hand is the affordable middle rung.
 2. **Faster featurisation / GPU path**. `--device cuda` is wired but
    untested; featurisation would need to move onto the device with it.
-3. **Learned pre-play**: kitty burial as 8 sequential card choices, then
-   declaration. Both are currently `smart-v34`'s job.
+3. **A population of 8** independently initialised agents, one per seat
+   at two tables, reseated at intervals, in place of pure self-play.
+   Learned pre-play (above) was the prerequisite.
 4. **Bot adapter** so a trained checkpoint can fill a seat in the web app.
