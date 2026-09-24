@@ -381,6 +381,8 @@ L40S, 1024 hands, v3 step 2000 weights:
 | burial forward in TF32 | ~9.7 s → ~7 s at training scale |
 | `ppo.length_buckets = 4` | update 9.7 s → 7.9 s, same losses and KL |
 | prefetching starts on a thread | **no gain** (GIL): step 28.2 → 26.4 s, all of it the buckets |
+| critic's pooled vector computed once when no row has history (exact) | play-start critic values cost only the privileged MLP |
+| burial scored by the critic over 8 deals, every swap, instead of the actor | full-hand play step 22 s → 17.6 s; declaration step ~9 s → 2.4 s |
 
 A warm-up step went from ~19 s to ~16 s with these. The declaration
 phase costs ~9–14 s a step at 1024 hands, nearly all of it burial.
