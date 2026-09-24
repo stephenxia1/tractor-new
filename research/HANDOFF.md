@@ -22,7 +22,11 @@ What a new session needs beyond that:
   1024 hands, `bury_consider 12`, `random_burial_frac 0.2`,
   `length_buckets 4`. Checkpoints `/vol/v4-full/checkpoints/`; each
   carries the declaration network under `"declare"`. It was restarted
-  once at step 2100 to pick up the TF32 burial and length buckets.
+  at step 2100 to pick up the TF32 burial and length buckets, and at
+  step 2550 to bury by the critic (`--bury-evaluator critic`,
+  `--bury-consider 0`) after the actor-scored climb measured worse than
+  its own heuristic starting point (README § *What the full hand
+  bought*).
 - **The critic changed shape** (`Critic.context_proj`). `load_model`
   loads older checkpoints with it at zero, and `load_checkpoint` extends
   an older optimiser state. Anything that calls `load_state_dict`

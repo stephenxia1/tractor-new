@@ -387,6 +387,49 @@ phase costs ~9–14 s a step at 1024 hands, nearly all of it burial.
 `modal run modal_perf.py::update` and `modal_train.py::pipeline`
 reproduce the numbers.
 
+### What the full hand bought, at v4-full step 2400
+
+770 deals a bot (1,540 hands, ±0.025 on a win rate), seed 20260923, so
+every row shares its shuffles. Raw per-hand rows: `evals/2026-09-24/`.
+
+**Play only** (`--pre-play random`: both sides start from the uniform
+draw, so the positions are identical and the change is paired):
+
+| bot | v3 step 2000 | v4 step 2400 | paired win change | paired points change |
+| --- | --- | --- | --- | --- |
+| smart | 0.518 | 0.614 | +0.096 ± 0.020 | +12.0 ± 1.4 |
+| smart-v18 | 0.499 | 0.569 | +0.071 ± 0.022 | +7.8 ± 2.0 |
+| smart-v28 | 0.499 | 0.570 | +0.071 ± 0.022 | +7.8 ± 2.0 |
+| smart-v34 | 0.498 | 0.574 | +0.076 ± 0.022 | +8.0 ± 1.9 |
+
+The play policy, flat from step 500 to 2000, moved +0.07 against the
+fair search bots in 400 steps. What changed together: the critic's
+context input, the kitty bonus in the reward, and play from the agent's
+own starts. Nothing here separates them.
+
+**The full hand** (`--pre-play agent` and its ablations; positions differ
+between rows, so these are unpaired). Win rate against smart-v18 / v28 /
+v34, averaged:
+
+| pre-play | win | levels | points | win as landlord |
+| --- | --- | --- | --- | --- |
+| v3: the bots declare and bury for everyone | 0.510 | −0.01 | −0.5 | 0.47 |
+| v3: buries by its value head, never declares | 0.480 | −0.05 | −1.8 | 0.43 |
+| v4: declares, buries by the actor's value climb | 0.521 | +0.05 | +2.2 | 0.45 |
+| v4: never declares, actor climb | 0.513 | +0.03 | +1.7 | 0.46 |
+| v4: declares, **critic** climb over 8 deals | 0.536 | +0.08 | +3.1 | 0.48 |
+| v4: declares, the heuristic the climb starts from | 0.543 | +0.10 | +4.2 | 0.50 |
+
+- Declaring is worth about +0.01, nearly all of it as attacker (0.566 →
+  0.592 when attacking).
+- **The actor-scored burial climb lost to its own starting point**, by
+  0.045 in the hands the network was landlord: the best of ~100 noisy
+  estimates is the one the estimate overrates. Scoring with the
+  privileged critic averaged over sampled deals of the unseen cards
+  recovers most of it and is within noise of the heuristic; the run
+  switched to it at step 2550. Value-guided burial has not yet beaten
+  a plain rule.
+
 ---
 
 ## Next steps
