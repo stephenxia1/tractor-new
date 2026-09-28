@@ -211,8 +211,10 @@ def _preplay_step(
         rng, n, nets, [a.declare.net for a in agents], device,
         pre=cfg.pre, record=True, cache=cache, bury_net=bury_nets, agents=seat_of,
     )
+    t_critic = time.perf_counter()
     values = critic_values(nets, starts, device, agents=seat_of)
     landlord = np.array([s.landlord for s in starts], dtype=np.int64)
+    t_update = time.perf_counter()
 
     per_agent: list[dict[str, float]] = [{} for _ in agents]
     bury = pre_rows.bury
@@ -235,6 +237,8 @@ def _preplay_step(
         **stats,
         **_mean_over([p for p in per_agent if p]),
         "declare/critic_landlord_value": float(values[np.arange(n), landlord].mean()),
+        "time/critic_s": t_update - t_critic,
+        "time/update_s": time.perf_counter() - t_update,
     }
 
 
@@ -279,6 +283,50 @@ def _preplay_phase(
     return out
 
 
+def build_agents(
+    cfg: PopulationConfig, device: torch.device, declare_cfg: DeclareTrainConfig
+) -> list[_Agent]:
+    """``cfg.agents`` fresh agents, built one after another from the current
+    torch seed: independent initialisations, reproducible as a set."""
+    model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
+    ppo_cfg = PPOConfig(**cfg.ppo) if cfg.ppo else PPOConfig()
+    full_hand = cfg.declare_phase_steps > 0
+    agents: list[_Agent] = []
+    for _ in range(cfg.agents):
+        net = ActorCritic(model_cfg).to(device)
+        agent = _Agent(net=net, learner=PPOLearner(net, ppo_cfg, device))
+        if full_hand:
+            agent.declare = DeclareLearner(
+                DeclareNet(DeclareConfig(**cfg.declare_model)).to(device), declare_cfg, device
+            )
+            if cfg.bury_policy:
+                agent.bury = BuryLearner(
+                    BuryNet(BuryNetConfig(**cfg.bury_model)).to(device), device=device
+                )
+        agents.append(agent)
+    return agents
+
+
+def load_agents(agents: list[_Agent], blob: dict) -> int:
+    """Restore a population checkpoint into ``agents``. -> its step."""
+    if "agents" not in blob:
+        raise ValueError("not a population checkpoint")
+    if len(blob["agents"]) != len(agents):
+        raise ValueError(f"the checkpoint holds {len(blob['agents'])} agents, not {len(agents)}")
+    for agent, saved in zip(agents, blob["agents"]):
+        load_model(agent.net, saved["model"])
+        agent.learner.opt.load_state_dict(saved["optimizer"])
+        if agent.declare is not None and saved.get("declare") is not None:
+            check_saved("declaration", saved["declare"], agent.declare.net.cfg)
+            agent.declare.net.load_state_dict(saved["declare"]["model"])
+            agent.declare.opt.load_state_dict(saved["declare"]["optimizer"])
+        if agent.bury is not None and saved.get("bury") is not None:
+            check_saved("burial", saved["bury"], agent.bury.net.cfg)
+            agent.bury.net.load_state_dict(saved["bury"]["model"])
+            agent.bury.opt.load_state_dict(saved["bury"]["optimizer"])
+    return int(blob["step"])
+
+
 def train_population(
     cfg: PopulationConfig,
     device: torch.device | str = "cpu",
@@ -308,7 +356,6 @@ def train_population(
     rng = np.random.default_rng(cfg.seed)
 
     model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
-    ppo_cfg = PPOConfig(**cfg.ppo) if cfg.ppo else PPOConfig()
     full_hand = cfg.declare_phase_steps > 0
     bury_cfg = BuryConfig(
         rounds=cfg.bury_rounds, consider=cfg.bury_consider,
@@ -320,42 +367,12 @@ def train_population(
         "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial=burial),
     })
 
-    # Built one after another from one seed: independent initialisations,
-    # reproducible as a set.
-    agents: list[_Agent] = []
-    for _ in range(cfg.agents):
-        net = ActorCritic(model_cfg).to(device)
-        agent = _Agent(net=net, learner=PPOLearner(net, ppo_cfg, device))
-        if full_hand:
-            agent.declare = DeclareLearner(
-                DeclareNet(DeclareConfig(**cfg.declare_model)).to(device), declare_cfg, device
-            )
-            if cfg.bury_policy:
-                agent.bury = BuryLearner(
-                    BuryNet(BuryNetConfig(**cfg.bury_model)).to(device), device=device
-                )
-        agents.append(agent)
-
+    agents = build_agents(cfg, device, declare_cfg)
     start = 0
     phases_done = 0
     if resume is not None and Path(resume).exists():
         blob = torch.load(Path(resume), map_location="cpu", weights_only=False)
-        if "agents" not in blob:
-            raise ValueError(f"{resume} is not a population checkpoint")
-        if len(blob["agents"]) != cfg.agents:
-            raise ValueError(f"{resume} holds {len(blob['agents'])} agents, not {cfg.agents}")
-        for agent, saved in zip(agents, blob["agents"]):
-            load_model(agent.net, saved["model"])
-            agent.learner.opt.load_state_dict(saved["optimizer"])
-            if agent.declare is not None and saved.get("declare") is not None:
-                check_saved("declaration", saved["declare"], agent.declare.net.cfg)
-                agent.declare.net.load_state_dict(saved["declare"]["model"])
-                agent.declare.opt.load_state_dict(saved["declare"]["optimizer"])
-            if agent.bury is not None and saved.get("bury") is not None:
-                check_saved("burial", saved["bury"], agent.bury.net.cfg)
-                agent.bury.net.load_state_dict(saved["bury"]["model"])
-                agent.bury.opt.load_state_dict(saved["bury"]["optimizer"])
-        start = int(blob["step"])
+        start = load_agents(agents, blob)
         phases_done = 0 if cfg.restart_schedule else int(blob.get("phases_done", 0))
         del blob
 
@@ -420,7 +437,7 @@ def train_population(
                     n_hands=cfg.hands_per_step, device=device,
                     temperature=cfg.temperature, level_weight=level_weight,
                     pool=cfg.pool, amp=amp, spans=spans, starts=starts,
-                    agents=seat_of,
+                    agents=seat_of, chunks=cfg.forward_chunks,
                 )
                 if rollout_pool is not None:
                     buffer, stats = rollout_pool.collect(nets, rng, buffer, **kwargs)

@@ -11,7 +11,10 @@ that predates saved configs rebuilds as ``v5``.
   same hidden widths, so each feed-forward holds half as many parameters
   again: actor 10.68M -> 13.27M;
 * the critic reads the deal as card tokens (``model.CardCritic``): width
-  256, 4 layers, 4 heads, feed-forward 1024; 0.48M -> 4.51M;
+  128, 4 layers, 2 heads, feed-forward 512; 0.48M -> 1.17M. Width 256
+  (4.51M) was the first choice; the user asked for less, and the width
+  bake-off found 128 as good (held-out explained variance 0.383 against
+  0.363 at 256, both far above the flat critic's 0.161);
 * declaration: a residual MLP, 3 blocks of width 512; 0.27M -> 5.0M;
 * burial: 4 layers of width 256, value head 512; 0.42M -> 3.6M.
 
@@ -36,10 +39,10 @@ ARCHES: dict[str, dict[str, dict[str, Any]]] = {
         "model": {
             "ffn": "swiglu",
             "critic_kind": "cards",
-            "critic_d": 256,
+            "critic_d": 128,
             "critic_layers": 4,
-            "critic_heads": 4,
-            "critic_d_ff": 1024,
+            "critic_heads": 2,
+            "critic_d_ff": 512,
         },
         "declare_model": {"width": 512, "depth": 3, "residual": True, "ffn": "swiglu"},
         "bury_model": {"d": 256, "layers": 4, "heads": 4, "value_width": 512, "ffn": "swiglu"},

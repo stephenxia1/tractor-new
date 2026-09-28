@@ -72,7 +72,7 @@ from .rollout import (
     check_agents,
     routed_step,
 )
-from .shared import SharedBuffer, compact_ranges, partition
+from .shared import SharedBuffer, copy_ranges, partition
 from .starts import pack_start, start_state
 
 __all__ = ["RolloutPool", "collect_parallel", "DEFAULT_WORKERS"]
@@ -267,6 +267,7 @@ class RolloutPool:
         episode_base: int = 0,
         starts: Any = None,
         agents: Any = None,
+        chunks: int = 1,
     ) -> tuple[RolloutBuffer, dict[str, float]]:
         """One round. -> ``(buffer, stats)``, same keys as ``collect``.
 
@@ -391,7 +392,8 @@ class RolloutPool:
                         owner = seating[buf.episode[rows] - episode_base,
                                         buf.seat[rows]]
                     slots, chosen_logp, values = routed_step(
-                        nets, owner, gather, temperature, greedy, rng, spans
+                        nets, owner, gather, temperature, greedy, rng, spans,
+                        lengths=buf.history_len[rows], chunks=chunks,
                     )
                     with _span(spans, "writeback"):
                         buf.action[rows] = slots
@@ -403,13 +405,15 @@ class RolloutPool:
                         for w in pending:
                             self._rep_qs[w].put(("go",))
 
-            with _span(spans, "compact"):
-                filled = [
-                    (self.ranges[w][0], self.ranges[w][0] + ends.get(w, 0))
-                    for w in range(workers)
-                ]
-                rows_written = compact_ranges(buf, filled)
-
+            # Each worker's rows go straight to their place in the
+            # caller's buffer: one pass over the round's bytes, where
+            # compacting the shared block and then copying it out was
+            # two, single-threaded -- 7.1 s of a 50 s round at 4096
+            # hands. The rows land in the order compaction gave them.
+            filled = sorted(
+                (self.ranges[w][0], ends.get(w, 0)) for w in range(workers)
+            )
+            rows_written = sum(count for _start, count in filled)
             out_buffer = buffer if buffer is not None else RolloutBuffer(
                 max(rows_written, 1), self.cfg
             )
@@ -418,14 +422,8 @@ class RolloutPool:
                     f"the caller's buffer holds {out_buffer.capacity} rows "
                     f"and the round wrote {rows_written}"
                 )
-            # A second full pass over the round's bytes. Avoidable in
-            # principle -- the learner could read the shared block --
-            # but only once nothing downstream outlives the pool.
             with _span(spans, "copy_out"):
-                for name in buf.fields:
-                    getattr(out_buffer, name)[:rows_written] = getattr(
-                        buf, name
-                    )[:rows_written]
+                copy_ranges(buf, out_buffer, filled)
                 out_buffer._n = rows_written
         finally:
             for n, was in zip(nets, was_training):
@@ -499,6 +497,7 @@ def collect_parallel(
     workers: int = DEFAULT_WORKERS,
     capacity: int | None = None,
     agents: Any = None,
+    chunks: int = 1,
 ) -> tuple[RolloutBuffer, dict[str, float]]:
     """One round through a throwaway pool.
 
@@ -516,5 +515,5 @@ def collect_parallel(
             net, rng, buffer, n_hands=int(n_hands), device=device,
             temperature=temperature, greedy=greedy,
             level_weight=level_weight, pool=pool, amp=amp, spans=spans,
-            agents=agents,
+            agents=agents, chunks=chunks,
         )

@@ -331,3 +331,31 @@ def test_a_table_left_empty_is_refused() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         with pytest.raises(ValueError, match="tables"):
             train_population(_cfg(tmp, hands_per_step=1))
+
+
+def test_a_split_forward_still_routes_every_row_to_its_seat() -> None:
+    """``chunks`` splits each agent's rows by history length; every row
+    must still be acted and valued by its own seat's network."""
+    nets = _nets()
+    hands = 6
+    seat_of = hand_agents(_table(2), hands)
+    buf = RolloutBuffer(hands * 100, SMALL)
+    collect(nets, np.random.default_rng(4), buf, n_hands=hands, device="cpu",
+            cfg=SMALL, pool=6, agents=seat_of, chunks=3)
+    _check_rows_belong_to_their_seats(nets, buf, seat_of)
+
+
+def test_copy_ranges_is_compaction_then_a_copy() -> None:
+    from ..train.shared import compact_ranges, copy_ranges
+
+    rng = np.random.default_rng(0)
+    src = RolloutBuffer(90, SMALL)
+    for name in src.fields:
+        arr = getattr(src, name)
+        arr[...] = rng.integers(0, 5, size=arr.shape).astype(arr.dtype)
+    filled = [(0, 17), (30, 0), (60, 29)]  # (start, count), one run empty
+    dst = RolloutBuffer(90, SMALL)
+    assert copy_ranges(src, dst, filled, threads=4) == 46
+    compact_ranges(src, [(s, s + c) for s, c in filled])
+    for name in src.fields:
+        assert np.array_equal(getattr(dst, name)[:46], getattr(src, name)[:46]), name

@@ -48,7 +48,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..nn.arch import ARCHES, bury_net_from, declare_net_from
+from ..nn.arch import bury_net_from, declare_net_from
 from ..nn.model import ActorCritic, CardCritic, Critic, ModelConfig, load_model
 from ..sim.state import NUM_SEATS
 from .buffer import RolloutBuffer
@@ -65,10 +65,18 @@ _TRICK = slice(5, 9)  # the trick-in-progress planes, one per relative seat
 
 
 def _arm_config(arm: str, actor_cfg: ModelConfig) -> ModelConfig:
-    """The critic config an arm builds, sized against the actor it reads."""
-    v6 = ARCHES["v6"]["model"]
-    wide = dict(critic_d=v6["critic_d"], critic_layers=v6["critic_layers"],
-                critic_heads=v6["critic_heads"], critic_d_ff=v6["critic_d_ff"])
+    """The critic config an arm builds, sized against the actor it reads.
+
+    ``cards-<d>`` is the card critic at width ``d``: v6's depth, a head
+    per 64 of width, feed-forward ``4 * d``.
+    """
+    if arm.startswith("cards-"):
+        d = int(arm.split("-", 1)[1])
+        return replace(actor_cfg, critic_kind="cards", ffn="swiglu", critic_d=d,
+                       critic_layers=4, critic_heads=max(1, d // 64), critic_d_ff=4 * d)
+    # The first card critic's size, 256 x 4, which ``cards`` and
+    # ``flat-wide`` were measured at; v6 has since come down to 128.
+    wide = dict(critic_d=256, critic_layers=4, critic_heads=4, critic_d_ff=1024)
     if arm == "flat":
         return replace(actor_cfg, critic_kind="flat", ffn="gelu")
     if arm == "flat-wide":

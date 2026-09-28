@@ -224,7 +224,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            length_buckets: int = 0, prefetch_starts: bool = False,
            bury_evaluator: str = "actor", bury_policy: bool = False,
            restart_schedule: bool = False, population: int = 0,
-           reshuffle_every: int = 10, pool: int = 0, arch: str = "v5") -> None:
+           reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
+           forward_chunks: int = 1) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -291,6 +292,10 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
         extra.update(agents=population, reshuffle_every=reshuffle_every)
     if pool:
         extra["pool"] = pool
+    # Forwards per network per lockstep round, split by history length.
+    # Measured at 4096 hands, v6, eight agents: 2 saves 1-3 s of a ~65 s
+    # round, 3 costs 13-15 s -- each forward carries a fixed overhead.
+    extra["forward_chunks"] = forward_chunks
     call = fn.spawn(
         steps,
         hands,
@@ -897,7 +902,7 @@ def pipeline(checkpoint: str = "", hands: int = 1024) -> None:
 @app.function(image=image, gpu="L40S", volumes={VOLUME: volume},
               timeout=4 * 3600, cpu=12.0, memory=65536)
 def critic_bakeoff_l40s(checkpoint: str, rounds: int, hands: int, epochs: int,
-                        seed: int, arms: list) -> dict:
+                        seed: int, arms: list, tag: str = "") -> dict:
     """``tractor.train.critic_bakeoff.run`` on one L40S; the result is also
     written to ``/vol/bakeoff/`` so a dropped client loses nothing."""
     import json
@@ -911,7 +916,7 @@ def critic_bakeoff_l40s(checkpoint: str, rounds: int, hands: int, epochs: int,
               hands=hands, epochs=epochs, seed=seed, arms=tuple(arms))
     out["checkpoint"] = checkpoint
     os.makedirs(f"{VOLUME}/bakeoff", exist_ok=True)
-    with open(f"{VOLUME}/bakeoff/critic-{seed}.json", "w") as fh:
+    with open(f"{VOLUME}/bakeoff/critic-{tag or seed}.json", "w") as fh:
         json.dump(out, fh)
     volume.commit()
     return out
@@ -921,19 +926,21 @@ def critic_bakeoff_l40s(checkpoint: str, rounds: int, hands: int, epochs: int,
 def critic_bakeoff(checkpoint: str = "/vol/v5-bury/checkpoints/final.pt",
                    rounds: int = 8, hands: int = 1024, epochs: int = 4,
                    seed: int = 20260928, arms: str = "v5,flat,flat-wide,cards",
-                   out: str = "") -> None:
+                   out: str = "", tag: str = "") -> None:
     """Does the v6 card critic generalise at least as well as v5's?
 
         modal run --detach modal_train.py::critic_bakeoff
 
     See ``tractor/train/critic_bakeoff.py``. The JSON lands in ``out``
-    (default ``runs/critic-bakeoff-<seed>.json``) and on the volume.
+    (default ``runs/critic-bakeoff-<tag or seed>.json``) and on the
+    volume. ``cards-<d>`` arms are the card critic at width ``d``.
     """
     import json
 
     res = critic_bakeoff_l40s.remote(checkpoint, rounds, hands, epochs, seed,
-                                     [a.strip() for a in arms.split(",") if a.strip()])
-    path = out or f"runs/critic-bakeoff-{seed}.json"
+                                     [a.strip() for a in arms.split(",") if a.strip()],
+                                     tag)
+    path = out or f"runs/critic-bakeoff-{tag or seed}.json"
     with open(path, "w") as fh:
         json.dump(res, fh)
     print(f"\n{res['hands_fit']} hands fitted, {res['hands_held']} held out "

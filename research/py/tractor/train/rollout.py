@@ -317,6 +317,8 @@ def routed_step(
     greedy: bool,
     rng: np.random.Generator,
     spans: Any = None,
+    lengths: np.ndarray | None = None,
+    chunks: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each row through its owner's network. -> ``(slots, logp, value)``.
 
@@ -324,6 +326,14 @@ def routed_step(
     ``(ObsBatch, privileged)`` for rows ``idx``. Owners are visited in
     index order and each samples from ``rng`` in turn, so with one owner
     this is exactly the unrouted forward: same batch, same draws.
+
+    ``chunks`` above 1 splits each owner's rows by history length
+    (``lengths[i]``) into that many forwards of equal count. The history
+    encoder and the card critic run only to a batch's longest history,
+    and a lockstep batch mixes the opening lead with the last trick --
+    measured at 4096 hands, a mean history of 43.5 against a longest of
+    ~95 -- so shorter rows stop paying for the longest one. The values
+    are the same up to float rounding; the draws are made per chunk.
     """
     n = len(owner)
     slots = np.empty(n, dtype=np.int64)
@@ -331,15 +341,21 @@ def routed_step(
     value = np.empty(n, dtype=np.float32)
     for agent in np.unique(owner):
         idx = np.nonzero(owner == agent)[0]
-        with _span(spans, "gather"):
-            obs, privileged = gather(idx)
-        with _span(spans, "forward"):
-            out, values = _evaluate(nets[int(agent)], obs, privileged)
-        with _span(spans, "sample"):
-            slots[idx], logp[idx] = _choose(
-                out.logits, obs.candidate_mask, temperature, greedy, rng
-            )
-            value[idx] = values.detach().float().cpu().numpy()
+        if chunks > 1 and lengths is not None and len(idx) >= 2 * chunks:
+            idx = idx[np.argsort(lengths[idx], kind="stable")]
+            parts = np.array_split(idx, chunks)
+        else:
+            parts = [idx]
+        for part in parts:
+            with _span(spans, "gather"):
+                obs, privileged = gather(part)
+            with _span(spans, "forward"):
+                out, values = _evaluate(nets[int(agent)], obs, privileged)
+            with _span(spans, "sample"):
+                slots[part], logp[part] = _choose(
+                    out.logits, obs.candidate_mask, temperature, greedy, rng
+                )
+                value[part] = values.detach().float().cpu().numpy()
     return slots, logp, value
 
 
@@ -443,6 +459,7 @@ def collect(
     amp: bool = False,
     starts: Any = None,
     agents: Any = None,
+    chunks: int = 1,
 ) -> dict[str, float]:
     """Play ``n_hands`` self-play hands into ``buffer``.
 
@@ -581,7 +598,8 @@ def collect(
                         [d.seat for d in packed],
                     ]
                 slots, chosen_logp, value_np = routed_step(
-                    nets, owner, gather, temperature, greedy, rng, spans
+                    nets, owner, gather, temperature, greedy, rng, spans,
+                    lengths=np.array([d.history_len for d in packed]), chunks=chunks,
                 )
 
                 with _span(spans, "step"):

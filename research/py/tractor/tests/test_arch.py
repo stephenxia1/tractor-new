@@ -108,7 +108,7 @@ def test_v6_sizes() -> None:
     net = ActorCritic(ModelConfig(**ARCHES["v6"]["model"]))
     assert isinstance(net.critic, CardCritic)
     assert n(net.actor) == 13_269_454
-    assert n(net.critic) == 4_508_929
+    assert n(net.critic) == 1_173_121
     assert n(DeclareNet(DeclareConfig(**ARCHES["v6"]["declare_model"]))) == 5_005_324
     assert n(BuryNet(BuryNetConfig(**ARCHES["v6"]["bury_model"]))) == 3_621_634
 

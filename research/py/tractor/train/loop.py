@@ -93,6 +93,9 @@ class TrainConfig:
     # it is arithmetic and not per-call overhead, and no batch size
     # will remove it.
     pool: int = 512
+    # Forwards per network per lockstep round, rows split by history
+    # length (``rollout.routed_step``). 1 is one forward, as before.
+    forward_chunks: int = 1
 
     # Reward anneal, described in the module docstring. Both zero:
     # the reward is trick points and the terminal level term is off.
@@ -533,6 +536,7 @@ def train(
                         amp=learner.amp,
                         spans=spans,
                         starts=starts,
+                        chunks=cfg.forward_chunks,
                     )
                 else:
                     stats = collect(
@@ -548,6 +552,7 @@ def train(
                         amp=learner.amp,
                         spans=spans,
                         starts=starts,
+                        chunks=cfg.forward_chunks,
                     )
 
             with spans.span("gae"):
