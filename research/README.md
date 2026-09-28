@@ -474,6 +474,76 @@ against smart / v18 / v28, paired +0.056 over no search and +0.02 over
 the shallow search (±0.022), at about 7× the cost — five hours a bot
 at 770 deals. The v34 pair hit the 8-hour container limit.
 
+### Where v5-bury ended (step 4150)
+
+The burial is a policy now, `nn/bury_net.py`: the landlord picks eight
+cards one at a time from the 33 it holds, scored by a set encoder over
+the 54 card types with every type not held masked out. Every pick shares one
+return, the privileged critic's value at the play start the burial
+produced, from the landlord's seat, ×10 (`train/bury_loop.py`). It
+trains in the pre-play phase on the declaration's hands with play
+frozen, sampling in training and taking the argmax in evaluation. It
+costs about 0.1 s per 1024 hands, where the critic climb cost about 7 s.
+
+`v5-bury` resumed v4-full final and ran five blocks of 100 pre-play
+steps and 200 play steps, with a fifth of play starts still buried at
+random. The burial return, averaged over each pre-play phase:
+
+| phase | from step | burial return | entropy | kitty points buried |
+| --- | --- | --- | --- | --- |
+| 0 | 3150 | +0.625 | 1.99 | 2.2 |
+| 1 | 3350 | +0.917 | 1.41 | 2.8 |
+| 2 | 3550 | +0.970 | 1.27 | 1.9 |
+| 3 | 3750 | +0.921 | 1.22 | 2.1 |
+| 4 | 3950 | +0.925 | 1.18 | 2.0 |
+
+×40 turns the return into points of expected margin, so the landlord's
+expected margin rose from +25 to +37 and was flat from the third phase.
+That is the critic grading the policy trained to please it, so it
+cannot show the burial is better. The benchmarks below can.
+
+Same protocol, 770 deals a bot, seed 20260923. Averaged over smart-v18 /
+v28 / v34 (±0.014 on the win rate):
+
+| configuration | win | levels | points | win as landlord | win attacking | vs smart |
+| --- | --- | --- | --- | --- | --- | --- |
+| declares, **learned burial** (as trained) | **0.566** | **+0.17** | **+7.1** | **0.523** | 0.608 | 0.719 |
+| declares, heuristic burial | 0.561 | +0.15 | +6.3 | 0.513 | 0.608 | 0.713 |
+| declares, critic-scored climb (v4's method) | 0.552 | +0.16 | +6.5 | 0.495 | 0.608 | 0.725 |
+| play only (`--pre-play random`) | 0.580 | +0.23 | +9.2 | 0.322 | 0.838 | 0.632 |
+
+Paired on the same deals, pooled over the three search bots:
+
+| comparison | win change | points change |
+| --- | --- | --- |
+| v5: learned burial − heuristic burial | +0.005 ± 0.011 | +0.80 ± 0.57 |
+| v5: learned burial − critic climb | **+0.014 ± 0.010** | +0.60 ± 0.53 |
+| v5 critic climb − v4 critic climb | +0.027 ± 0.014 | +2.85 ± 0.98 |
+| v5 heuristic burial − v4 heuristic burial | +0.008 ± 0.014 | +1.56 ± 0.90 |
+| play only: v5 final − v4 final | +0.006 ± 0.012 | +0.51 ± 1.02 |
+| v5 learned burial − v4 critic climb + search | −0.000 ± 0.015 | +0.39 ± 0.94 |
+
+- **Value-guided burial has now caught the heuristic.** The learned
+  policy matches the heuristic and edges it (0.523 against 0.513 as
+  landlord, not paired: the result files do not record each hand's
+  side), and it beats the climb it replaced. Its points gain over the
+  heuristic, +0.8 a deal, is at the edge of its interval.
+- **It buries points.** The policy puts 2.1 points in the kitty on
+  average against the heuristic's 0.04 (the bots bury 9.6), and still
+  concedes fewer (76.1 a deal against 77.8, versus smart-v18). It
+  trades a few kitty points for the shape of the hand it keeps.
+- **Play did not move.** Play only, v5 is +0.006 over v4 final, inside
+  the noise: the policy is still on the plateau v4 reached at step 2400.
+  Most of the v5 − v4 gain under the critic climb is then likely the
+  critic scoring burials better: under the heuristic burial, where only
+  declaration and play changed, v5 gained +0.008.
+- **The learned burial without search equals v4 with search.** Search
+  on top of v5 is not measured yet; it added about +0.04 every time it
+  was measured before.
+- The network declares in 60% of hands, as v4 did. In training, a third
+  of its declarations are no-trump, against about a fifth under the
+  bots' declarations.
+
 ---
 
 ## Next steps

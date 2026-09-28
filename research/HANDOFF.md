@@ -7,89 +7,37 @@ and `README.md` § *Measurements on the PPO track*.
 
 ---
 
-## 0. What is in flight, and the first thing to do
+## 0. Nothing is in flight (updated 2026-09-28)
 
-**Training run `v5-bury`** — Modal app `tractor-train`, id
-`ap-fiXapAUx62STVFCwuAImWx`, detached, one L40S. At 15:41 it was at step
-3966 of 4150 at ~18 s a step, so `final.pt` lands around **16:40 EDT**.
-The last pre-play phase (the 5th of 5) has already run.
+**`v5-bury` is finished and benchmarked.** `final.pt` landed at 16:46
+EDT on 09-24, and all four benchmarks (16 pairs) were stored on the
+volume by 20:06. No cloud session committed anything, so the results
+were taken straight from `/vol/evals/` on 09-28. They are in
+`evals/2026-09-24/v5-final-{policy,heur,critic,random}.jsonl` and
+written up in README § *Where v5-bury ended*.
 
-```
-/vol/v5-bury/checkpoints/step_00NNNNN.pt   every 50 steps
-/vol/v5-bury/checkpoints/final.pt          at 4150
-/vol/v5-bury/metrics.jsonl
-```
+**The learned burial earned its place.** Against smart-v18/v28/v34,
+averaged: learned burial 0.566 (0.523 as landlord), heuristic 0.561
+(0.513), critic climb 0.552 (0.495). Paired, learned − heuristic is
++0.005 ± 0.011 and learned − critic climb is +0.014 ± 0.010. By §6's
+criterion burial is done for now. Play only did not move (+0.006 ±
+0.012 over v4 final).
 
-**Benchmarks of `v5-bury/final.pt`.** The Windows session left a
-background script waiting for `final.pt`; when it appears it launches
-four `modal_eval.py::smart` runs, each as its own app, in two waves:
-
-| app name | `--pre-play` | what it measures |
-| --- | --- | --- |
-| `tractor-eval-v5-policy` | `agent-policy` | the full hand with the learned burial policy — **the question** |
-| `tractor-eval-v5-heur` | `agent-heur` | same declarations, heuristic burial — the bar to beat |
-| `tractor-eval-v5-critic` | `agent-critic` | same declarations, critic-scored climb (v4's method) |
-| `tractor-eval-v5-random` | `random` | play only, for pairing against v4 final and v3 step 2000 |
-
-770 deals per bot, bots `smart,smart-v18,smart-v28,smart-v34`, seed
-20260923 (the default). A pair took 10–25 min for v4 final, so both
-waves should be done within about an hour of `final.pt`.
-
-**The user closed the Windows session before the benchmarks could
-finish**, and that script died with it. Depending on when the session
-closed, none, some, or all of the four apps launched. The second wave
-starts only after the first finishes, so the likely states are "nothing
-launched" or "the first wave launched and the second never did". Any
-app that did launch is detached, so it keeps running and stores its
-results on the volume. **Check before launching anything**:
+To rerun or extend a benchmark, `modal_eval.py::smart` with the same
+arguments first fetches every result already on the volume, then
+measures only what is missing:
 
 ```bash
-modal app list | grep tractor-eval-v5
-# State column: "ephemeral" = still running (detached runs show this way),
-# "stopped" = finished or dead. No row = never launched.
-```
-
-- For any app still **ephemeral**, wait until it stops before running
-  its command. Otherwise a pair not yet stored on the volume would be
-  launched a second time.
-- For every app that is **stopped or missing**, run its command below.
-  Each command first pulls every result already stored in
-  `/vol/evals/` (keyed on checkpoint path, bot, deals, seed, pre-play,
-  search), then measures only what is missing. So the same command
-  collects a finished run, fills the pairs a dead run lost, or starts a
-  run that never launched. Run all four in the end, so that every
-  result lands in `runs/` here.
-
-```bash
-# from research/. Separate app names so they don't stop each other.
+# from research/. A unique app name per launch; see §7.
 CK=/vol/v5-bury/checkpoints/final.pt
 TRACTOR_EVAL_APP=tractor-eval-v5-policy modal run --detach modal_eval.py::smart --checkpoints $CK --pre-play agent-policy --out runs/v5-final-policy.jsonl
-TRACTOR_EVAL_APP=tractor-eval-v5-heur   modal run --detach modal_eval.py::smart --checkpoints $CK --pre-play agent-heur   --out runs/v5-final-heur.jsonl
-# after those two finish: each agent-* launch holds 4 A10Gs (one per bot), and three at once would ask for 12 of the workspace's 10
-TRACTOR_EVAL_APP=tractor-eval-v5-critic modal run --detach modal_eval.py::smart --checkpoints $CK --pre-play agent-critic --out runs/v5-final-critic.jsonl
-TRACTOR_EVAL_APP=tractor-eval-v5-random modal run --detach modal_eval.py::smart --checkpoints $CK --pre-play random       --out runs/v5-final-random.jsonl
+python scripts/tab_evals.py evals/2026-09-24/v5-final-*.jsonl
+python scripts/tab_evals.py evals/2026-09-24/v5-final-heur.jsonl evals/2026-09-24/v5-final-policy.jsonl --paired
 ```
 
-Then tabulate (`scripts/tab_evals.py`, reproduces the README tables):
-
-```bash
-python scripts/tab_evals.py runs/v5-final-*.jsonl                         # one line per bot + the v18/v28/v34 mean
-python scripts/tab_evals.py runs/v5-final-heur.jsonl runs/v5-final-policy.jsonl --paired   # policy − heuristic, same deals
-python scripts/tab_evals.py evals/2026-09-24/v4-final-random.jsonl runs/v5-final-random.jsonl --paired   # did play move?
-```
-
-Copy the four files to `evals/2026-09-24/v5-final-*.jsonl` (`runs/` is
-gitignored), add a README section *Where v5-bury ended* in the style of
-§ *Where v4-full ended*, and update §1 below.
-
-**How to read it.** v4 final's numbers against the three fair search
-bots (smart-v18/v28/v34, averaged) were 0.525 win with the critic climb
-it trained with, **0.553 with the heuristic burial**, 0.566 critic climb
-+ search. The burial policy has earned its place if `agent-policy`
-matches or beats `agent-heur` on v5. Pay most attention to the *win as
-landlord* column (`win LL`): burial only matters in the hands the
-network is landlord, and that is where the value climb lost (0.454
-against 0.510).
+`modal app list` forgets stopped apps after a few days. To find out
+whether something ran, list the volume (`modal volume ls tractor-rl
+evals`) rather than the apps.
 
 ---
 
@@ -106,7 +54,11 @@ trained. Against the fair smart bots, on 770 duplicate deals (±0.025):
 | v4-full final, play only | 0.574 | 0.619 | **+0.075 ± 0.013 paired over v3** |
 | v4-full final, full hand (critic burial, as trained) | 0.525 | 0.706 | |
 | v4-full final, full hand, heuristic burial | 0.553 | 0.718 | |
-| v4-full final, full hand, critic burial + search | **0.566** | **0.729** | the best measured |
+| v4-full final, full hand, critic burial + search | 0.566 | 0.729 | |
+| v5-bury final, play only | 0.580 | 0.632 | +0.006 ± 0.012 paired over v4 final |
+| v5-bury final, full hand, learned burial (as trained) | **0.566** | 0.719 | **the best measured without search** |
+| v5-bury final, full hand, heuristic burial | 0.561 | 0.713 | |
+| v5-bury final, full hand, critic burial | 0.552 | 0.725 | |
 | v3 step 2000 against `random` | 0.746 (+0.85 levels, +34 pts) | | 0.762 with search |
 
 "Play only" (`--pre-play random`) draws the declaration and burial
@@ -116,7 +68,8 @@ The two are different games, so their win rates are not comparable to
 each other.
 
 The play policy **plateaued again** at v4 step 2400: the last 750 steps
-of v4 added nothing measurable (+0.005 ± 0.02).
+of v4 added nothing measurable (+0.005 ± 0.02), and neither did v5's
+thousand (+0.006 ± 0.012). v5 moved the burial, not the play.
 
 **Branch `rl-research`** is pushed at the handoff commit. Before that the
 branch was 10 commits ahead of `origin/rl-research`. The user's standing
@@ -295,16 +248,20 @@ nothing.
 
 ## 6. Next steps, in order
 
-1. **Benchmark `v5-bury/final.pt`** (§0) and record it. If
-   `agent-policy` beats `agent-heur` as landlord, burial is done for now.
-   If it loses, the likely cause is the policy exploiting critic error,
-   the failure the climb had. The options are:
+1. ~~**Benchmark `v5-bury/final.pt`**~~ Done 2026-09-28 (§0): the learned
+   burial matches the heuristic and beats the climb, so burial is done
+   for now. If burial is revisited, its gain over the heuristic (+0.005
+   ± 0.011) is not yet significant. The options, if a later run shows
+   it exploiting critic error, remain:
    - return = the hand's actual outcome, or a mix of outcome and critic;
    - a KL penalty toward the heuristic;
    - more random burials.
 
    The critic reward was the user's explicit choice, so **propose the
    change; don't switch it silently**.
+
+   Cheap and not yet measured: v5 final with the learned burial and
+   search (`--pre-play agent-policy --search-worlds 8`, ~30 min a bot).
 2. **Population of 8** (plan task 7, not started). The user's spec:
    - K = 8 randomly initialised agents;
    - one agent per seat, so partners can be different agents;
