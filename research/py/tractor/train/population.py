@@ -45,8 +45,9 @@ import numpy as np
 import torch
 
 from ..gen.episode import deal_sizes
-from ..nn.bury_net import BuryNet
-from ..nn.declare import DeclareNet
+from ..nn.arch import check_saved
+from ..nn.bury_net import BuryNet, BuryNetConfig
+from ..nn.declare import DeclareConfig, DeclareNet
 from ..nn.features import Cache
 from ..nn.model import ActorCritic, ModelConfig, load_model
 from ..sim.bury import BuryConfig
@@ -123,11 +124,13 @@ def _state(agent: _Agent, phases_done: int) -> dict:
             "model": agent.declare.net.state_dict(),
             "optimizer": agent.declare.opt.state_dict(),
             "phases_done": phases_done,
+            "config": asdict(agent.declare.net.cfg),
         }
     if agent.bury is not None:
         out["bury"] = {
             "model": agent.bury.net.state_dict(),
             "optimizer": agent.bury.opt.state_dict(),
+            "config": asdict(agent.bury.net.cfg),
         }
     return out
 
@@ -324,9 +327,13 @@ def train_population(
         net = ActorCritic(model_cfg).to(device)
         agent = _Agent(net=net, learner=PPOLearner(net, ppo_cfg, device))
         if full_hand:
-            agent.declare = DeclareLearner(DeclareNet().to(device), declare_cfg, device)
+            agent.declare = DeclareLearner(
+                DeclareNet(DeclareConfig(**cfg.declare_model)).to(device), declare_cfg, device
+            )
             if cfg.bury_policy:
-                agent.bury = BuryLearner(BuryNet().to(device), device=device)
+                agent.bury = BuryLearner(
+                    BuryNet(BuryNetConfig(**cfg.bury_model)).to(device), device=device
+                )
         agents.append(agent)
 
     start = 0
@@ -341,9 +348,11 @@ def train_population(
             load_model(agent.net, saved["model"])
             agent.learner.opt.load_state_dict(saved["optimizer"])
             if agent.declare is not None and saved.get("declare") is not None:
+                check_saved("declaration", saved["declare"], agent.declare.net.cfg)
                 agent.declare.net.load_state_dict(saved["declare"]["model"])
                 agent.declare.opt.load_state_dict(saved["declare"]["optimizer"])
             if agent.bury is not None and saved.get("bury") is not None:
+                check_saved("burial", saved["bury"], agent.bury.net.cfg)
                 agent.bury.net.load_state_dict(saved["bury"]["model"])
                 agent.bury.opt.load_state_dict(saved["bury"]["optimizer"])
         start = int(blob["step"])

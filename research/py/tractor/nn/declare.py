@@ -18,15 +18,30 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..sim.deal import DECLARE_OBS_DIM, DECLARE_PRIV_DIM, NUM_ACTIONS
-from .model import MASK_LOGIT
+from .model import MASK_LOGIT, ResidualMLP
 
 __all__ = ["DeclareConfig", "DeclareNet"]
 
 
 @dataclass(frozen=True)
 class DeclareConfig:
+    """The defaults are the network every run through v5 trained.
+
+    ``residual`` swaps each plain MLP for ``model.ResidualMLP``: ``depth``
+    pre-norm blocks of hidden width ``width`` in ``ffn`` form ("gelu" or
+    "swiglu"). The plain MLP is GELU only.
+    """
+
     width: int = 256
     depth: int = 2
+    residual: bool = False
+    ffn: str = "gelu"
+
+    def __post_init__(self) -> None:
+        if self.ffn not in ("gelu", "swiglu"):
+            raise ValueError(f"ffn must be 'gelu' or 'swiglu', not {self.ffn!r}")
+        if not self.residual and self.ffn != "gelu":
+            raise ValueError("the plain MLP is GELU only; set residual=True for SwiGLU")
 
 
 def _mlp(d_in: int, width: int, depth: int, d_out: int) -> nn.Sequential:
@@ -43,12 +58,20 @@ class DeclareNet(nn.Module):
     def __init__(self, cfg: DeclareConfig | None = None) -> None:
         super().__init__()
         self.cfg = cfg = cfg or DeclareConfig()
-        self.actor = _mlp(DECLARE_OBS_DIM, cfg.width, cfg.depth, NUM_ACTIONS)
-        self.critic = _mlp(DECLARE_OBS_DIM + DECLARE_PRIV_DIM, cfg.width, cfg.depth, 1)
+        if cfg.residual:
+            self.actor = ResidualMLP(DECLARE_OBS_DIM, cfg.width, cfg.depth, NUM_ACTIONS, cfg.ffn)
+            self.critic = ResidualMLP(
+                DECLARE_OBS_DIM + DECLARE_PRIV_DIM, cfg.width, cfg.depth, 1, cfg.ffn
+            )
+            last = self.actor.out
+        else:
+            self.actor = _mlp(DECLARE_OBS_DIM, cfg.width, cfg.depth, NUM_ACTIONS)
+            self.critic = _mlp(DECLARE_OBS_DIM + DECLARE_PRIV_DIM, cfg.width, cfg.depth, 1)
+            last = self.actor[-1]
         # A near-uniform start over the legal actions, so early training
         # explores rather than committing to whatever init favoured.
-        nn.init.zeros_(self.actor[-1].weight)
-        nn.init.zeros_(self.actor[-1].bias)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
     def logits(self, obs: Tensor, mask: Tensor) -> Tensor:
         raw = self.actor(obs)

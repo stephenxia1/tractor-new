@@ -224,7 +224,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            length_buckets: int = 0, prefetch_starts: bool = False,
            bury_evaluator: str = "actor", bury_policy: bool = False,
            restart_schedule: bool = False, population: int = 0,
-           reshuffle_every: int = 10, pool: int = 0) -> None:
+           reshuffle_every: int = 10, pool: int = 0, arch: str = "v5") -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -232,6 +232,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     In-loop evaluation is off for a population; its checkpoints are
     measured per agent with modal_eval.py, as `final.pt#k`. `--pool`
     overrides the hands in flight (0 keeps the config's default).
+
+    `--arch` names the network set (`tractor/nn/arch.py`): `v5`, what
+    every run through v5-bury trained, or `v6`, SwiGLU with the card
+    critic and the widened declaration and burial networks. A resume
+    must name the architecture its checkpoint was trained with.
 
     The defaults for `hands`, `epochs` and `rollout_workers` come from
     measurement rather than taste. All three were taken by holding a
@@ -269,15 +274,21 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     Modal and exits, so nothing local can end it. Watch it with
     `modal app logs`, or on the run's Weights and Biases page.
     """
+    import sys
+
+    # This entrypoint runs locally, where research/py is not on the path.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "py"))
+    from tractor.nn.arch import ARCHES
+
     fn = {"a10g": train_a10g, "a100": train_a100,
           "l40s": train_l40s}[gpu.lower()]
-    extra = {}
+    extra = dict(ARCHES[arch])
     if population:
         if eval_every:
             print("population: in-loop evaluation is off; measure checkpoints "
                   "with modal_eval.py as final.pt#k")
         eval_every = 0
-        extra = {"agents": population, "reshuffle_every": reshuffle_every}
+        extra.update(agents=population, reshuffle_every=reshuffle_every)
     if pool:
         extra["pool"] = pool
     call = fn.spawn(
@@ -878,3 +889,67 @@ def pipeline(checkpoint: str = "", hands: int = 1024) -> None:
               f"declare {r['time/declare_s']:5.1f}s  bury {r['time/bury_s']:5.1f}s  "
               f"critic {r['critic_s']:4.1f}s  climb +{gain:.1f} pts  "
               f"rounds used {r['bury/rounds']:.0f}")
+
+
+# --- critic architecture bake-off -------------------------------------------
+
+
+@app.function(image=image, gpu="L40S", volumes={VOLUME: volume},
+              timeout=4 * 3600, cpu=12.0, memory=65536)
+def critic_bakeoff_l40s(checkpoint: str, rounds: int, hands: int, epochs: int,
+                        seed: int, arms: list) -> dict:
+    """``tractor.train.critic_bakeoff.run`` on one L40S; the result is also
+    written to ``/vol/bakeoff/`` so a dropped client loses nothing."""
+    import json
+
+    import torch
+
+    from tractor.train.critic_bakeoff import run
+    from tractor.train.population import read_checkpoint
+
+    out = run(read_checkpoint(checkpoint), torch.device("cuda"), rounds=rounds,
+              hands=hands, epochs=epochs, seed=seed, arms=tuple(arms))
+    out["checkpoint"] = checkpoint
+    os.makedirs(f"{VOLUME}/bakeoff", exist_ok=True)
+    with open(f"{VOLUME}/bakeoff/critic-{seed}.json", "w") as fh:
+        json.dump(out, fh)
+    volume.commit()
+    return out
+
+
+@app.local_entrypoint()
+def critic_bakeoff(checkpoint: str = "/vol/v5-bury/checkpoints/final.pt",
+                   rounds: int = 8, hands: int = 1024, epochs: int = 4,
+                   seed: int = 20260928, arms: str = "v5,flat,flat-wide,cards",
+                   out: str = "") -> None:
+    """Does the v6 card critic generalise at least as well as v5's?
+
+        modal run --detach modal_train.py::critic_bakeoff
+
+    See ``tractor/train/critic_bakeoff.py``. The JSON lands in ``out``
+    (default ``runs/critic-bakeoff-<seed>.json``) and on the volume.
+    """
+    import json
+
+    res = critic_bakeoff_l40s.remote(checkpoint, rounds, hands, epochs, seed,
+                                     [a.strip() for a in arms.split(",") if a.strip()])
+    path = out or f"runs/critic-bakeoff-{seed}.json"
+    with open(path, "w") as fh:
+        json.dump(res, fh)
+    print(f"\n{res['hands_fit']} hands fitted, {res['hands_held']} held out "
+          f"({res['rows_fit']:,} / {res['rows_held']:,} rows)")
+    print(f"{'arm':10} {'params':>10} {'pass':>4} {'fit':>7} {'held':>7} "
+          f"{'95% CI':>17} {'start':>7} {'95% CI':>17} {'s/pass':>7}")
+    for arm, got in res["arms"].items():
+        for p in got["passes"]:
+            print(f"{arm:10} {got['params']:>10,} {p['epoch']:>4} {p['ev_fit']:+7.3f} "
+                  f"{p['ev_held']:+7.3f} [{p['ev_held_lo']:+.3f},{p['ev_held_hi']:+.3f}] "
+                  f"{p['ev_start']:+7.3f} [{p['ev_start_lo']:+.3f},{p['ev_start_hi']:+.3f}] "
+                  f"{p['seconds']:7.1f}")
+    print("\npaired against the fresh flat critic, same held-out hands:")
+    for arm, rows in res["paired"].items():
+        for r in rows:
+            h, s = r["held"], r["start"]
+            print(f"  {arm:10} pass {r['epoch']}: held {h[0]:+.3f} [{h[1]:+.3f},{h[2]:+.3f}]"
+                  f"  start {s[0]:+.3f} [{s[1]:+.3f},{s[2]:+.3f}]")
+    print(f"\nraw: {path}")

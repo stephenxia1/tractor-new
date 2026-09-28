@@ -29,7 +29,7 @@ from torch import Tensor, nn
 
 from ..rules.cards import NUM_TYPES
 from .features import D_STATIC
-from .model import MASK_LOGIT
+from .model import MASK_LOGIT, _GLU, _MaskedBlock, _init_module, _scale_residual_outputs
 
 __all__ = [
     "BURY_CARD_DIM",
@@ -52,10 +52,24 @@ BURY_PRIV_DIM = 3 * NUM_TYPES
 
 @dataclass(frozen=True)
 class BuryNetConfig:
+    """The defaults are the network every run through v5 trained.
+
+    ``ffn`` "gelu" is the original: ``nn.TransformerEncoder``, whose
+    feed-forward is torch's default ReLU, and a GELU value head. "swiglu"
+    builds the encoder from the play network's own pre-norm blocks with
+    SwiGLU feed-forwards, hidden width ``2 * d`` as in the original, and
+    gates the value head's layers too.
+    """
+
     d: int = 128
     layers: int = 2
     heads: int = 4
     value_width: int = 256
+    ffn: str = "gelu"
+
+    def __post_init__(self) -> None:
+        if self.ffn not in ("gelu", "swiglu"):
+            raise ValueError(f"ffn must be 'gelu' or 'swiglu', not {self.ffn!r}")
 
 
 class BuryNet(nn.Module):
@@ -65,20 +79,38 @@ class BuryNet(nn.Module):
         self.card_in = nn.Linear(BURY_CARD_DIM, cfg.d)
         self.ctx_in = nn.Linear(BURY_CTX_DIM, cfg.d)
         self.card_embed = nn.Parameter(torch.zeros(NUM_TYPES, cfg.d))
-        layer = nn.TransformerEncoderLayer(
-            cfg.d, cfg.heads, dim_feedforward=2 * cfg.d, dropout=0.0,
-            batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, cfg.layers, enable_nested_tensor=False)
+        self.swiglu = cfg.ffn == "swiglu"
+        if self.swiglu:
+            self.blocks = nn.ModuleList(
+                _MaskedBlock(cfg.d, cfg.heads, 2 * cfg.d, "swiglu")
+                for _ in range(cfg.layers)
+            )
+            self.blocks.apply(_init_module)
+            _scale_residual_outputs(self.blocks)
+        else:
+            layer = nn.TransformerEncoderLayer(
+                cfg.d, cfg.heads, dim_feedforward=2 * cfg.d, dropout=0.0,
+                batch_first=True, norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                layer, cfg.layers, enable_nested_tensor=False
+            )
         self.norm = nn.LayerNorm(cfg.d)
         self.score = nn.Linear(cfg.d, 1)
-        self.value_head = nn.Sequential(
-            nn.Linear(cfg.d + BURY_PRIV_DIM, cfg.value_width),
-            nn.GELU(),
-            nn.Linear(cfg.value_width, cfg.value_width),
-            nn.GELU(),
-            nn.Linear(cfg.value_width, 1),
-        )
+        if self.swiglu:
+            self.value_head = nn.Sequential(
+                _GLU(cfg.d + BURY_PRIV_DIM, cfg.value_width),
+                _GLU(cfg.value_width, cfg.value_width),
+                nn.Linear(cfg.value_width, 1),
+            )
+        else:
+            self.value_head = nn.Sequential(
+                nn.Linear(cfg.d + BURY_PRIV_DIM, cfg.value_width),
+                nn.GELU(),
+                nn.Linear(cfg.value_width, cfg.value_width),
+                nn.GELU(),
+                nn.Linear(cfg.value_width, 1),
+            )
         nn.init.normal_(self.card_embed, std=0.02)
         # A uniform first policy over the held cards, so early training
         # explores rather than committing to whatever init favoured.
@@ -87,6 +119,11 @@ class BuryNet(nn.Module):
 
     def encode(self, cards: Tensor, ctx: Tensor) -> Tensor:
         x = self.card_in(cards) + self.card_embed + self.ctx_in(ctx).unsqueeze(1)
+        if self.swiglu:
+            # Every card type is a key, held or not, as in the original.
+            for block in self.blocks:
+                x = block(x, None)
+            return self.norm(x)  # [B, 54, d]
         return self.norm(self.encoder(x))  # [B, 54, d]
 
     def forward(

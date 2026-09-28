@@ -65,7 +65,6 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
 
     from tractor.eval.bots import play_against_bot
     from tractor.eval.search import SearchConfig
-    from tractor.nn.declare import DeclareNet
     from tractor.sim.bury import BuryConfig
 
     # Each host shard scores its own decisions on its own thread; intra-op
@@ -86,22 +85,19 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
     declare_net = None
     bury_net = None
     if pre_play in ("agent", "agent-heur", "agent-critic", "agent-policy"):
+        from tractor.nn.arch import bury_net_from, declare_net_from
         from tractor.train.population import read_checkpoint
 
         # `pop/final.pt#k`: agent k of a population, in the usual layout.
+        # Each network is rebuilt from the config saved beside it (v5's
+        # when the checkpoint predates saved configs).
         blob = read_checkpoint(checkpoint)
         if blob.get("declare") is not None:
-            declare_net = DeclareNet()
-            declare_net.load_state_dict(blob["declare"]["model"])
-            declare_net = declare_net.to(device).eval()
+            declare_net = declare_net_from(blob["declare"]).to(device).eval()
         if pre_play == "agent-policy":
-            from tractor.nn.bury_net import BuryNet
-
             if blob.get("bury") is None:
                 raise ValueError(f"{checkpoint} carries no burial policy")
-            bury_net = BuryNet()
-            bury_net.load_state_dict(blob["bury"]["model"])
-            bury_net = bury_net.to(device).eval()
+            bury_net = bury_net_from(blob["bury"]).to(device).eval()
     started = time.perf_counter()
     stats = play_against_bot(net, bot, device=device, cfg=cfg,
                              num_deals=deals, seed=seed, workers=workers,

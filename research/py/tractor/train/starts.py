@@ -31,7 +31,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..nn.features import Cache, context_vector
+from ..nn.features import D_STATIC, Cache, context_vector
 from ..nn.model import privileged_view
 from ..rules.cards import Ctx
 from ..sim.bury import (
@@ -399,13 +399,19 @@ def critic_values(
     """
     ctx_rows: list[np.ndarray] = []
     priv_rows: list[np.ndarray] = []
+    # Per start, not per row: every seat of a hand shares its trump context.
+    # Read only by ``CardCritic``; the flat critic never asks for them.
+    cache = Cache()
+    static = []
     for st in starts:
         state = st.state(num_decks)
+        static.append(cache.static_card_features(state.ctx, num_decks))
         for seat in range(NUM_SEATS):
             ctx_rows.append(context_vector(state, seat).astype(np.float16).astype(np.float32))
             priv_rows.append(privileged_view(state.hands, state.kitty, seat))
     context = np.stack(ctx_rows) if ctx_rows else np.zeros((0, 1), np.float32)
     priv = np.stack(priv_rows) if priv_rows else np.zeros((0, 5, 54), np.float32)
+    static_all = np.stack(static) if static else np.zeros((0, 54, D_STATIC), np.float32)
     out = np.empty(len(ctx_rows), dtype=np.float32)
     # Rows are hand-major, seat-minor, as ``agents`` flattens.
     owner = (
@@ -425,6 +431,7 @@ def critic_values(
                     enc, length,
                     torch.from_numpy(priv[r]).to(device),
                     context=torch.from_numpy(context[r]).to(device),
+                    cards=torch.from_numpy(static_all[r // NUM_SEATS]).to(device),
                 )
                 out[r] = v.float().cpu().numpy()
     return out.reshape(len(starts), NUM_SEATS)

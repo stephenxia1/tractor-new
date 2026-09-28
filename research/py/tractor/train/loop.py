@@ -45,8 +45,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..nn.bury_net import BuryNet
-from ..nn.declare import DeclareNet
+from ..nn.arch import check_saved
+from ..nn.bury_net import BuryNet, BuryNetConfig
+from ..nn.declare import DeclareConfig, DeclareNet
 from ..nn.features import Cache
 from ..nn.model import ActorCritic, ModelConfig, load_model
 from ..sim.bury import BuryConfig
@@ -197,6 +198,11 @@ class TrainConfig:
     prefetch_starts: bool = False
 
     model: dict = field(default_factory=dict)
+    # The declaration and burial networks' configs (``DeclareConfig``,
+    # ``BuryNetConfig``); empty is the v5 network. ``nn/arch.py`` names
+    # the sets that go together.
+    declare_model: dict = field(default_factory=dict)
+    bury_model: dict = field(default_factory=dict)
     ppo: dict = field(default_factory=dict)
 
 
@@ -394,9 +400,10 @@ def train(
             else {}
         )
         if cfg.bury_policy:
-            bury_net = BuryNet().to(device)
+            bury_net = BuryNet(BuryNetConfig(**cfg.bury_model)).to(device)
             bury_learner = BuryLearner(bury_net, device=device)
             if blob.get("bury") is not None:
+                check_saved("burial", blob["bury"], bury_net.cfg)
                 bury_net.load_state_dict(blob["bury"]["model"])
                 bury_learner.opt.load_state_dict(blob["bury"]["optimizer"])
             bury_net.eval()
@@ -404,12 +411,13 @@ def train(
             **cfg.declare,
             "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial=burial),
         })
-        declare_net = DeclareNet().to(device)
+        declare_net = DeclareNet(DeclareConfig(**cfg.declare_model)).to(device)
         declare_learner = DeclareLearner(
             declare_net, declare_cfg, device, bury=bury_learner
         )
         saved = blob.get("declare")
         if saved is not None:
+            check_saved("declaration", saved, declare_net.cfg)
             declare_net.load_state_dict(saved["model"])
             declare_learner.opt.load_state_dict(saved["optimizer"])
             phases_done = 0 if cfg.restart_schedule else int(saved["phases_done"])
@@ -426,11 +434,13 @@ def train(
             "model": declare_net.state_dict(),
             "optimizer": declare_learner.opt.state_dict(),
             "phases_done": phases_done,
+            "config": asdict(declare_net.cfg),
         }}
         if bury_net is not None:
             out["bury"] = {
                 "model": bury_net.state_dict(),
                 "optimizer": bury_learner.opt.state_dict(),
+                "config": asdict(bury_net.cfg),
             }
         return out
 

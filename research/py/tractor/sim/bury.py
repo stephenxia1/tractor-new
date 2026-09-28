@@ -334,6 +334,7 @@ class _DeviceBases:
                     torch.zeros(rows, dtype=torch.int64, device=dev),
                     priv.reshape(rows, 5, NUM_TYPES),
                     context=self.context[own].repeat_interleave(worlds, dim=0),
+                    cards=self.cards[own].repeat_interleave(worlds, dim=0),
                 )
                 out[lo:hi] = v.float().reshape(b, worlds).mean(1).cpu().numpy()
         return out

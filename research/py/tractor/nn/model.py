@@ -62,6 +62,7 @@ from ..rules.cards import NUM_TYPES, TRUMP
 from .features import (
     CONTEXT_DIM,
     D_CARD,
+    D_STATIC,
     HISTORY_DIM,
     MAX_HISTORY,
     NUM_PLANES,
@@ -126,6 +127,7 @@ MASK_LOGIT = -1e9
 # be audited rather than believed. They are small next to the matmuls.
 FLOPS_PER_SOFTMAX_ELEM = 5  # max, subtract, exp, accumulate, divide
 FLOPS_PER_GELU = 8  # erf approximation, conservatively
+FLOPS_PER_SILU = 4  # exp, add, divide, multiply
 FLOPS_PER_LAYERNORM_ELEM = 7  # mean, two for variance, rsqrt, sub, mul, add
 
 
@@ -158,6 +160,20 @@ class ModelConfig:
     scalar_d: int = 64
     head_d: int = 192
 
+    # Both default to what every run through v5 trained, so a checkpoint's
+    # saved config that predates them builds the network it was saved from.
+    #
+    # ``ffn``: "gelu" is Linear -> GELU -> Linear everywhere. "swiglu"
+    # replaces every such pair, in the transformer blocks and in the small
+    # heads alike, with down(SiLU(gate(x)) * up(x)) at the same hidden
+    # width, so each holds half as many parameters again.
+    ffn: str = "gelu"
+    # ``critic_kind``: "flat" is ``Critic`` -- a transformer over the
+    # history plus an MLP over the raw privileged counts, which is all it
+    # reads at play start. "cards" is ``CardCritic`` -- one transformer
+    # over a context token, a token per card type and the history.
+    critic_kind: str = "flat"
+
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads:
             raise ValueError("d_model must divide by n_heads")
@@ -165,6 +181,14 @@ class ModelConfig:
             raise ValueError("critic_d must divide by critic_heads")
         if self.max_history < 1 or self.max_candidates < 1:
             raise ValueError("padded extents must be positive")
+        if self.ffn not in ("gelu", "swiglu"):
+            raise ValueError(f"ffn must be 'gelu' or 'swiglu', not {self.ffn!r}")
+        if self.critic_kind not in ("flat", "cards"):
+            raise ValueError(f"critic_kind must be 'flat' or 'cards', not {self.critic_kind!r}")
+        if self.critic_kind == "flat" and self.ffn != "gelu":
+            # The flat critic's privileged MLP adds the context into its
+            # first layer by index; it is the legacy design and stays GELU.
+            raise ValueError("the flat critic is GELU only; SwiGLU runs use critic_kind='cards'")
 
     @property
     def head_dim(self) -> int:
@@ -353,25 +377,93 @@ class _CrossAttention(nn.Module):
 
 
 class _FeedForward(nn.Module):
-    def __init__(self, d: int, d_ff: int) -> None:
+    """``fc2(GELU(fc1(x)))``, or with ``ffn="swiglu"``
+    ``fc2(SiLU(gate(x)) * fc1(x))`` at the same hidden width.
+
+    The GELU form keeps the parameter names every checkpoint through v5
+    was saved under; SwiGLU adds ``gate`` beside them.
+    """
+
+    def __init__(self, d: int, d_ff: int, ffn: str = "gelu") -> None:
         super().__init__()
+        self.swiglu = ffn == "swiglu"
+        if self.swiglu:
+            self.gate = nn.Linear(d, d_ff)
         self.fc1 = nn.Linear(d, d_ff)
-        self.act = nn.GELU()
+        if not self.swiglu:
+            self.act = nn.GELU()
         self.fc2 = nn.Linear(d_ff, d)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.swiglu:
+            return self.fc2(F.silu(self.gate(x)) * self.fc1(x))
         return self.fc2(self.act(self.fc1(x)))
+
+
+class _GatedMLP(nn.Module):
+    """``down(SiLU(gate(x)) * up(x))``: the SwiGLU form of a small head."""
+
+    def __init__(self, d_in: int, hidden: int, d_out: int) -> None:
+        super().__init__()
+        self.gate = nn.Linear(d_in, hidden)
+        self.up = nn.Linear(d_in, hidden)
+        self.down = nn.Linear(hidden, d_out)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class _GLU(nn.Module):
+    """``SiLU(gate(x)) * up(x)``: a SwiGLU hidden layer, for stacking."""
+
+    def __init__(self, d_in: int, d_out: int) -> None:
+        super().__init__()
+        self.gate = nn.Linear(d_in, d_out)
+        self.up = nn.Linear(d_in, d_out)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.silu(self.gate(x)) * self.up(x)
+
+
+class ResidualMLP(nn.Module):
+    """``in -> depth x (x + FF(LayerNorm(x))) -> LayerNorm -> out``.
+
+    The pre-play networks' trunk when they are widened: each block is the
+    transformer's feed-forward, hidden width ``width``, in ``ffn`` form.
+    """
+
+    def __init__(self, d_in: int, width: int, depth: int, d_out: int, ffn: str) -> None:
+        super().__init__()
+        self.inp = nn.Linear(d_in, width)
+        self.norms = nn.ModuleList(nn.LayerNorm(width) for _ in range(depth))
+        self.ffs = nn.ModuleList(_FeedForward(width, width, ffn) for _ in range(depth))
+        self.norm = nn.LayerNorm(width)
+        self.out = nn.Linear(width, d_out)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.inp(x)
+        for norm, ff in zip(self.norms, self.ffs):
+            x = x + ff(norm(x))
+        return self.out(self.norm(x))
+
+
+def _head(d_in: int, hidden: int, d_out: int, ffn: str) -> nn.Module:
+    """A one-hidden-layer MLP. The GELU form is the ``Sequential`` every
+    checkpoint through v5 holds, so its parameter names are unchanged."""
+    if ffn == "swiglu":
+        return _GatedMLP(d_in, hidden, d_out)
+    return nn.Sequential(nn.Linear(d_in, hidden), nn.GELU(), nn.Linear(hidden, d_out))
 
 
 class _CausalBlock(nn.Module):
     """Pre-LayerNorm block with causal self-attention."""
 
-    def __init__(self, d: int, n_heads: int, d_ff: int) -> None:
+    def __init__(self, d: int, n_heads: int, d_ff: int, ffn: str = "gelu") -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d)
         self.attn = _SelfAttention(d, n_heads)
         self.norm2 = nn.LayerNorm(d)
-        self.ff = _FeedForward(d, d_ff)
+        self.ff = _FeedForward(d, d_ff, ffn)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.norm1(x), is_causal=True)
@@ -387,12 +479,12 @@ class _CausalBlock(nn.Module):
 class _MaskedBlock(nn.Module):
     """Pre-LayerNorm block with key-masked, non-causal self-attention."""
 
-    def __init__(self, d: int, n_heads: int, d_ff: int) -> None:
+    def __init__(self, d: int, n_heads: int, d_ff: int, ffn: str = "gelu") -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d)
         self.attn = _SelfAttention(d, n_heads)
         self.norm2 = nn.LayerNorm(d)
-        self.ff = _FeedForward(d, d_ff)
+        self.ff = _FeedForward(d, d_ff, ffn)
 
     def forward(self, x: Tensor, key_mask: Tensor) -> Tensor:
         x = x + self.attn(self.norm1(x), attn_mask=key_mask)
@@ -402,14 +494,14 @@ class _MaskedBlock(nn.Module):
 class _QueryBlock(nn.Module):
     """Self-attention over the decision tokens, then cross to history."""
 
-    def __init__(self, d: int, n_heads: int, d_ff: int) -> None:
+    def __init__(self, d: int, n_heads: int, d_ff: int, ffn: str = "gelu") -> None:
         super().__init__()
         self.norm_sa = nn.LayerNorm(d)
         self.sa = _SelfAttention(d, n_heads)
         self.norm_ca = nn.LayerNorm(d)
         self.ca = _CrossAttention(d, n_heads)
         self.norm_ff = nn.LayerNorm(d)
-        self.ff = _FeedForward(d, d_ff)
+        self.ff = _FeedForward(d, d_ff, ffn)
 
     def forward(
         self, x: Tensor, token_mask: Tensor, mem: Tensor, mem_mask: Tensor
@@ -502,7 +594,7 @@ class HistoryEncoder(nn.Module):
         self.in_proj = nn.Linear(HISTORY_DIM, cfg.d_model)
         self.pos = nn.Parameter(torch.zeros(cfg.max_history, cfg.d_model))
         self.blocks = nn.ModuleList(
-            _CausalBlock(cfg.d_model, cfg.n_heads, cfg.d_ff)
+            _CausalBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.ffn)
             for _ in range(cfg.n_layers_history)
         )
         self.norm = nn.LayerNorm(cfg.d_model)
@@ -698,7 +790,8 @@ class QueryEncoder(nn.Module):
         self.mem_sink = nn.Parameter(torch.zeros(1, d))
         self.mem_norm = nn.LayerNorm(d)
         self.blocks = nn.ModuleList(
-            _QueryBlock(d, cfg.n_heads, cfg.d_ff) for _ in range(cfg.n_layers_query)
+            _QueryBlock(d, cfg.n_heads, cfg.d_ff, cfg.ffn)
+            for _ in range(cfg.n_layers_query)
         )
         self.out_norm = nn.LayerNorm(d)
 
@@ -816,11 +909,7 @@ class CandidateScorer(nn.Module):
         # No bias: this is a basis for a multiset sum, and a bias would
         # scale with the number of cards, which scalar 0 already says.
         self.card_proj = nn.Linear(D_CARD, d, bias=False)
-        self.scalar_mlp = nn.Sequential(
-            nn.Linear(NUM_CAND_SCALARS, cfg.scalar_d),
-            nn.GELU(),
-            nn.Linear(cfg.scalar_d, d),
-        )
+        self.scalar_mlp = _head(NUM_CAND_SCALARS, cfg.scalar_d, d, cfg.ffn)
         self.norm = nn.LayerNorm(d)
         self.score_q = nn.Linear(d, d)
         self.cand_bias = nn.Linear(d, 1)
@@ -915,18 +1004,26 @@ class AuxHeads(nn.Module):
         super().__init__()
         self.cfg = cfg
         d, hd = cfg.d_model, cfg.head_d
-        self.value = nn.Sequential(nn.Linear(d, hd), nn.GELU(), nn.Linear(hd, 1))
-        self.outcome = nn.Sequential(
-            nn.Linear(d, hd), nn.GELU(), nn.Linear(hd, NUM_OUTCOMES)
-        )
+        self.value = _head(d, hd, 1, cfg.ffn)
+        self.outcome = _head(d, hd, NUM_OUTCOMES, cfg.ffn)
         self.belief_h = nn.Linear(d, cfg.belief_d)  # W_a, carries the bias
         self.belief_c = nn.Linear(D_CARD, cfg.belief_d, bias=False)  # W_b
-        self.belief_act = nn.GELU()
+        # SwiGLU gates the hidden layer with a second pair of the same
+        # factored form: SiLU(G_a h + G_b c) * (W_a h + W_b c).
+        self.swiglu = cfg.ffn == "swiglu"
+        if self.swiglu:
+            self.belief_gate_h = nn.Linear(d, cfg.belief_d)
+            self.belief_gate_c = nn.Linear(D_CARD, cfg.belief_d, bias=False)
+        else:
+            self.belief_act = nn.GELU()
         self.belief_out = nn.Linear(cfg.belief_d, NUM_BELIEF_LOCATIONS)
         self.apply(_init_module)
 
     def belief_card_term(self, cards: Tensor) -> Tensor:
-        """``W_b @ card_features`` -> [B, 54, belief_d]. Cacheable."""
+        """``W_b @ card_features`` -> [B, 54, belief_d] (and, under
+        SwiGLU, ``G_b @ card_features`` concatenated after it). Cacheable."""
+        if self.swiglu:
+            return torch.cat((self.belief_c(cards), self.belief_gate_c(cards)), dim=-1)
         return self.belief_c(cards)
 
     def forward(
@@ -937,7 +1034,13 @@ class AuxHeads(nn.Module):
 
         if card_term is None:
             card_term = self.belief_card_term(cards)
-        z = self.belief_act(self.belief_h(summary).unsqueeze(1) + card_term)
+        if self.swiglu:
+            up_c, gate_c = card_term.chunk(2, dim=-1)
+            z = F.silu(self.belief_gate_h(summary).unsqueeze(1) + gate_c) * (
+                self.belief_h(summary).unsqueeze(1) + up_c
+            )
+        else:
+            z = self.belief_act(self.belief_h(summary).unsqueeze(1) + card_term)
         belief_logits = self.belief_out(z)  # [B, 54, 5]
         belief_log_probs = F.log_softmax(belief_logits.float(), dim=-1)
         return value, outcome_logits, belief_logits, belief_log_probs
@@ -1054,9 +1157,12 @@ class Critic(nn.Module):
         privileged: Tensor,
         detach: bool = True,
         context: Tensor | None = None,
+        cards: Tensor | None = None,
+        trick: Tensor | None = None,
     ) -> Tensor:
         """-> [B]. ``privileged`` is float[B, 5, 54] of raw counts;
-        ``context`` the observation's float[B, CONTEXT_DIM] vector."""
+        ``context`` the observation's float[B, CONTEXT_DIM] vector.
+        ``cards`` and ``trick`` are ``CardCritic``'s and ignored here."""
         if detach:
             history_enc = history_enc.detach()
 
@@ -1098,6 +1204,113 @@ class Critic(nn.Module):
         return self.head(torch.cat((pooled, priv), dim=-1)).squeeze(-1)
 
 
+# Card-token inputs to ``CardCritic``: the static card block, then the
+# card's count in each privileged location (four hands, relative, and the
+# kitty) and in each seat's play to the trick in progress.
+CARD_CRITIC_IN = D_STATIC + NUM_PRIVILEGED_ROWS + NUM_REL_SEATS
+# Two decks: a card type has at most two copies anywhere.
+_COPIES = 2.0
+
+
+class CardCritic(nn.Module):
+    """Privileged value head that reads the deal as cards in a trump context.
+
+    ``Critic`` sees the four hands and the kitty as a flat 270-vector of
+    counts through an MLP, with the trump context added into its first
+    layer, and at play start -- no history -- that MLP is all there is.
+    Play-start values are the reward for every declaration and burial, so
+    that is the estimate the pre-play agents climb.
+
+    Here one non-causal transformer reads a single sequence:
+
+    * a CLS token, read out as the value;
+    * a context token (the observation's context vector);
+    * 54 card-type tokens: the card's static features in this trump
+      context -- effective suit, strength, points, level and joker flags,
+      the same block the actor reads -- and its count in each of the four
+      hands, the kitty, and each seat's play to the current trick, plus a
+      learned per-type embedding;
+    * the actor's encoded history, projected, up to the batch's longest.
+
+    The weights that read a card are shared across the 54 types, which is
+    the structure a flat MLP has to learn 54 times over and the one a
+    trump suit changes: the same count vector means a different hand in a
+    different context, and here the context is in every card token.
+
+    ``detach`` behaves as in ``Critic``.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        cd = cfg.critic_d
+        self.card_in = nn.Linear(CARD_CRITIC_IN, cd)
+        self.card_embed = nn.Parameter(torch.zeros(NUM_TYPES, cd))
+        self.ctx_in = nn.Linear(CONTEXT_DIM, cd)
+        self.hist_in = nn.Linear(cfg.d_model, cd)
+        self.pos = nn.Parameter(torch.zeros(cfg.max_history, cd))
+        self.cls = nn.Parameter(torch.zeros(1, cd))
+        self.blocks = nn.ModuleList(
+            _MaskedBlock(cd, cfg.critic_heads, cfg.critic_d_ff, cfg.ffn)
+            for _ in range(cfg.critic_layers)
+        )
+        self.norm = nn.LayerNorm(cd)
+        self.head = _head(cd, cd, 1, cfg.ffn)
+        self.apply(_init_module)
+        for p in (self.card_embed, self.pos, self.cls):
+            nn.init.normal_(p, std=0.02)
+        _scale_residual_outputs(self.blocks)
+
+    def forward(
+        self,
+        history_enc: Tensor,
+        history_len: Tensor,
+        privileged: Tensor,
+        detach: bool = True,
+        context: Tensor | None = None,
+        cards: Tensor | None = None,
+        trick: Tensor | None = None,
+    ) -> Tensor:
+        """-> [B]. ``privileged`` float[B, 5, 54] raw counts; ``context``
+        float[B, CONTEXT_DIM]; ``cards`` float[B, 54, >= D_STATIC] whose
+        first ``D_STATIC`` columns are the static block; ``trick``
+        float[B, 4, 54] raw counts, or ``None`` for no trick in progress."""
+        if context is None or cards is None:
+            raise ValueError("CardCritic needs the context and the card features")
+        if detach:
+            history_enc = history_enc.detach()
+        b = privileged.shape[0]
+        cd = self.cfg.critic_d
+
+        counts = privileged.transpose(1, 2) / _COPIES  # [B, 54, 5]
+        if trick is None:
+            played = counts.new_zeros(b, NUM_TYPES, NUM_REL_SEATS)
+        else:
+            played = trick.transpose(1, 2) / _COPIES  # [B, 54, 4]
+        feats = torch.cat((cards[..., :D_STATIC], counts, played), dim=-1)
+        card_tok = self.card_in(feats) + self.card_embed
+        ctx_tok = self.ctx_in(context).unsqueeze(1)
+        cls = self.cls.unsqueeze(0).expand(b, 1, cd)
+
+        parts = [cls, ctx_tok, card_tok]
+        keep = [torch.ones(b, 2 + NUM_TYPES, dtype=torch.bool, device=card_tok.device)]
+        # Only to the longest real history in the batch: past it every
+        # key is masked, so the rest would be arithmetic on padding.
+        longest = int(history_len.max()) if b else 0
+        if longest > 0:
+            hist_keep = _length_mask(history_len, longest)
+            h = self.hist_in(history_enc[:, :longest]) + self.pos[:longest]
+            parts.append(h * hist_keep.unsqueeze(-1).to(h.dtype))
+            keep.append(hist_keep)
+        x = torch.cat(parts, dim=1)
+        seq_keep = torch.cat(keep, dim=1)
+        gate = seq_keep.unsqueeze(-1).to(x.dtype)
+        attn = seq_keep[:, None, None, :]
+        for block in self.blocks:
+            x = block(x, attn) * gate
+        return self.head(self.norm(x[:, 0])).squeeze(-1)
+
+
 class ActorCritic(nn.Module):
     """Convenience container. The two towers stay addressable apart."""
 
@@ -1105,7 +1318,9 @@ class ActorCritic(nn.Module):
         super().__init__()
         self.cfg = cfg or ModelConfig()
         self.actor = TractorNet(self.cfg)
-        self.critic = Critic(self.cfg)
+        self.critic = (
+            CardCritic(self.cfg) if self.cfg.critic_kind == "cards" else Critic(self.cfg)
+        )
 
     def forward(
         self, obs: ObsBatch, privileged: Tensor, detach_critic: bool = True
@@ -1117,6 +1332,8 @@ class ActorCritic(nn.Module):
             privileged,
             detach=detach_critic,
             context=obs.context,
+            cards=obs.cards,
+            trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_REL_SEATS],
         )
         return out, value
 
@@ -1379,6 +1596,11 @@ def analytic_flops(
 
     ``matmul_only=True`` drops biases, LayerNorm, GELU and softmax,
     leaving only what a matmul-level counter sees.
+
+    ``cfg.ffn`` and ``cfg.critic_kind`` are honoured: a SwiGLU
+    feed-forward is two input projections, a SiLU and a product where
+    GELU had one projection and a GELU, and ``CardCritic`` is counted over
+    its ``2 + 54 + history_len`` tokens.
     """
     d = cfg.d_model
     ff = cfg.d_ff
@@ -1404,6 +1626,16 @@ def analytic_flops(
     def gelu(count: int) -> int:
         return elem(count, FLOPS_PER_GELU)
 
+    swiglu = cfg.ffn == "swiglu"
+
+    def hidden(rows: int, d_in: int, width: int, bias: bool = True) -> int:
+        """The hidden layer of a feed-forward or head, activation included."""
+        if swiglu:
+            # gate and up projections, SiLU on the gate, their product
+            return (2 * lin(rows, d_in, width, bias) + elem(rows * width, FLOPS_PER_SILU)
+                    + elem(rows * width))
+        return lin(rows, d_in, width, bias) + gelu(rows * width)
+
     def attn(lq: int, lk: int, width: int, nh: int, causal: bool = False) -> int:
         pairs = lq * (lq + 1) // 2 if (causal and causal_discount) else lq * lk
         # Q@K^T and A@V are each 2 FLOPs per (pair, head, head-dim).
@@ -1421,8 +1653,7 @@ def analytic_flops(
         f += lin(rows, width, width)
         f += elem(rows * width)  # residual add
         f += norm(rows, width)
-        f += lin(rows, width, width_ff)
-        f += gelu(rows * width_ff)
+        f += hidden(rows, width, width_ff)
         f += lin(rows, width_ff, width)
         f += elem(rows * width)  # residual add
         return f
@@ -1464,8 +1695,7 @@ def analytic_flops(
         query += elem(tok * d)
         # feed-forward
         query += norm(tok, d)
-        query += lin(tok, d, ff)
-        query += gelu(tok * ff)
+        query += hidden(tok, d, ff)
         query += lin(tok, ff, d)
         query += elem(tok * d)
         query += elem(tok * d)  # * held gate
@@ -1478,8 +1708,7 @@ def analytic_flops(
     scorer += 2 * NUM_TYPES * D_CARD * NUM_CARD_SCALARS  # cards @ scalar basis
     scorer += 2 * n * NUM_TYPES * NUM_CARD_SCALARS  # counts @ per-card scalars
     scorer += elem(n * 12)  # sums, clamps and comparisons for 6 scalars
-    scorer += lin(n, NUM_CAND_SCALARS, cfg.scalar_d)
-    scorer += gelu(n * cfg.scalar_d)
+    scorer += hidden(n, NUM_CAND_SCALARS, cfg.scalar_d)
     scorer += lin(n, cfg.scalar_d, d)
     scorer += elem(n * d)  # embedding + scalar term
     scorer += norm(n, d)
@@ -1495,12 +1724,16 @@ def analytic_flops(
     # -- auxiliary heads ---------------------------------------------------
     hd = cfg.head_d
     bd = cfg.belief_d
-    aux = lin(1, d, hd) + gelu(hd) + lin(1, hd, 1)  # value
-    aux += lin(1, d, hd) + gelu(hd) + lin(1, hd, NUM_OUTCOMES)  # outcome
-    aux += lin(1, d, bd)  # W_a @ h, once
-    aux += lin(NUM_TYPES, D_CARD, bd, bias=False)  # W_b @ cards, once
-    aux += elem(NUM_TYPES * bd)  # broadcast add
-    aux += gelu(NUM_TYPES * bd)
+    aux = hidden(1, d, hd) + lin(1, hd, 1)  # value
+    aux += hidden(1, d, hd) + lin(1, hd, NUM_OUTCOMES)  # outcome
+    pairs = 2 if swiglu else 1  # SwiGLU factors a gate pair beside W
+    aux += pairs * lin(1, d, bd)  # W_a @ h, once
+    aux += pairs * lin(NUM_TYPES, D_CARD, bd, bias=False)  # W_b @ cards, once
+    aux += pairs * elem(NUM_TYPES * bd)  # broadcast add
+    if swiglu:
+        aux += elem(NUM_TYPES * bd, FLOPS_PER_SILU) + elem(NUM_TYPES * bd)
+    else:
+        aux += gelu(NUM_TYPES * bd)
     aux += lin(NUM_TYPES, bd, NUM_BELIEF_LOCATIONS)
     aux += elem(NUM_TYPES * NUM_BELIEF_LOCATIONS, FLOPS_PER_SOFTMAX_ELEM)
     aux *= batch
@@ -1509,24 +1742,27 @@ def analytic_flops(
     cd = cfg.critic_d
     cff = cfg.critic_d_ff
     ch = cfg.critic_heads
-    lc = lh + 1  # + the CLS token
-    crit = lin(lh, d, cd)
-    crit += elem(lh * cd)  # + positional
-    crit += elem(lh * cd)  # * keep gate
-    for _ in range(cfg.critic_layers):
-        crit += sa_ffn_block(lc, cd, ch, cff, causal=False, keys=lc)
-        crit += elem(lc * cd)  # * keep gate
-    crit += norm(1, cd)  # pooled CLS
-    crit += lin(1, NUM_PRIVILEGED_ROWS * NUM_TYPES, 2 * cd)
-    crit += lin(1, CONTEXT_DIM, 2 * cd)  # context_proj
-    crit += elem(2 * cd)  # added into the first layer
-    crit += gelu(2 * cd)
-    crit += lin(1, 2 * cd, cd)
-    crit += gelu(cd)
-    crit += lin(1, 2 * cd, cd)
-    crit += gelu(cd)
-    crit += lin(1, cd, 1)
-    crit *= batch
+    if cfg.critic_kind == "cards":
+        crit = _card_critic_flops(cfg, lh, lin, elem, norm, hidden, sa_ffn_block) * batch
+    else:
+        lc = lh + 1  # + the CLS token
+        crit = lin(lh, d, cd)
+        crit += elem(lh * cd)  # + positional
+        crit += elem(lh * cd)  # * keep gate
+        for _ in range(cfg.critic_layers):
+            crit += sa_ffn_block(lc, cd, ch, cff, causal=False, keys=lc)
+            crit += elem(lc * cd)  # * keep gate
+        crit += norm(1, cd)  # pooled CLS
+        crit += lin(1, NUM_PRIVILEGED_ROWS * NUM_TYPES, 2 * cd)
+        crit += lin(1, CONTEXT_DIM, 2 * cd)  # context_proj
+        crit += elem(2 * cd)  # added into the first layer
+        crit += gelu(2 * cd)
+        crit += lin(1, 2 * cd, cd)
+        crit += gelu(cd)
+        crit += lin(1, 2 * cd, cd)
+        crit += gelu(cd)
+        crit += lin(1, cd, 1)
+        crit *= batch
 
     actor = hist + query + scorer + aux
     return {
@@ -1538,6 +1774,26 @@ def analytic_flops(
         "critic": crit,
         "total": actor + crit,
     }
+
+
+def _card_critic_flops(cfg, lh, lin, elem, norm, hidden, sa_ffn_block) -> int:
+    """One row of ``CardCritic``, with ``analytic_flops``'s helpers."""
+    cd = cfg.critic_d
+    seq = 2 + NUM_TYPES + lh  # CLS, context, card types, history
+    f = elem(NUM_TYPES * (NUM_PRIVILEGED_ROWS + NUM_REL_SEATS))  # counts / copies
+    f += lin(NUM_TYPES, CARD_CRITIC_IN, cd)  # card tokens
+    f += elem(NUM_TYPES * cd)  # + card-type embedding
+    f += lin(1, CONTEXT_DIM, cd)  # context token
+    if lh > 0:
+        f += lin(lh, cfg.d_model, cd)  # history tokens
+        f += elem(lh * cd)  # + positional
+        f += elem(lh * cd)  # * keep gate
+    for _ in range(cfg.critic_layers):
+        f += sa_ffn_block(seq, cd, cfg.critic_heads, cfg.critic_d_ff, causal=False, keys=seq)
+        f += elem(seq * cd)  # * keep gate
+    f += norm(1, cd)  # the CLS token
+    f += hidden(1, cd, cd) + lin(1, cd, 1)  # head
+    return f
 
 
 def count_parameters(module: nn.Module, trainable_only: bool = True) -> int:
@@ -1553,6 +1809,7 @@ __all__ = [
     "ActorOutput",
     "AuxHeads",
     "CandidateScorer",
+    "CardCritic",
     "Critic",
     "HistoryEncoder",
     "MASK_LOGIT",
