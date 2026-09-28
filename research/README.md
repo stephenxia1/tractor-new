@@ -693,6 +693,48 @@ network takes a few hundred minibatches to move where the flat MLP moves
 in one step -- and had nearly caught up by step 4; the bake-off has it
 ahead after about 1,700 minibatches, some ten population steps.
 
+**The critic's width, and where a v6 step goes** (2026-09-28). The user
+asked for a narrower critic. The same bake-off data, paired, at three
+widths (`evals/2026-09-28/critic-bakeoff-widths.json`):
+
+| card critic | params | held out, pass 1 / 4 | at play start, pass 4 | s/pass |
+| --- | --- | --- | --- | --- |
+| 128 × 4, ff 512 | 1.17M | 0.270 / **0.383** | **0.379** | 25.2 |
+| 192 × 4, ff 768 | 2.57M | 0.350 / 0.368 | 0.364 | 31.5 |
+| 256 × 4, ff 1024 | 4.51M | 0.338 / 0.363 | 0.368 | 40.2 |
+
+Width 128 is level with 256 from the second pass on and slower only in
+the first; v6's critic is now 128.
+
+`modal run modal_perf.py::pop_profile` breaks a population step apart
+(`evals/2026-09-28/pop-profile-v6-128.json`). What it and two v6 smoke
+runs showed:
+
+- **Two full copies of the round are gone.** The rollout compacted the
+  shared block and then copied it out: two single-threaded passes over
+  ~10 GB, 3.3–4.8 s a step in training. `shared.copy_ranges` puts each
+  worker's rows straight into the learner's buffer on threads: 0.3 s.
+- **10 rollout workers beat 7** on the 12-core container: the parent's
+  wait on them fell from ~24 s to ~18 s (`--rollout-workers 10`).
+- **Splitting a forward by history length does not pay.** Each forward
+  carries a fixed ~3 ms; two splits added ~12 s of forward a step in
+  training (22.6 → 34.8 s), three were worse still in the profile.
+  `forward_chunks` stays at 1.
+- **The update is dispatch-bound.** Shrinking the critic 3.8× moved it
+  from 75.7 s to 73.8 s. A 256-row minibatch is ~50 ms of forward,
+  backward and optimiser for well under 10 ms of arithmetic on an L40S.
+  The levers are fewer, larger kernels -- a larger minibatch (a change to
+  the optimisation, the user's call), CUDA graphs or `torch.compile`
+  over fixed padded shapes, or one stacked update for all eight agents.
+- **The rollout's parent and workers take turns** (~23 s forward, ~18 s
+  waiting); overlapping them -- two half-pools per worker -- is worth up
+  to ~18 s a step.
+- **Host CPUs differ between containers** enough to swamp these savings
+  when two runs are compared; compare inside one container.
+
+A v6 step at 4096 hands from random weights is ~125–135 s; the pre-play
+step is ~26 s, two thirds of it the burial network's PPO update.
+
 ---
 
 ## Next steps

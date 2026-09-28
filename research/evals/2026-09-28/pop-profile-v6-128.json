@@ -1,0 +1,124 @@
+{
+  "arch": "v6",
+  "hands": 4096,
+  "collect": {
+    "workers 7, chunks 1": {
+      "seconds": 70.813572884,
+      "gather": 20.331851568251874,
+      "forward": 21.546612125396784,
+      "sample": 1.4072920623868668,
+      "writeback": 0.032921568055637174,
+      "release": 0.22629743902385238,
+      "copy_out": 0.5771030883789062,
+      "waiting_on_workers": 26.691495032506083,
+      "lockstep_rounds": 240,
+      "mean_batch": 1512.6333333333334,
+      "rows": 363032,
+      "mean_history": 44.10530201194385
+    },
+    "workers 7, chunks 2": {
+      "seconds": 68.01005032500001,
+      "gather": 4.486174941480183,
+      "forward": 35.15541348838818,
+      "sample": 1.7480052451044326,
+      "writeback": 0.007460511986166234,
+      "release": 0.17817772798240186,
+      "copy_out": 0.24213580322265624,
+      "waiting_on_workers": 26.192682606835987,
+      "lockstep_rounds": 244,
+      "mean_batch": 1490.27868852459,
+      "rows": 363628,
+      "mean_history": 44.19312594189666
+    },
+    "workers 7, chunks 3": {
+      "seconds": 83.92218692399999,
+      "gather": 5.029968159139174,
+      "forward": 50.388081799507255,
+      "sample": 2.0664735715091207,
+      "writeback": 0.007245343996211885,
+      "release": 0.184203392341733,
+      "copy_out": 0.23517103576660156,
+      "waiting_on_workers": 26.011043621739887,
+      "lockstep_rounds": 244,
+      "mean_batch": 1491.0983606557377,
+      "rows": 363828,
+      "mean_history": 44.21007179216553
+    },
+    "workers 10, chunks 1": {
+      "seconds": 64.51811331700003,
+      "gather": 21.432035235762566,
+      "forward": 21.709737284660324,
+      "sample": 1.4697179829627303,
+      "writeback": 0.027143136085011066,
+      "release": 0.20635024008154876,
+      "copy_out": 0.376353515625,
+      "waiting_on_workers": 19.296775921822857,
+      "lockstep_rounds": 240,
+      "mean_batch": 1512.7333333333333,
+      "rows": 363056,
+      "mean_history": 44.11857123969856
+    },
+    "workers 10, chunks 2": {
+      "seconds": 63.44358119999998,
+      "gather": 4.7424328326881025,
+      "forward": 36.84384366989134,
+      "sample": 1.735807103991505,
+      "writeback": 0.007788672002963724,
+      "release": 0.23081171202659603,
+      "copy_out": 0.24173922729492187,
+      "waiting_on_workers": 19.641157982104552,
+      "lockstep_rounds": 240,
+      "mean_batch": 1512.85,
+      "rows": 363084,
+      "mean_history": 44.14265018563197
+    },
+    "workers 10, chunks 3": {
+      "seconds": 78.619447105,
+      "gather": 5.167857725679858,
+      "forward": 51.59521426391582,
+      "sample": 2.177414655715228,
+      "writeback": 0.007541376003064216,
+      "release": 0.21508844777941716,
+      "copy_out": 0.2733297424316406,
+      "waiting_on_workers": 19.183000893474983,
+      "lockstep_rounds": 256,
+      "mean_batch": 1420.90625,
+      "rows": 363752,
+      "mean_history": 44.193615430293164
+    }
+  },
+  "forward_ms_batch190": {
+    "history": 3.3666887000009638,
+    "query": 3.267721649999089,
+    "scorer": 0.9347611500004405,
+    "heads": 0.7077433500001007,
+    "critic": 2.790783899999383,
+    "whole": 9.628689249998956,
+    "longest_history": 95
+  },
+  "forward_ms_batch1500": {
+    "history": 39.93435280000028,
+    "query": 36.476675649998924,
+    "scorer": 5.071945950001577,
+    "heads": 0.7316381999999066,
+    "critic": 29.370868050000354,
+    "whole": 111.50186184999882,
+    "longest_history": 99
+  },
+  "update_ms_per_minibatch": {
+    "gather": 3.080231350006102,
+    "forward": 16.33284391666431,
+    "backward": 30.472855366666824,
+    "optimiser": 5.003675683336913
+  },
+  "update_minibatches_per_agent": 180,
+  "update_rows_to_device_s": 0.4803354660000423,
+  "preplay": {
+    "seconds": 27.38186431200006,
+    "time/declare_s": 5.439260290999982,
+    "time/bury_s": 2.454628189999994,
+    "time/critic_s": 1.0964308380000034,
+    "time/update_s": 18.212569625000015
+  },
+  "update_kernels": "------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                        Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nvoid at::native::vectorized_elementwise_kernel<4, at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      25.965ms         8.64%      25.965ms      57.700us           450  \nampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_n...         0.00%       0.000us         0.00%       0.000us       0.000us      23.249ms         7.73%      23.249ms      45.055us           516  \nvoid at::native::(anonymous namespace)::multi_tensor_appl...         0.00%       0.000us         0.00%       0.000us       0.000us      18.784ms         6.25%      18.784ms     268.337us            70  \nvoid at::native::(anonymous namespace)::GammaBetaBackward...         0.00%       0.000us         0.00%       0.000us       0.000us      17.310ms         5.76%      17.310ms      68.420us           253  \nvoid at::native::vectorized_elementwise_kernel<4, at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      14.746ms         4.90%      14.746ms      27.307us           540  \nfmha_cutlassB_bf16_aligned_64x64_k64_sm80(PyTorchMemEffAt...         0.00%       0.000us         0.00%       0.000us       0.000us      14.522ms         4.83%      14.522ms     145.225us           100  \nvoid at::native::(anonymous namespace)::layer_norm_grad_i...         0.00%       0.000us         0.00%       0.000us       0.000us      14.413ms         4.79%      14.413ms      51.474us           280  \nvoid at::native::vectorized_elementwise_kernel<4, at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      14.045ms         4.67%      14.045ms       5.280us          2660  \nvoid at::native::unrolled_elementwise_kernel<at::native::...         0.00%       0.000us         0.00%       0.000us       0.000us      13.267ms         4.41%      13.267ms       5.459us          2430  \nampere_bf16_s1688gemm_bf16_128x128_ldg8_relu_f2f_stages_3...         0.00%       0.000us         0.00%       0.000us       0.000us      13.122ms         4.36%      13.122ms      53.342us           246  \nvoid at::native::reduce_kernel<128, 4, at::native::Reduce...         0.00%       0.000us         0.00%       0.000us       0.000us      12.565ms         4.18%      12.565ms      15.323us           820  \nvoid cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm...         0.00%       0.000us         0.00%       0.000us       0.000us      10.560ms         3.51%      10.560ms      56.773us           186  \n         ampere_bf16_s1688gemm_bf16_128x128_ldg8_relu_f2f_tn         0.00%       0.000us         0.00%       0.000us       0.000us      10.430ms         3.47%      10.430ms      33.973us           307  \nvoid at::native::unrolled_elementwise_kernel<at::native::...         0.00%       0.000us         0.00%       0.000us       0.000us       9.195ms         3.06%       9.195ms      39.977us           230  \nvoid at::native::vectorized_elementwise_kernel<4, at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us       8.901ms         2.96%       8.901ms      59.341us           150  \nvoid at::native::(anonymous namespace)::vectorized_layer_...         0.00%       0.000us         0.00%       0.000us       0.000us       7.762ms         2.58%       7.762ms      27.721us           280  \nvoid at::native::(anonymous namespace)::CatArrayBatchedCo...         0.00%       0.000us         0.00%       0.000us       0.000us       7.392ms         2.46%       7.392ms      49.281us           150  \nfmha_cutlassF_bf16_aligned_64x64_rf_sm80(PyTorchMemEffAtt...         0.00%       0.000us         0.00%       0.000us       0.000us       7.167ms         2.38%       7.167ms      71.666us           100  \n------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 152.679ms\nSelf CUDA time total: 300.675ms\n"
+}
