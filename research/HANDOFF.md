@@ -265,7 +265,8 @@ nothing.
 
    Cheap and not yet measured: v5 final with the learned burial and
    search (`--pre-play agent-policy --search-worlds 8`, ~30 min a bot).
-2. **Population of 8: built 2026-09-28, tested on CPU, not yet run.**
+2. **Population of 8: built and smoke-tested 2026-09-28; the real run is
+   not launched.**
    The user's spec:
    - K = 8 randomly initialised agents;
    - one agent per seat, so partners can be different agents;
@@ -276,13 +277,15 @@ nothing.
    - landlord-set hands only.
 
    Design and the reasoning: README § *A population of eight*. Code:
-   `train/population.py`, tests `tests/test_population.py`. Nothing has
-   run on a GPU, so step time and memory are estimates (~70 s a play
-   step, ~11 s a pre-play step, ~23 GB of rollout buffers against the
-   L40S container's 64 GB).
+   `train/population.py`, tests `tests/test_population.py`.
 
-   **Measure before the long run** (a few minutes on an L40S). This
-   covers a warm-up step, a pre-play phase and full-hand play steps:
+   **The smoke run** (`pop8-smoke`, 2026-09-28, 4 steps, ~10 min on an
+   L40S) ran clean: ~102 s a play step from random initialisation, 12–15 s
+   a pre-play step, 4.1 GB peak GPU memory, 28.7 GB host, 1.1 GB a
+   checkpoint, every agent on 44–45k rows a step. The step is long
+   because untrained hands run ~88 decisions against v5's ~60; per
+   decision it costs what v5's did, so expect ~72 s once hands shorten.
+   Numbers in README § *A population of eight*. The command, for a rerun:
 
    ```bash
    # from research/; the app name keeps it apart from any live training run
@@ -294,13 +297,16 @@ nothing.
    ```
 
    **The proposed run** (the warm-up length and step count are proposals,
-   not the user's decisions yet). A Modal function stops at 24 hours, so
-   plan launches of ~1000 steps and resume with `--resume
-   /vol/pop8/checkpoints/final.pt` and a larger absolute `--steps`:
+   not the user's decisions yet). A Modal function stops at 24 hours. At
+   the measured ~100 s a step early, 300 warm-up steps are ~8.3 h and
+   each 200-step block ~5 h plus ~25 min of pre-play, so a first launch
+   fits about 800 steps. Resume with `--resume
+   /vol/pop8/checkpoints/final.pt` and a larger absolute `--steps`
+   (confirm the first line reads `[801/...]`):
 
    ```bash
    modal run --detach modal_train.py::launch --gpu l40s --name pop8 \
-     --population 8 --reshuffle-every 10 --hands 4096 --steps 1000 \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 800 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
      --length-buckets 4 --checkpoint-every 50 --keep-last 8

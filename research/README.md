@@ -544,7 +544,7 @@ Paired on the same deals, pooled over the three search bots:
   of its declarations are no-trump, against about a fifth under the
   bots' declarations.
 
-### A population of eight (built 2026-09-28, not yet run)
+### A population of eight (built and smoke-tested 2026-09-28)
 
 The single agent's partner is always itself. `train/population.py`
 trains eight independently initialised agents instead, each a whole
@@ -585,11 +585,28 @@ user's choices: eight agents, random initialisation, two tables, the
   /vol/<run>/checkpoints/final.pt#3`.
 - In-loop evaluation is off for a population: it measures one network.
 
-Estimated, not measured: about 70 s a play step at 4096 hands on an
-L40S (collect and update are both linear in hands), and about 11 s a
-pre-play step at 8192. The rollout's `pool` defaults to 2048 hands in
-flight, not 512, so each agent's share of a forward stays near 190
-rows; that too wants measuring.
+**Measured on the smoke run** (`pop8-smoke`, L40S, 4096 hands a step,
+four steps from random initialisation, 2026-09-28):
+
+| | step | collect (forward) | update | decisions | per hand |
+| --- | --- | --- | --- | --- | --- |
+| warm-up step 2 | 101.7 s | 46.6 s (15.2 s) | 54.5 s | 362,756 | 88.6 |
+| full-hand step 4 | 102.9 s | 46.9 s (15.0 s) | 52.5 s | 354,368 | 86.5 |
+| v5, for scale (1024 hands) | 18.2 s | 8.5 s (2.2 s) | 8.9 s | 61,614 | 60.2 |
+
+- Per decision, a population step costs what a v5 step did: the update
+  0.148 ms against v5's 0.144, the collect 0.132 ms against 0.138. The
+  step is long because an untrained agent plays ~88 decisions a hand
+  against v5's ~60. At v5's hand length the same step would be about
+  72 s.
+- Splitting the forward eight ways costs about 17% (0.042 ms a decision
+  against 0.036); `pool` 2048 gives a mean lockstep batch of ~1,500, so
+  ~190 rows an agent.
+- A pre-play step at 8192 hands takes 12–15 s; building the play starts
+  for 4096 hands about 3 s.
+- Peak GPU memory 4.1 GB of 48; host RSS 28.7 GB of 64. A checkpoint is
+  1.1 GB.
+- Every agent trained on 44–45k rows a step.
 
 ---
 
