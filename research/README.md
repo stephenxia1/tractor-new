@@ -608,6 +608,91 @@ four steps from random initialisation, 2026-09-28):
   1.1 GB.
 - Every agent trained on 44–45k rows a step.
 
+### The v6 architecture, and the critic bake-off (2026-09-28)
+
+The user asked for SwiGLU in place of every GELU and for bigger critic,
+declaration and burial networks. `nn/arch.py` names the set `v6`; every
+config still defaults to `v5`, and fixtures pin the v5 networks'
+layouts and outputs to the bit (`tests/test_arch.py`).
+
+| | v5 | v6 |
+| --- | --- | --- |
+| feed-forwards and heads | GELU | SwiGLU at the same hidden width |
+| actor | 10.68M | 13.27M |
+| critic | flat: history transformer (128 × 2) + MLP over raw counts, 0.48M | `CardCritic`: one transformer (256 × 4, ff 1024) over CLS, context, 54 card tokens and the history, 4.51M |
+| declaration | MLP 2 × 256, 0.27M | residual SwiGLU MLP 3 × 512, 5.0M |
+| burial | transformer 128 × 2 (ReLU), 0.42M | SwiGLU blocks 256 × 4, value head 512, 3.6M |
+
+The card critic's token for each card type carries the card's static
+features in this trump context -- the block the actor reads -- and its
+count in each hand, the kitty and each seat's play to the current
+trick. At play start, where the flat critic is an MLP over a
+270-vector of counts, that value is the reward for every declaration
+and burial.
+
+**Bake-off** (`train/critic_bakeoff.py`, `modal run
+modal_train.py::critic_bakeoff`, L40S): 8 rounds of 1024 hands played by
+v5-bury final from its own declarations and burials; the last round's
+1024 hands held out; targets the Monte-Carlo return. Each arm trains
+from scratch on the same 426,296 rows in the same order (AdamW 3e-4,
+batch 256) reading v5's frozen history encodings; `v5` is the
+checkpoint's own trained critic, for reference. Explained variance on
+the held-out hands, every row and at play start (95% intervals
+resample hands):
+
+| arm | params | pass | fit | held out | at play start | s/pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| v5, trained over the whole run | 0.48M | – | 0.425 | 0.404 [0.360, 0.443] | 0.400 [0.353, 0.440] | – |
+| flat, fresh | 0.48M | 1 | 0.313 | 0.213 [0.174, 0.249] | 0.227 [0.188, 0.262] | 12.9 |
+| flat, fresh | 0.48M | 4 | 0.643 | 0.161 [0.109, 0.212] | 0.135 [0.070, 0.197] | 12.9 |
+| flat widened to 256 × 4 | 3.71M | 1 | 0.302 | 0.212 [0.174, 0.245] | 0.223 [0.185, 0.259] | 29.3 |
+| flat widened to 256 × 4 | 3.71M | 4 | 0.697 | 0.180 [0.124, 0.230] | 0.145 [0.081, 0.205] | 29.4 |
+| **cards** | 4.51M | 1 | 0.374 | 0.338 [0.303, 0.370] | 0.340 [0.296, 0.384] | 39.5 |
+| **cards** | 4.51M | 4 | 0.501 | **0.368** [0.330, 0.403] | **0.364** [0.317, 0.411] | 39.6 |
+
+Paired on the same held-out hands, cards minus flat at pass 4: **+0.206
+[+0.168, +0.250]** on every row and **+0.229 [+0.178, +0.283]** at play
+start; at pass 1, +0.125 and +0.112. Widened flat minus flat is within
+±0.025 at every pass.
+
+- **The card critic generalises; the flat one memorises.** From the same
+  data the flat critic peaks after one pass and then declines on unseen
+  hands while its fit keeps climbing (0.64 fitted, 0.16 held out, slope
+  0.66). The card critic holds or improves on unseen hands through four
+  passes (0.338, 0.352, 0.369, 0.368), its gap is 0.13 against 0.48,
+  and it stays calibrated (slope 0.94–0.98).
+- **Size is not what does it.** The flat design at the card critic's
+  width and depth is indistinguishable from the original. The gain is
+  the structure (card tokens in the trump context); SwiGLU is inside the
+  card arm and is not separated here.
+- **Fresh, on 28 steps' worth of data, it nearly reaches v5's critic**,
+  which trained over the whole v2-v5 lineage (0.368 against 0.404 held
+  out, 0.364 against 0.400 at play start).
+- It costs about 3× the flat critic's training time per row here (the
+  frozen history encoder is in both numbers).
+
+Raw: `evals/2026-09-28/critic-bakeoff-20260928.json`.
+
+**The v6 population smoke run** (`pop8v6-smoke`, same four steps as
+`pop8-smoke`, `--arch v6`):
+
+| | v5 shapes | v6 |
+| --- | --- | --- |
+| warm-up play step (step 2) | 101.7 s | 141.0 s |
+| full-hand play step (step 4) | 102.9 s | 134.2 s |
+| pre-play step, 8192 hands | 12–15 s | 26 s |
+| peak GPU memory | 4.1 GB | 8.7 GB |
+| host RSS | 28.7 GB | 28.7 GB |
+| checkpoint (8 agents, with optimisers) | 1.1 GB | 2.4 GB |
+| critic explained variance, steps 1–4 | −0.009, +0.214, +0.252, +0.265 | −0.007, +0.008, +0.038, +0.189 |
+
+A v6 step costs about 1.35× a v5-shaped one; at v5's hand length (~60
+decisions against the untrained ~87) it would be about 94 s. The card
+critic starts slower from random weights -- the deeper, residual-scaled
+network takes a few hundred minibatches to move where the flat MLP moves
+in one step -- and had nearly caught up by step 4; the bake-off has it
+ahead after about 1,700 minibatches, some ten population steps.
+
 ---
 
 ## Next steps

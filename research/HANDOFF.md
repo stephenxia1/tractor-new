@@ -296,20 +296,31 @@ nothing.
      --checkpoint-every 2 --keep-last 2
    ```
 
+   **pop8 uses the v6 architecture** (`--arch v6`, the user's choice on
+   2026-09-28): SwiGLU everywhere at the same hidden widths, the card
+   critic, and the widened declaration and burial networks. The user
+   asked for a bake-off first; the card critic won it clearly (held-out
+   explained variance 0.368 against 0.161–0.213 for the flat critic,
+   paired +0.21 overall and +0.23 at play start; a widened flat critic
+   gained nothing). README § *The v6 architecture, and the critic
+   bake-off*. The v6 smoke run (`pop8v6-smoke`) ran clean at 134–141 s a
+   play step, 26 s a pre-play step, 8.7 GB GPU, 2.4 GB a checkpoint; add
+   `--arch v6` to the smoke command above to rerun it.
+
    **The proposed run** (the warm-up length and step count are proposals,
    not the user's decisions yet). A Modal function stops at 24 hours. At
-   the measured ~100 s a step early, 300 warm-up steps are ~8.3 h and
-   each 200-step block ~5 h plus ~25 min of pre-play, so a first launch
-   fits about 800 steps. Resume with `--resume
-   /vol/pop8/checkpoints/final.pt` and a larger absolute `--steps`
-   (confirm the first line reads `[801/...]`):
+   the measured ~140 s a step early, 300 warm-up steps are ~11.7 h and a
+   200-step block ~7.5 h plus ~45 min of pre-play, so a first launch fits
+   about 550 steps. Resume with `--resume /vol/pop8/checkpoints/final.pt`,
+   the same `--arch v6` and a larger absolute `--steps` (confirm the first
+   line reads `[551/...]`):
 
    ```bash
-   modal run --detach modal_train.py::launch --gpu l40s --name pop8 \
-     --population 8 --reshuffle-every 10 --hands 4096 --steps 800 \
+   modal run --detach modal_train.py::launch --gpu l40s --name pop8 --arch v6 \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 550 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
-     --length-buckets 4 --checkpoint-every 50 --keep-last 8
+     --length-buckets 4 --checkpoint-every 50 --keep-last 6
    ```
 
    **Evaluating it.** Rank the eight cheaply, then measure the best
