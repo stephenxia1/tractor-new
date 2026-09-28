@@ -12,7 +12,9 @@ and `README.md` § *Measurements on the PPO track*.
 **`v5-bury` is finished and benchmarked.** `final.pt` landed at 16:46
 EDT on 09-24, and all four benchmarks (16 pairs) were stored on the
 volume by 20:06. No cloud session committed anything, so the results
-were taken straight from `/vol/evals/` on 09-28. They are in
+were taken straight from `/vol/evals/` on 09-28. The local launcher had
+in fact finished too: its `runs/bench-v5-final-*.jsonl` match them hand
+for hand. They are in
 `evals/2026-09-24/v5-final-{policy,heur,critic,random}.jsonl` and
 written up in README § *Where v5-bury ended*.
 
@@ -98,6 +100,7 @@ play only" is **stale**.
 | burial network | `nn/bury_net.py` | `BuryNet`: set transformer over 54 card types (2 layers, d 128), 8 sequential picks, masked logits, value head that reads the other hands |
 | play training | `train/loop.py`, `ppo.py`, `rollout.py`, `parallel.py`, `shared.py` | PPO, GAE γ 1 λ 0.95, points-only reward; `RolloutPool` workers + batched forward in the parent |
 | pre-play training | `train/starts.py`, `declare_loop.py`, `bury_loop.py` | `make_starts` builds play starts from the declaration and burial policies; `DeclareLearner` trains declaration (and burial, when given a `BuryLearner`) with play frozen |
+| population | `train/population.py` | eight agents, one per seat at two tables, reseated every N steps; routes rows by `agents[hand, seat]` through `collect`/`RolloutPool`/`make_starts`/`critic_values`; `read_checkpoint("…pt#k")` hands out one agent. README § *A population of eight* |
 | evaluation | `eval/bots.py`, `eval/search.py`, `src/evalhost.ts`, `src/env.ts` | games against the TS bots through a Node host; inference-time search |
 | Modal | `modal_train.py`, `modal_eval.py`, `modal_perf.py`, `modal_bench.py` | training, benchmark, and profiling entrypoints |
 
@@ -262,16 +265,57 @@ nothing.
 
    Cheap and not yet measured: v5 final with the learned burial and
    search (`--pre-play agent-policy --search-worlds 8`, ~30 min a bot).
-2. **Population of 8** (plan task 7, not started). The user's spec:
+2. **Population of 8: built 2026-09-28, tested on CPU, not yet run.**
+   The user's spec:
    - K = 8 randomly initialised agents;
    - one agent per seat, so partners can be different agents;
    - two tables;
-   - seats reshuffled every N steps;
+   - seats reshuffled every **10** steps;
+   - **4096 hands a step**, so each agent gets 2048 seat-trajectories a
+     step, half the single agent's;
    - landlord-set hands only.
 
-   Today `RolloutPool` batches one network for all four seats. It needs
-   per-seat network routing in the parent's forward, one learner per
-   agent, and the pre-play phase run per agent.
+   Design and the reasoning: README § *A population of eight*. Code:
+   `train/population.py`, tests `tests/test_population.py`. Nothing has
+   run on a GPU, so step time and memory are estimates (~70 s a play
+   step, ~11 s a pre-play step, ~23 GB of rollout buffers against the
+   L40S container's 64 GB).
+
+   **Measure before the long run** (a few minutes on an L40S). This
+   covers a warm-up step, a pre-play phase and full-hand play steps:
+
+   ```bash
+   # from research/; the app name keeps it apart from any live training run
+   TRACTOR_TRAIN_APP=tractor-train-pop-smoke modal run --detach modal_train.py::launch \
+     --gpu l40s --name pop8-smoke --population 8 --reshuffle-every 10 --hands 4096 \
+     --steps 4 --warmup-steps 2 --play-phase-steps 2 --declare-phase-steps 2 \
+     --declare-hands 8192 --bury-policy --random-burial-frac 0.2 --length-buckets 4 \
+     --checkpoint-every 2 --keep-last 2
+   ```
+
+   **The proposed run** (the warm-up length and step count are proposals,
+   not the user's decisions yet). A Modal function stops at 24 hours, so
+   plan launches of ~1000 steps and resume with `--resume
+   /vol/pop8/checkpoints/final.pt` and a larger absolute `--steps`:
+
+   ```bash
+   modal run --detach modal_train.py::launch --gpu l40s --name pop8 \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 1000 \
+     --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
+     --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
+     --length-buckets 4 --checkpoint-every 50 --keep-last 8
+   ```
+
+   **Evaluating it.** Rank the eight cheaply, then measure the best
+   properly against v5 final on the same seed:
+
+   ```bash
+   CK=/vol/pop8/checkpoints/final.pt
+   modal run --detach modal_eval.py::smart --bots smart-v18 --deals 192 --pre-play agent-policy \
+     --checkpoints $CK#0,$CK#1,$CK#2,$CK#3,$CK#4,$CK#5,$CK#6,$CK#7 --out runs/pop8-rank.jsonl
+   # then 770 deals, all four bots, --pre-play agent-policy and random, for the best agents;
+   # pair against evals/2026-09-24/v5-final-{policy,random}.jsonl with tab_evals.py --paired
+   ```
 3. **Separate what broke the plateau**: one-change-at-a-time runs from v3
    step 2000.
 4. **Distil search into the policy** (search is worth +0.04).

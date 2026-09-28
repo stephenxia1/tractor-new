@@ -794,7 +794,9 @@ def main() -> int:
     cfg = ModelConfig()
     net = ActorCritic(cfg)
     if args.checkpoint:
-        blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        from ..train.population import read_checkpoint
+
+        blob = read_checkpoint(args.checkpoint)  # `pop.pt#k` for one agent
         cfg = ModelConfig(**blob["model_config"])
         net = ActorCritic(cfg)
         load_model(net, blob["model"])

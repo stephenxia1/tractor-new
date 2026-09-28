@@ -62,14 +62,15 @@ from ..nn.model import ModelConfig
 from .buffer import RolloutBuffer, obs_batch_from_arrays
 from .rollout import (
     DECKS,
-    _choose,
     _credit_terminal,
     _credit_trick,
-    _evaluate,
     _InFlight,
     _pack,
     _room_for_another,
     _span,
+    as_nets,
+    check_agents,
+    routed_step,
 )
 from .shared import SharedBuffer, compact_ranges, partition
 from .starts import pack_start, start_state
@@ -265,11 +266,17 @@ class RolloutPool:
         spans: Any = None,
         episode_base: int = 0,
         starts: Any = None,
+        agents: Any = None,
     ) -> tuple[RolloutBuffer, dict[str, float]]:
         """One round. -> ``(buffer, stats)``, same keys as ``collect``.
 
         ``starts``, when given, are the round's play starts (``train.starts.
         Start``), one per hand, in place of the workers' own uniform draw.
+
+        ``net`` may be a population's list of networks, with ``agents``
+        int64[n_hands, 4] naming the network in each seat of each hand, as
+        in ``rollout.collect``. The workers are unchanged: a row's hand is
+        its episode less ``episode_base``, so the parent routes it.
 
         ``spans`` records the parent's own work -- "forward" and
         "sample" -- and nothing else. Encode, enumerate and step happen
@@ -284,6 +291,8 @@ class RolloutPool:
                 f"this pool was sized for {self.hands_per_round} hands a "
                 f"round, not {n_hands}; make a wider one"
             )
+        nets = as_nets(net)
+        seating = check_agents(agents, n_hands, nets)
         workers = self.workers
         pool_total = int(pool) if pool else 128
         per_worker_pool = max(1, pool_total // workers)
@@ -292,9 +301,10 @@ class RolloutPool:
             for w in range(workers)
         ]
 
-        was_training = getattr(net, "training", False)
-        if hasattr(net, "eval"):
-            net.eval()
+        was_training = [getattr(n, "training", False) for n in nets]
+        for n in nets:
+            if hasattr(n, "eval"):
+                n.eval()
 
         started_at = time.perf_counter()
         totals = dict.fromkeys(_STAT_KEYS, 0)
@@ -348,42 +358,45 @@ class RolloutPool:
                     if not pending:
                         break
 
+                    rows = np.concatenate([
+                        np.arange(first, first + count, dtype=np.int64)
+                        for first, count in
+                        (pending[w] for w in sorted(pending))
+                    ])
+
                     # Fancy indexing, so each of these materialises a
                     # copy: at 1024 hands a round moves about 2.4 GiB
-                    # through here. Timed apart from the forward because
-                    # the two have different remedies -- this one shrinks
-                    # by slicing each worker's contiguous run instead of
-                    # gathering, the forward only by a wider batch.
-                    with _span(spans, "gather"):
-                        rows = np.concatenate([
-                            np.arange(first, first + count, dtype=np.int64)
-                            for first, count in
-                            (pending[w] for w in sorted(pending))
-                        ])
+                    # through here. Timed apart from the forward (as
+                    # "gather") because the two have different remedies
+                    # -- this one shrinks by slicing each worker's
+                    # contiguous run instead of gathering, the forward
+                    # only by a wider batch.
+                    def gather(idx: np.ndarray) -> tuple[Any, torch.Tensor]:
+                        r = rows[idx]
                         obs = obs_batch_from_arrays(
-                            buf.history[rows], buf.history_len[rows],
-                            buf.context[rows], buf.unseen[rows],
-                            buf.planes[rows], buf.cards[rows],
-                            buf.candidates[rows], buf.candidate_mask[rows],
+                            buf.history[r], buf.history_len[r],
+                            buf.context[r], buf.unseen[r],
+                            buf.planes[r], buf.cards[r],
+                            buf.candidates[r], buf.candidate_mask[r],
                             device=device,
                         )
                         privileged = torch.from_numpy(
-                            buf.privileged[rows].astype(np.float32)
+                            buf.privileged[r].astype(np.float32)
                         ).to(device)
-                    with _span(spans, "forward"):
-                        out, values = _evaluate(net, obs, privileged)
-                    with _span(spans, "sample"):
-                        slots, chosen_logp = _choose(
-                            out.logits, obs.candidate_mask, temperature,
-                            greedy, rng,
-                        )
+                        return obs, privileged
+
+                    if seating is None:
+                        owner = np.zeros(len(rows), dtype=np.int64)
+                    else:
+                        owner = seating[buf.episode[rows] - episode_base,
+                                        buf.seat[rows]]
+                    slots, chosen_logp, values = routed_step(
+                        nets, owner, gather, temperature, greedy, rng, spans
+                    )
                     with _span(spans, "writeback"):
-                        buf.action[rows] = slots.astype(np.int64)
-                        buf.logp[rows] = chosen_logp.astype(np.float32)
-                        buf.value[rows] = (
-                            values.detach().float().cpu().numpy()
-                            .astype(np.float32)
-                        )
+                        buf.action[rows] = slots
+                        buf.logp[rows] = chosen_logp
+                        buf.value[rows] = values
                     forwards += 1
                     batch_total += int(rows.size)
                     with _span(spans, "release"):
@@ -415,8 +428,9 @@ class RolloutPool:
                     )[:rows_written]
                 out_buffer._n = rows_written
         finally:
-            if was_training and hasattr(net, "train"):
-                net.train()
+            for n, was in zip(nets, was_training):
+                if was and hasattr(n, "train"):
+                    n.train()
 
         elapsed = time.perf_counter() - started_at
         decisions = totals["decisions"]
@@ -484,6 +498,7 @@ def collect_parallel(
     amp: bool = False,
     workers: int = DEFAULT_WORKERS,
     capacity: int | None = None,
+    agents: Any = None,
 ) -> tuple[RolloutBuffer, dict[str, float]]:
     """One round through a throwaway pool.
 
@@ -492,7 +507,7 @@ def collect_parallel(
     seconds for one worker and 12.3 for seven, most of it ``import
     torch`` -- on every call, which is more than the round costs.
     """
-    cfg = cfg or getattr(net, "cfg", None) or ModelConfig()
+    cfg = cfg or getattr(as_nets(net)[0], "cfg", None) or ModelConfig()
     with RolloutPool(
         cfg=cfg, workers=workers, hands_per_round=int(n_hands),
         capacity=capacity,
@@ -501,4 +516,5 @@ def collect_parallel(
             net, rng, buffer, n_hands=int(n_hands), device=device,
             temperature=temperature, greedy=greedy,
             level_weight=level_weight, pool=pool, amp=amp, spans=spans,
+            agents=agents,
         )

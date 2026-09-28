@@ -121,12 +121,18 @@ def _train(steps: int, hands: int, name: str, gpu_label: str,
 
     from tractor.telemetry import Run
     from tractor.train.loop import TrainConfig, train
+    from tractor.train.population import PopulationConfig, train_population
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = f"{VOLUME}/{name}/checkpoints"
     os.makedirs(ckpt, exist_ok=True)
 
-    cfg = TrainConfig(
+    # `agents` in the overrides means a population (train/population.py).
+    Config, fit = (
+        (PopulationConfig, train_population) if overrides.get("agents")
+        else (TrainConfig, train)
+    )
+    cfg = Config(
         total_steps=steps,
         hands_per_step=hands,
         checkpoint_dir=ckpt,
@@ -149,8 +155,8 @@ def _train(steps: int, hands: int, name: str, gpu_label: str,
             except Exception as exc:  # pragma: no cover
                 print(f"modal_train: volume commit failed ({exc})")
 
-        out = train(cfg, device=device, run=run,
-                    resume=resume or None, on_checkpoint=_flush)
+        out = fit(cfg, device=device, run=run,
+                  resume=resume or None, on_checkpoint=_flush)
     volume.commit()
     out["device"] = device
     return out
@@ -217,8 +223,15 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_rounds: int = 8, bury_consider: int = 0,
            length_buckets: int = 0, prefetch_starts: bool = False,
            bury_evaluator: str = "actor", bury_policy: bool = False,
-           restart_schedule: bool = False) -> None:
+           restart_schedule: bool = False, population: int = 0,
+           reshuffle_every: int = 10, pool: int = 0) -> None:
     """Submit a run and return, rather than waiting on it.
+
+    `--population K` trains K agents, one per seat at K/4 tables,
+    reseated every `--reshuffle-every` steps (train/population.py).
+    In-loop evaluation is off for a population; its checkpoints are
+    measured per agent with modal_eval.py, as `final.pt#k`. `--pool`
+    overrides the hands in flight (0 keeps the config's default).
 
     The defaults for `hands`, `epochs` and `rollout_workers` come from
     measurement rather than taste. All three were taken by holding a
@@ -258,6 +271,15 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     """
     fn = {"a10g": train_a10g, "a100": train_a100,
           "l40s": train_l40s}[gpu.lower()]
+    extra = {}
+    if population:
+        if eval_every:
+            print("population: in-loop evaluation is off; measure checkpoints "
+                  "with modal_eval.py as final.pt#k")
+        eval_every = 0
+        extra = {"agents": population, "reshuffle_every": reshuffle_every}
+    if pool:
+        extra["pool"] = pool
     call = fn.spawn(
         steps,
         hands,
@@ -265,6 +287,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
         wandb_on,
         resume,
         {
+            **extra,
             "eval_every": eval_every,
             "eval_deals": eval_deals,
             "eval_bots": _bot_list(eval_bots),
@@ -336,15 +359,17 @@ def main(steps: int = 1000, hands: int = 64, name: str = "run",
 
 
 def _load_net(checkpoint: str, device: str):
-    """``(net, model_cfg)`` from a checkpoint path, or a fresh net."""
-    import torch
+    """``(net, model_cfg)`` from a checkpoint path, or a fresh net.
 
+    ``pop/final.pt#k`` is agent ``k`` of a population checkpoint.
+    """
     from tractor.nn.model import ActorCritic, ModelConfig, load_model
+    from tractor.train.population import read_checkpoint
 
     if not checkpoint:
         cfg = ModelConfig()
         return ActorCritic(cfg).to(device), cfg
-    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    blob = read_checkpoint(checkpoint)
     cfg = ModelConfig(**blob["model_config"])
     net = ActorCritic(cfg)
     load_model(net, blob["model"])

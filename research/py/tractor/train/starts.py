@@ -137,6 +137,19 @@ class DeclareRows:
     def __len__(self) -> int:
         return len(self.action)
 
+    def subset(self, idx: np.ndarray) -> "DeclareRows":
+        return DeclareRows(**{k: v[idx] for k, v in vars(self).items()})
+
+
+def _groups(owner: np.ndarray) -> list[tuple[int, np.ndarray]]:
+    """``(agent, rows)`` for each agent in ``owner``, in agent order."""
+    return [(int(a), np.nonzero(owner == a)[0]) for a in np.unique(owner)]
+
+
+def _pick(nets: Any, agent: int) -> Any:
+    """A population's ``agent``-th network, or the one network."""
+    return nets[agent] if isinstance(nets, (list, tuple)) else nets
+
 
 @dataclass
 class PrePlayRows:
@@ -153,6 +166,7 @@ def _declare_round(
     rng: np.random.Generator,
     device: Any,
     greedy: bool,
+    agents: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     obs = np.stack([declare_obs(envs[h], s) for h, s in pending])
     priv = np.stack([declare_privileged(envs[h], s) for h, s in pending])
@@ -162,14 +176,23 @@ def _declare_round(
         logp_all = np.where(mask, -np.log(mask.sum(1, keepdims=True)), -np.inf)
         value = np.zeros(len(pending), dtype=np.float32)
     else:
-        with torch.no_grad():
-            _logits, lp, v = declare_net(
-                torch.from_numpy(obs).to(device),
-                torch.from_numpy(mask).to(device),
-                torch.from_numpy(priv).to(device),
-            )
-        logp_all = lp.float().cpu().numpy()
-        value = v.float().cpu().numpy()
+        # Each decision through its seat's network. One agent is one
+        # forward over every row, as before routing existed.
+        owner = (
+            np.zeros(len(pending), dtype=np.int64) if agents is None
+            else agents[[h for h, _s in pending], [s for _h, s in pending]]
+        )
+        logp_all = np.empty(mask.shape, dtype=np.float32)
+        value = np.empty(len(pending), dtype=np.float32)
+        for agent, idx in _groups(owner):
+            with torch.no_grad():
+                _logits, lp, v = _pick(declare_net, agent)(
+                    torch.from_numpy(obs[idx]).to(device),
+                    torch.from_numpy(mask[idx]).to(device),
+                    torch.from_numpy(priv[idx]).to(device),
+                )
+            logp_all[idx] = lp.float().cpu().numpy()
+            value[idx] = v.float().cpu().numpy()
     if greedy:
         action = logp_all.argmax(axis=1)
     else:
@@ -189,14 +212,24 @@ def make_starts(
     cache: Cache | None = None,
     num_decks: int = 2,
     bury_net: Any = None,
+    agents: Any = None,
 ) -> tuple[list[Start], PrePlayRows | None, dict[str, float]]:
     """Deal, declare and bury ``n`` hands.
 
     ``declare_net`` of ``None`` declares uniformly over the legal
     actions; ``play_net`` of ``None`` buries every hand at random, as
     does ``pre.burial == "policy"`` with no ``bury_net``.
+
+    A population passes lists for the networks and ``agents``,
+    int64[n, 4], the agent in each seat of each hand. Each seat then
+    declares by its own agent's network, and the landlord buries by its
+    agent's burial policy (or climbs on its agent's play network).
     """
     pre = pre or PrePlayConfig()
+    if agents is not None:
+        agents = np.asarray(agents, dtype=np.int64)
+        if agents.shape != (n, NUM_SEATS):
+            raise ValueError(f"seating is {agents.shape}, expected {(n, NUM_SEATS)}")
     t_start = time.perf_counter()
     envs = [
         DealEnv(rng, landlord=int(rng.integers(NUM_SEATS)),
@@ -215,7 +248,7 @@ def make_starts(
         if not pending:
             break
         obs, priv, mask, action, logp, value = _declare_round(
-            declare_net, envs, pending, rng, device, pre.greedy_declare
+            declare_net, envs, pending, rng, device, pre.greedy_declare, agents
         )
         for (h, s), a in zip(pending, action):
             envs[h].act(s, int(a))
@@ -245,6 +278,12 @@ def make_starts(
             by_value.append(i)
     bury_stats = {"value_start": 0.0, "value_end": 0.0, "rounds": 0.0}
     bury_rows = None
+    valued = np.asarray(by_value, dtype=np.int64)
+    # Each landlord buries by its own agent; one agent is one group.
+    owner = (
+        np.zeros(len(valued), dtype=np.int64) if agents is None
+        else agents[valued, np.asarray(landlords, dtype=np.int64)[valued]]
+    )
     if by_value and use_policy:
         standings = []
         others = np.zeros((len(by_value), 3, pools[0].shape[0]), dtype=np.float32)
@@ -255,23 +294,47 @@ def make_starts(
             standings.append((env.standing_tier, rel))
             for k in range(3):
                 others[j, k] = env.final[(env.landlord + 1 + k) % NUM_SEATS]
-        got, bury_rows = policy_burials(
-            bury_net, [pools[i] for i in by_value], [ctxs[i] for i in by_value],
-            standings, rng, device, greedy=pre.greedy_bury, others=others,
-            record=record, cache=cache, num_decks=num_decks,
-        )
-        for i, b in zip(by_value, got):
-            burials[i] = b
-        if bury_rows is not None:
-            # Rows index the policy's own batch; point them at the hands.
-            bury_rows.hand = np.asarray(by_value, dtype=np.int64)[bury_rows.hand]
+        parts_rows: list[BuryRows] = []
+        for agent, members in _groups(owner):
+            hands = valued[members]
+            got, rows_a = policy_burials(
+                _pick(bury_net, agent), [pools[i] for i in hands],
+                [ctxs[i] for i in hands], [standings[j] for j in members], rng,
+                device, greedy=pre.greedy_bury, others=others[members],
+                record=record, cache=cache, num_decks=num_decks,
+            )
+            for i, b in zip(hands, got):
+                burials[i] = b
+            if rows_a is not None:
+                # Rows index the policy's own batch; point them at the hands.
+                rows_a.hand = hands[rows_a.hand]
+                parts_rows.append(rows_a)
+        if parts_rows:
+            bury_rows = parts_rows[0] if len(parts_rows) == 1 else BuryRows(**{
+                k: np.concatenate([vars(p)[k] for p in parts_rows])
+                for k in vars(parts_rows[0])
+            })
     elif by_value:
-        got, bury_stats = value_burials(
-            play_net, [pools[i] for i in by_value], [ctxs[i] for i in by_value],
-            [landlords[i] for i in by_value], device, pre.bury, cache, num_decks,
-        )
-        for i, b in zip(by_value, got):
-            burials[i] = b
+        weighted = []
+        for agent, members in _groups(owner):
+            hands = valued[members]
+            got, st = value_burials(
+                _pick(play_net, agent), [pools[i] for i in hands],
+                [ctxs[i] for i in hands], [landlords[i] for i in hands], device,
+                pre.bury, cache, num_decks,
+            )
+            for i, b in zip(hands, got):
+                burials[i] = b
+            weighted.append((len(hands), st))
+        if len(weighted) == 1:
+            bury_stats = weighted[0][1]
+        else:
+            total = sum(m for m, _st in weighted)
+            bury_stats = {
+                "value_start": sum(m * st["value_start"] for m, st in weighted) / total,
+                "value_end": sum(m * st["value_end"] for m, st in weighted) / total,
+                "rounds": max(st["rounds"] for _m, st in weighted),
+            }
 
     t_buried = time.perf_counter()
     starts = []
@@ -322,7 +385,7 @@ def make_starts(
 
 def critic_values(
     play_net: Any, starts: list[Start], device: Any = "cpu", chunk: int = 512,
-    num_decks: int = 2,
+    num_decks: int = 2, agents: Any = None,
 ) -> np.ndarray:
     """float32[n, 4]: the privileged critic at each seat's play start.
 
@@ -330,9 +393,10 @@ def critic_values(
     margin over ``2 * 100 * num_decks``. At play start the history is
     empty, so the critic reads only the four hands, the burial and the
     seat's context vector.
+
+    A population passes its list of play networks and ``agents``,
+    int64[n, 4]; each seat is then valued by its own agent's critic.
     """
-    critic = play_net.critic
-    cfg = play_net.cfg
     ctx_rows: list[np.ndarray] = []
     priv_rows: list[np.ndarray] = []
     for st in starts:
@@ -343,18 +407,24 @@ def critic_values(
     context = np.stack(ctx_rows) if ctx_rows else np.zeros((0, 1), np.float32)
     priv = np.stack(priv_rows) if priv_rows else np.zeros((0, 5, 54), np.float32)
     out = np.empty(len(ctx_rows), dtype=np.float32)
+    # Rows are hand-major, seat-minor, as ``agents`` flattens.
+    owner = (
+        np.zeros(len(out), dtype=np.int64) if agents is None
+        else np.asarray(agents, dtype=np.int64).reshape(-1)
+    )
     with torch.no_grad():
-        for lo in range(0, len(out), chunk):
-            hi = min(lo + chunk, len(out))
-            b = hi - lo
-            # Empty histories: the critic's fast path reads only the batch
-            # size from this, so one position is enough.
-            enc = torch.zeros(b, 1, cfg.d_model, device=device)
-            length = torch.zeros(b, dtype=torch.int64, device=device)
-            v = critic(
-                enc, length,
-                torch.from_numpy(priv[lo:hi]).to(device),
-                context=torch.from_numpy(context[lo:hi]).to(device),
-            )
-            out[lo:hi] = v.float().cpu().numpy()
+        for agent, rows in _groups(owner):
+            net = _pick(play_net, agent)
+            for lo in range(0, len(rows), chunk):
+                r = rows[lo : lo + chunk]
+                # Empty histories: the critic's fast path reads only the
+                # batch size from this, so one position is enough.
+                enc = torch.zeros(len(r), 1, net.cfg.d_model, device=device)
+                length = torch.zeros(len(r), dtype=torch.int64, device=device)
+                v = net.critic(
+                    enc, length,
+                    torch.from_numpy(priv[r]).to(device),
+                    context=torch.from_numpy(context[r]).to(device),
+                )
+                out[r] = v.float().cpu().numpy()
     return out.reshape(len(starts), NUM_SEATS)

@@ -31,7 +31,8 @@ def load(path: str) -> list[dict]:
 
 def label(r: dict) -> tuple[str, str]:
     parts = r["checkpoint"].rstrip("/").split("/")
-    ckpt = f"{parts[-3]}/{parts[-1].removesuffix('.pt')}" if len(parts) >= 3 else r["checkpoint"]
+    # A population's agent k is `.../final.pt#k` -> `run/final#k`.
+    ckpt = f"{parts[-3]}/{parts[-1].replace('.pt', '')}" if len(parts) >= 3 else r["checkpoint"]
     mode = r.get("pre_play", "bot")
     if r.get("search"):
         mode += "+search"

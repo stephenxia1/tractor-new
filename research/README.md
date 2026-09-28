@@ -544,6 +544,53 @@ Paired on the same deals, pooled over the three search bots:
   of its declarations are no-trump, against about a fifth under the
   bots' declarations.
 
+### A population of eight (built 2026-09-28, not yet run)
+
+The single agent's partner is always itself. `train/population.py`
+trains eight independently initialised agents instead, each a whole
+single agent: its own play network and privileged critic, declaration
+network and burial policy, each with its own optimiser. They sit one to
+a seat at two tables, so a partner and both opponents are other agents,
+and are reseated every 10 steps. Landlord-set hands only. These are the
+user's choices: eight agents, random initialisation, two tables, the
+10-step reshuffle, and 4096 hands a step.
+
+- **Routing, not a new rollout.** Hand `i` is played at table `i % 2`;
+  the table and the seat name the agent. That table, int64[hands, 4],
+  goes to `rollout.collect` / `RolloutPool.collect` and to
+  `make_starts`, which route every decision to its seat's network,
+  every value to its seat's critic, every burial to the landlord's
+  agent and every declaration return to the declaring seat's critic.
+  The workers are unchanged; the parent groups a lockstep batch by
+  agent and runs one forward per agent. GAE already groups by hand and
+  seat, and each agent's learner then updates on its own rows.
+  With one agent the routed path is the old one exactly: same batches,
+  same random draws (`tests/test_population.py`).
+- **Sample size.** An agent sits in one seat of half the hands, so it
+  learns from an eighth of the seat-trajectories the single agent took
+  from the same round. At 4096 hands a step each agent gets 2048, half
+  what the single agent's 1024-hand round gave it. The pre-play phase
+  needs 8192 hands a step to give each agent the declarations and
+  burials a 1024-hand phase gave the single agent (each agent is
+  landlord in about 1024 of them).
+- **Seatings** are a function of `(seed, epoch)`, not of a live
+  generator, so a resumed run seats every agent where the original
+  would have. Pre-play phases draw their own seatings on the same
+  10-step schedule.
+- **Checkpoints** hold all eight agents (about 1 GB with optimiser
+  state). `read_checkpoint("…/final.pt#3")` returns agent 3 in the
+  single agent's layout, and `modal_train._load_net`,
+  `modal_eval.py` and `eval/bots.py` all read through it. So an agent
+  is benchmarked with the usual command and `--checkpoints
+  /vol/<run>/checkpoints/final.pt#3`.
+- In-loop evaluation is off for a population: it measures one network.
+
+Estimated, not measured: about 70 s a play step at 4096 hands on an
+L40S (collect and update are both linear in hands), and about 11 s a
+pre-play step at 8192. The rollout's `pool` defaults to 2048 hands in
+flight, not 512, so each agent's share of a forward stays near 190
+rows; that too wants measuring.
+
 ---
 
 ## Next steps

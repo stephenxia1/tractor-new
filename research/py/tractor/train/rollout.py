@@ -285,6 +285,64 @@ def _choose(
     return slots.astype(np.int64), chosen.astype(np.float32)
 
 
+def as_nets(net: Any) -> list[Any]:
+    """``net`` as a list: a population's networks, or the one network."""
+    return list(net) if isinstance(net, (list, tuple)) else [net]
+
+
+def check_agents(agents: Any, n_hands: int, nets: list[Any]) -> np.ndarray | None:
+    """Validate a seating table: int64[n_hands, 4], each entry a net index.
+
+    ``None`` is the single network in every seat, and is refused beside
+    more than one network -- a population with no seating would put
+    every row through agent 0 without complaint.
+    """
+    if agents is None:
+        if len(nets) != 1:
+            raise ValueError(f"{len(nets)} networks and no seating to route them")
+        return None
+    table = np.asarray(agents, dtype=np.int64)
+    if table.shape != (n_hands, NUM_SEATS):
+        raise ValueError(f"seating is {table.shape}, expected {(n_hands, NUM_SEATS)}")
+    if table.min() < 0 or table.max() >= len(nets):
+        raise ValueError(f"seating names agents outside 0..{len(nets) - 1}")
+    return table
+
+
+def routed_step(
+    nets: list[Any],
+    owner: np.ndarray,
+    gather: Any,
+    temperature: float,
+    greedy: bool,
+    rng: np.random.Generator,
+    spans: Any = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Each row through its owner's network. -> ``(slots, logp, value)``.
+
+    ``owner[i]`` indexes ``nets`` and ``gather(idx)`` returns
+    ``(ObsBatch, privileged)`` for rows ``idx``. Owners are visited in
+    index order and each samples from ``rng`` in turn, so with one owner
+    this is exactly the unrouted forward: same batch, same draws.
+    """
+    n = len(owner)
+    slots = np.empty(n, dtype=np.int64)
+    logp = np.empty(n, dtype=np.float32)
+    value = np.empty(n, dtype=np.float32)
+    for agent in np.unique(owner):
+        idx = np.nonzero(owner == agent)[0]
+        with _span(spans, "gather"):
+            obs, privileged = gather(idx)
+        with _span(spans, "forward"):
+            out, values = _evaluate(nets[int(agent)], obs, privileged)
+        with _span(spans, "sample"):
+            slots[idx], logp[idx] = _choose(
+                out.logits, obs.candidate_mask, temperature, greedy, rng
+            )
+            value[idx] = values.detach().float().cpu().numpy()
+    return slots, logp, value
+
+
 def _combine(buffer: RolloutBuffer, row: int, level_weight: np.float32) -> None:
     """Rewrite ``reward`` from its two terms.
 
@@ -384,6 +442,7 @@ def collect(
     pool: int | None = None,
     amp: bool = False,
     starts: Any = None,
+    agents: Any = None,
 ) -> dict[str, float]:
     """Play ``n_hands`` self-play hands into ``buffer``.
 
@@ -394,6 +453,11 @@ def collect(
     critic, reading the four hands and the kitty through
     ``privileged_view``, records the value. A bare ``TractorNet`` also
     works and falls back to its own value head.
+
+    A population passes a list of networks as ``net`` and ``agents``,
+    int64[n_hands, 4]: the network in each seat of each hand, in the
+    order the hands start. Every row is then acted and valued by its
+    seat's network, and its critic is the one that records the value.
 
     ``temperature`` scales the logits before sampling and ``greedy`` takes
     the argmax instead. ``level_weight`` weighs the terminal term against
@@ -407,7 +471,8 @@ def collect(
     guarantee room for another whole one, so a caller that sizes the
     buffer too small gets fewer hands rather than a half-written one.
     """
-    cfg = cfg or getattr(net, "cfg", None) or ModelConfig()
+    nets = as_nets(net)
+    cfg = cfg or getattr(nets[0], "cfg", None) or ModelConfig()
     if cfg.max_candidates != buffer.candidates.shape[1]:
         raise ValueError(
             f"cfg.max_candidates {cfg.max_candidates} does not match the "
@@ -418,6 +483,7 @@ def collect(
     n_hands = int(n_hands)
     if n_hands < 1:
         raise ValueError(f"n_hands must be positive, got {n_hands}")
+    seating = check_agents(agents, n_hands, nets)
 
     hand_size, _kitty = deal_sizes(DECKS)
     # A hard ceiling on the decisions in one hand: every decision sheds at
@@ -446,6 +512,8 @@ def collect(
     # together.
     filled = len(buffer)
     next_episode = 0 if filled == 0 else int(buffer.episode[:filled].max()) + 1
+    # A hand's index into ``starts`` and ``agents`` is its episode less this.
+    first_episode = next_episode
 
     active: list[_InFlight] = []
     started = 0
@@ -458,9 +526,10 @@ def collect(
     forwards = 0
     batch_total = 0
 
-    was_training = getattr(net, "training", False)
-    if hasattr(net, "eval"):
-        net.eval()
+    was_training = [getattr(n, "training", False) for n in nets]
+    for n in nets:
+        if hasattr(n, "eval"):
+            n.eval()
     started_at = time.perf_counter()
     try:
         with torch.no_grad(), torch.autocast(
@@ -486,31 +555,34 @@ def collect(
 
                 packed = [_pack(hand, cache, cfg, spans) for hand in active]
 
-                obs = obs_batch_from_arrays(
-                    np.stack([d.history for d in packed]),
-                    np.array([d.history_len for d in packed], dtype=np.int64),
-                    np.stack([d.context for d in packed]),
-                    np.stack([d.unseen for d in packed]),
-                    np.stack([d.planes for d in packed]),
-                    np.stack([d.cards for d in packed]),
-                    np.stack([d.candidates for d in packed]),
-                    np.stack([d.candidate_mask for d in packed]),
-                    device=device,
-                )
-                privileged = torch.from_numpy(
-                    np.stack([d.privileged for d in packed]).astype(np.float32)
-                ).to(device)
-
-                with _span(spans, "forward"):
-                    out, values = _evaluate(net, obs, privileged)
-
-                with _span(spans, "sample"):
-                    slots, chosen_logp = _choose(
-                        out.logits, obs.candidate_mask, temperature, greedy, rng
+                def gather(idx: np.ndarray) -> tuple[Any, torch.Tensor]:
+                    sel = [packed[i] for i in idx]
+                    obs = obs_batch_from_arrays(
+                        np.stack([d.history for d in sel]),
+                        np.array([d.history_len for d in sel], dtype=np.int64),
+                        np.stack([d.context for d in sel]),
+                        np.stack([d.unseen for d in sel]),
+                        np.stack([d.planes for d in sel]),
+                        np.stack([d.cards for d in sel]),
+                        np.stack([d.candidates for d in sel]),
+                        np.stack([d.candidate_mask for d in sel]),
+                        device=device,
                     )
-                    value_np = (
-                values.detach().float().cpu().numpy().astype(np.float32)
-            )
+                    privileged = torch.from_numpy(
+                        np.stack([d.privileged for d in sel]).astype(np.float32)
+                    ).to(device)
+                    return obs, privileged
+
+                if seating is None:
+                    owner = np.zeros(len(packed), dtype=np.int64)
+                else:
+                    owner = seating[
+                        [hand.episode - first_episode for hand in active],
+                        [d.seat for d in packed],
+                    ]
+                slots, chosen_logp, value_np = routed_step(
+                    nets, owner, gather, temperature, greedy, rng, spans
+                )
 
                 with _span(spans, "step"):
                     finished: list[int] = []
@@ -559,8 +631,9 @@ def collect(
                 for i in reversed(finished):
                     active.pop(i)
     finally:
-        if was_training and hasattr(net, "train"):
-            net.train()
+        for n, was in zip(nets, was_training):
+            if was and hasattr(n, "train"):
+                n.train()
     elapsed = time.perf_counter() - started_at
 
     return {

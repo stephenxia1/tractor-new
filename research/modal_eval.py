@@ -86,7 +86,10 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
     declare_net = None
     bury_net = None
     if pre_play in ("agent", "agent-heur", "agent-critic", "agent-policy"):
-        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        from tractor.train.population import read_checkpoint
+
+        # `pop/final.pt#k`: agent k of a population, in the usual layout.
+        blob = read_checkpoint(checkpoint)
         if blob.get("declare") is not None:
             declare_net = DeclareNet()
             declare_net.load_state_dict(blob["declare"]["model"])
@@ -168,9 +171,11 @@ def play_gpu(checkpoint: str, bot: str, deals: int, seed: int,
 
 
 def _label(path: str) -> str:
-    """`/vol/v2-points/checkpoints/final.pt` -> `v2-points/final`."""
+    """`/vol/v2-points/checkpoints/final.pt` -> `v2-points/final`, and a
+    population's `/vol/pop8/checkpoints/final.pt#3` -> `pop8/final#3`."""
     parts = path.rstrip("/").split("/")
-    return f"{parts[-3]}/{parts[-1].removesuffix('.pt')}" if len(parts) >= 3 else path
+    return (f"{parts[-3]}/{parts[-1].replace('.pt', '')}"
+            if len(parts) >= 3 else path)
 
 
 @app.local_entrypoint()

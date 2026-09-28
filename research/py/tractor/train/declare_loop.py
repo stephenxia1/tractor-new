@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from ..nn.declare import DeclareNet
 from ..nn.features import Cache
-from .starts import PrePlayConfig, critic_values, make_starts
+from .starts import DeclareRows, PrePlayConfig, critic_values, make_starts
 
 __all__ = ["DeclareTrainConfig", "DeclareLearner"]
 
@@ -87,7 +87,21 @@ class DeclareLearner:
         if len(rows) == 0:
             return {**stats, "declare/rows": 0.0}
         ret = values[rows.hand, rows.seat].astype(np.float32) * cfg.reward_scale
+        return {
+            **stats,
+            **self.update(rows, ret),
+            "declare/critic_landlord_value": float(
+                np.mean([values[i, s.landlord] for i, s in enumerate(starts)])
+            ),
+        }
 
+    def update(self, rows: DeclareRows, ret: np.ndarray) -> dict[str, float]:
+        """PPO on declaration rows; ``ret[i]`` is row ``i``'s scaled return.
+
+        Apart from ``step`` so that a population, which deals one batch
+        for all its agents, can hand each agent's learner its own rows.
+        """
+        cfg = self.cfg
         dev = self.device
         obs = torch.from_numpy(rows.obs).to(dev)
         priv = torch.from_numpy(rows.privileged).to(dev)
@@ -126,17 +140,10 @@ class DeclareLearner:
                 count += 1
         self.net.eval()
 
-        # How much a declaration was worth to the team that made it: the
-        # declaring team's play-start value, against hands nobody declared.
         declared = rows.action != 0
-        out = {
-            **stats,
+        return {
             **{f"declare/{k}": v / max(count, 1) for k, v in losses.items()},
             "declare/rows": float(n),
             "declare/return_mean": float(ret.mean()),
             "declare/declare_rate": float(declared.mean()),
-            "declare/critic_landlord_value": float(
-                np.mean([values[i, s.landlord] for i, s in enumerate(starts)])
-            ),
         }
-        return out

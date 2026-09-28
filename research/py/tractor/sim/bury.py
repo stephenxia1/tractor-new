@@ -518,6 +518,9 @@ class BuryRows:
     def __len__(self) -> int:
         return len(self.action)
 
+    def subset(self, idx: np.ndarray) -> "BuryRows":
+        return BuryRows(**{k: v[idx] for k, v in vars(self).items()})
+
 
 def bury_context(
     level_rank: int, trump_suit: int, step: int, standing_tier: int,
