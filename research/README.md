@@ -720,20 +720,74 @@ runs showed:
   carries a fixed ~3 ms; two splits added ~12 s of forward a step in
   training (22.6 → 34.8 s), three were worse still in the profile.
   `forward_chunks` stays at 1.
-- **The update is dispatch-bound.** Shrinking the critic 3.8× moved it
-  from 75.7 s to 73.8 s. A 256-row minibatch is ~50 ms of forward,
-  backward and optimiser for well under 10 ms of arithmetic on an L40S.
-  The levers are fewer, larger kernels -- a larger minibatch (a change to
-  the optimisation, the user's call), CUDA graphs or `torch.compile`
-  over fixed padded shapes, or one stacked update for all eight agents.
-- **The rollout's parent and workers take turns** (~23 s forward, ~18 s
-  waiting); overlapping them -- two half-pools per worker -- is worth up
-  to ~18 s a step.
+- **The update looked dispatch-bound, and is not.** Shrinking the critic
+  3.8× moved it only from 75.7 s to 73.8 s, but that compared two
+  containers; measured in one (below), the cost per row is flat from 256
+  to 1024 rows a minibatch. It is arithmetic and memory traffic.
 - **Host CPUs differ between containers** enough to swamp these savings
   when two runs are compared; compare inside one container.
 
-A v6 step at 4096 hands from random weights is ~125–135 s; the pre-play
-step is ~26 s, two thirds of it the burial network's PPO update.
+### A shared critic, and a step that costs 80 s (2026-09-28)
+
+**The critic is shared** (the user's call): one `CardCritic` for all
+eight agents, trained on every row of every step (`train/critic_learner.py`),
+reading the raw history -- eight agents have eight history encoders, so
+a shared critic can read none of them -- and told which agent sits in
+each seat. The agents are actors alone. It values a whole round in one
+forward, and its explained variance in the smoke run was +0.40 at step 2,
+where the per-agent critics were at +0.008: it learns from eight times
+the rows. On the bake-off data, reading raw history rather than a
+trained actor's encoding costs it 0.08 of held-out explained variance
+(0.295 against 0.376, `evals/2026-09-28/critic-bakeoff-raw.json`) -- an
+unequal comparison, since the encoding came from v5's fully trained
+actor and pop8's actors start from nothing.
+
+**Optimisations**, measured in one container each (`modal run
+modal_perf.py::opt_bench`, `::opt_probe`; `evals/2026-09-28/opt-bench-v6.json`,
+`opt-probe-v6.json`):
+
+| | eager | optimised |
+| --- | --- | --- |
+| rollout round, 4096 hands | 42.8 s lockstep | **28.4 s** overlapped, pool 4096 |
+| actor update, per row | 135 µs | **95 µs** compiled |
+| shared critic training step, 256 rows | 12.8 ms | **8.6 ms** compiled |
+| shared critic forward, 1536 rows | 32.7 ms | 21.2 ms compiled |
+| actor forward, 192 rows | 7.4 ms | 5.4 ms compiled |
+
+- **Rollout overlap** (`--rollout-overlap --pool 4096`): each worker's
+  hands are two halves taking turns with the parent's forward, so a
+  round costs about the larger of the parent's and the workers' time,
+  not their sum. Doubling the pool without the overlap bought nothing
+  (41.0 s); the doubled pool keeps each half's forward as wide.
+- **`torch.compile`** (`--compile`) on fixed shapes: every minibatch
+  exactly 256 rows (the ragged tails skipped, 0.014% of rows), history
+  trimmed to a multiple of 16 (`model.history_bucket`), the model in
+  `static_shapes` mode so it reads no length back to the host. At most
+  eight widths, each compiled once and shared by all eight agents (a
+  second agent recompiled nothing); loss within bf16 rounding of eager.
+  The first compile attempt's two failures were exactly those: new
+  shapes every minibatch, and inductor failing to lower the mask's
+  `torch.arange` -- now a cumulative sum of ones.
+- **Not worth it**: larger minibatches (flat per-row cost: 141 / 122 /
+  128 µs at 256 / 512 / 1024); CUDA graphs (`reduce-overhead`, 5-13×
+  slower in training); a history-length split of the rollout forward;
+  stacking the eight agents' updates with `vmap` (the backward fails in
+  the memory-efficient attention kernel under `vmap`).
+
+**All of it together** (`pop8v6c-smoke`, v6 with the shared critic,
+10 workers, overlap, pool 4096, compiled; from random weights, so hands
+run ~88 decisions):
+
+| per step | v6, before | now |
+| --- | --- | --- |
+| collect | ~55–60 s | 24.2 s |
+| actor updates | ~74 s (with their critics) | 37.4 s |
+| shared critic update | – | 13.8 s |
+| **step** | **~135 s** | **~80 s** |
+
+Compiling costs ~5–6 minutes spread over the first steps of a launch
+(and once more when a history width first appears). The pre-play step
+is still ~26 s, most of it the burial network's PPO update, uncompiled.
 
 ---
 

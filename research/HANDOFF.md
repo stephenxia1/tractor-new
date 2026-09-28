@@ -314,17 +314,24 @@ nothing.
    *The critic's width, and where a v6 step goes*. Add `--arch v6
    --rollout-workers 10` to the smoke command above to rerun it.
 
+   **Then the critic became shared and the step was optimised** (the
+   user's calls, 2026-09-28): one critic for all eight agents, the
+   rollout overlapped, the update compiled. A step is ~80 s where it was
+   ~135 s (README § *A shared critic, and a step that costs 80 s*;
+   `pop8v6c-smoke`).
+
    **The proposed run** (the warm-up length and step count are proposals,
    not the user's decisions yet). A Modal function stops at 24 hours. At
-   the measured ~140 s a step early, 300 warm-up steps are ~11.7 h and a
-   200-step block ~7.5 h plus ~45 min of pre-play, so a first launch fits
-   about 550 steps. Resume with `--resume /vol/pop8/checkpoints/final.pt`,
-   the same `--arch v6` and a larger absolute `--steps` (confirm the first
-   line reads `[551/...]`):
+   ~80 s a step, 300 warm-up steps are ~6.7 h and a 200-step block ~4.5 h
+   plus ~45 min of pre-play, so a first launch fits about 900 steps.
+   Resume with `--resume /vol/pop8/checkpoints/final.pt`, the same flags
+   and a larger absolute `--steps` (confirm the first line reads
+   `[901/...]`):
 
    ```bash
    modal run --detach modal_train.py::launch --gpu l40s --name pop8 --arch v6 \
-     --rollout-workers 10 --population 8 --reshuffle-every 10 --hands 4096 --steps 550 \
+     --rollout-workers 10 --rollout-overlap --pool 4096 --compile \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 900 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
      --length-buckets 4 --checkpoint-every 50 --keep-last 6
