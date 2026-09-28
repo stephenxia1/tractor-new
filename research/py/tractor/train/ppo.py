@@ -60,7 +60,6 @@ arriving here are float32 whatever the autocast state.
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -70,7 +69,14 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..nn.features import PLANE_KITTY, PLANE_PLAYED
-from ..nn.model import NUM_OUTCOMES, NUM_PRIVILEGED_ROWS, ActorCritic, ObsBatch
+from ..nn.model import (
+    NUM_OUTCOMES,
+    NUM_PRIVILEGED_ROWS,
+    ActorCritic,
+    ObsBatch,
+    history_bucket,
+    static_shapes,
+)
 from .gae import num_rows
 from .rollout import MAX_LEVEL_GAIN
 
@@ -211,27 +217,32 @@ class PPOConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     check_actions: bool = True
 
-    # ``compile`` applies torch.compile to the training graph. It is
-    # off because it was measured, and it loses badly.
+    # ``compile`` runs ``losses`` -- forward and loss; autograd compiles
+    # the backward -- through ``torch.compile(dynamic=False)`` on fixed
+    # shapes (``fixed_shapes``, which it implies).
     #
-    # In isolation it wins: a fixed batch of 256 replayed twenty times
-    # on an A10 runs 82.7 ms eager against 62.9 ms compiled under bf16.
-    # In the training loop the same flag took the update span from
-    # 17.9 s to 171.0 s, a 9.6x regression, and the step from 28 s to
-    # 183 s. The difference is that the benchmark replays one batch
-    # while the loop draws a fresh minibatch each iteration and the
-    # last of every epoch is ragged -- 24 rows against 256 -- so the
-    # backend keeps recompiling for work the benchmark never does.
+    # The first attempt (the v2-era net) lost 9.6x in the loop, 17.9 s
+    # to 171.0 s an update: minibatches of a new size (each epoch's
+    # ragged last) and of a new history width (the encoder trimmed to
+    # each batch's longest, read on the host -- a graph break too) kept
+    # it recompiling. Fixed shapes remove both: every minibatch is
+    # exactly ``minibatch`` rows -- the ragged tails are skipped, 0.014%
+    # of rows at 256 -- and its history is trimmed to a multiple of 16,
+    # so there are at most eight widths, each compiled once and shared
+    # by every learner of the same architecture (a population's agents
+    # reuse one another's graphs). The legal-action check runs eagerly,
+    # beside the compiled function, since it reads back to the host.
     #
-    # Making it pay would mean padding every minibatch to a fixed
-    # width and passing dynamic=False, for a gain the isolated figures
-    # cap at about 1.3x. Left off until that is worth doing.
-    #
-    # Separately, the inference path cannot be compiled at all today:
-    # under ``no_grad`` inductor propagates a symbolic size into the
-    # ``torch.arange`` in ``_length_mask`` and fails with "Expected a
-    # number but got Identity". dynamic=False does not avoid it.
+    # Measured 2026-09-28 on an L40S (v6, actor only, 4096-hand round):
+    # 135 -> 95 us a row, a third off, loss within bf16 rounding of
+    # eager; about four minutes of compiling the first time each width
+    # is seen. The "reduce-overhead" mode (CUDA graphs) was 5-13x slower
+    # and is not offered.
     compile: bool = False
+    # Minibatches of exactly ``minibatch`` rows and history trimmed to
+    # ``model.history_bucket`` widths, run in ``model.static_shapes``.
+    # What ``compile`` needs; on its own it saves ~4% eager.
+    fixed_shapes: bool = False
 
 
 # --- loss pieces ----------------------------------------------------------
@@ -427,6 +438,17 @@ def _minibatches(
     return [out[i] for i in perm]
 
 
+def _check_legal(obs: ObsBatch, batch: dict[str, Tensor]) -> None:
+    """``PPOConfig.check_actions``, run eagerly beside a compiled loss."""
+    action = batch["action"].to(obs.candidate_mask.device, torch.int64).reshape(-1, 1)
+    legal = obs.candidate_mask.gather(1, action)
+    if not bool(legal.all()):
+        raise ValueError(
+            f"{int((~legal).sum())} stored action(s) index an illegal candidate slot; "
+            "the rollout and the learner disagree about the move list"
+        )
+
+
 def _make_optimiser(
     net: torch.nn.Module, cfg: PPOConfig, device: torch.device
 ) -> torch.optim.Optimizer:
@@ -488,19 +510,17 @@ class PPOLearner:
         self.run = run
         self.opt = _make_optimiser(net, cfg, self.device)
         self.amp = bool(cfg.bf16) and _bf16_supported(self.device)
-        # Compiled graph for the update; ``self.net`` stays the
-        # eager module so that parameters, state_dict and the
-        # rollout all address the same object.
         self.graph = net
-        if cfg.compile and self.device.type == "cuda":
-            try:
-                self.graph = torch.compile(net)
-            except Exception as exc:  # pragma: no cover
-                warnings.warn(
-                    f"ppo: torch.compile unavailable "
-                    f"({type(exc).__name__}: {exc}); running eager",
-                    stacklevel=2,
-                )
+        # See ``PPOConfig.compile``. ``self.net`` stays the eager module,
+        # so parameters, state_dict and the rollout address one object.
+        self._losses = self.losses
+        self.fixed = bool(cfg.compile or cfg.fixed_shapes)
+        if cfg.compile:
+            import torch._dynamo as dynamo
+
+            # Eight widths per compiled function; room to spare.
+            dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)
+            self._losses = torch.compile(self.losses, dynamic=False)
         # Optimiser steps taken, across every call to ``update``. Used as
         # the x-axis for the telemetry rows this learner logs.
         self.steps = 0
@@ -557,7 +577,7 @@ class PPOLearner:
         level = batch["reward_level"].to(self.device, torch.float32).reshape(-1)
         done = batch["done"].to(self.device, torch.bool).reshape(-1)
 
-        if cfg.check_actions:
+        if cfg.check_actions and not torch.compiler.is_compiling():
             legal = obs.candidate_mask.gather(1, action)
             if not bool(legal.all()):
                 bad = int((~legal).sum())
@@ -718,11 +738,25 @@ class PPOLearner:
         ratio_clamped = 0
 
         self.net.train()
+        skipped_ragged = 0
         for epoch in range(max(0, int(cfg.epochs))):
             order = selected[torch.randperm(m).numpy()]
             for idx in _minibatches(order, buffer, size, int(cfg.length_buckets)):
+                if self.fixed and len(idx) != size and m >= size:
+                    # A new size is a new graph; the ragged tails are a
+                    # sliver of the rows (see ``PPOConfig.compile``).
+                    skipped_ragged += len(idx)
+                    continue
                 obs, privileged, batch = buffer.as_torch(idx, self.device)
-                loss, parts = self.losses(obs, privileged, batch)
+                if self.fixed:
+                    width = history_bucket(int(np.asarray(buffer.history_len)[idx].max()))
+                    obs = obs._replace(history=obs.history[:, :width].contiguous())
+                    if cfg.check_actions and cfg.compile:
+                        _check_legal(obs, batch)
+                    with static_shapes():
+                        loss, parts = self._losses(obs, privileged, batch)
+                else:
+                    loss, parts = self._losses(obs, privileged, batch)
 
                 if cfg.target_kl is not None:
                     if float(parts["approx_kl"]) > float(cfg.target_kl):
@@ -780,6 +814,7 @@ class PPOLearner:
         metrics["epochs_run"] = float(epochs_run)
         metrics["early_stop"] = 1.0 if early_stop else 0.0
         metrics["rows"] = float(m)
+        metrics["skipped_ragged_rows"] = float(skipped_ragged)
         metrics["nonfinite_minibatches"] = float(nonfinite)
         # Counts, so they stay counts: zero clamped rows and zero
         # terminal rows are both true statements about an update that

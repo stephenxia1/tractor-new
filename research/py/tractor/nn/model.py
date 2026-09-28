@@ -309,12 +309,24 @@ def _static() -> bool:
     return _STATIC or torch.compiler.is_compiling()
 
 
+HISTORY_BUCKET = 16
+
+
+def history_bucket(width: int, cap: int = MAX_HISTORY) -> int:
+    """The static width a batch whose longest history is ``width`` runs at:
+    up to a multiple of 16, so a compiled model sees at most eight."""
+    return min(cap, max(HISTORY_BUCKET, -(-int(width) // HISTORY_BUCKET) * HISTORY_BUCKET))
+
+
 def _length_mask(lengths: Tensor, size: int) -> Tensor:
     """bool[B, size]: True for the first ``lengths[b]`` positions."""
     if _static():
         # No cache: a module-level dict is a side effect a trace cannot
-        # keep, and the arange is one small kernel.
-        idx = torch.arange(size, device=lengths.device)
+        # keep. And no ``torch.arange``: inductor (torch 2.6) fails to
+        # lower it here -- "Expected a number but got Identity", the error
+        # the first compile attempt hit, reproduced in the shared critic
+        # on 2026-09-28 -- while a cumulative sum of ones compiles.
+        idx = torch.ones(size, dtype=torch.int64, device=lengths.device).cumsum(0) - 1
         return idx.unsqueeze(0) < lengths.unsqueeze(1).to(idx.dtype)
     device = lengths.device
     key = (size, device.type, -1 if device.index is None else device.index)
@@ -1920,6 +1932,7 @@ __all__ = [
     "Critic",
     "relative_seat_agents",
     "shared_critic",
+    "history_bucket",
     "static_shapes",
     "HistoryEncoder",
     "MASK_LOGIT",

@@ -662,3 +662,260 @@ def opt_bench(arch: str = "v6", hands: int = 4096, n_timed: int = 60) -> None:
     bench/opt-v6.json``) and the lines stream to ``modal app logs``."""
     call = opt_bench_l40s.spawn(arch, hands, n_timed)
     print(f"spawned {call.object_id}; result -> /vol/bench/opt-{arch}.json")
+
+
+# --- follow-up: the critic's compile failure, its training compile, stacking ----
+
+
+def _opt_probe(arch: str, hands: int) -> dict:
+    """What ``opt_bench`` left open.
+
+    1. The shared critic's inference compile failed ("Expected a number
+       but got Identity") where the actor's, through the same static mask,
+       did not: the full traceback, then the same compile with the mask
+       built without ``torch.arange``.
+    2. The shared critic's training step, compiled -- the update arms only
+       ran actors.
+    3. Eight agents stacked by ``vmap``, all in one mode this time.
+    """
+    import time
+    import traceback
+    from dataclasses import replace
+
+    import numpy as np
+    import torch
+    import torch._dynamo
+    import torch.nn.functional as F
+
+    import tractor.nn.model as M
+    from tractor.nn.arch import ARCHES
+    from tractor.train.buffer import RolloutBuffer
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import hand_agents, seating
+
+    torch._dynamo.config.cache_size_limit = 256
+    dev = torch.device("cuda")
+
+    def sync() -> None:
+        torch.cuda.synchronize()
+
+    base = M.ModelConfig(**ARCHES[arch]["model"])
+    actor_cfg = replace(base, critic_kind="none")
+    torch.manual_seed(0)
+    nets = [M.ActorCritic(actor_cfg).to(dev) for _ in range(8)]
+    critic = M.shared_critic(base, 8).to(dev)
+    rng = np.random.default_rng(0)
+    seat_of = hand_agents(seating(0, 0, 8), hands)
+    buf = RolloutBuffer(hands * 100, actor_cfg)
+    with RolloutPool(cfg=actor_cfg, workers=10, hands_per_round=hands) as pool:
+        buf, _st = pool.collect(nets, rng, buf, n_hands=hands, device=dev, pool=2048,
+                                amp=True, level_weight=0.0, agents=seat_of, critic=critic)
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    n = len(buf)
+    out: dict = {"rows": n}
+
+    def bucket(width: int) -> int:
+        return min(128, max(16, -(-width // 16) * 16))
+
+    def load(idx):
+        obs, priv, sc = buf.as_torch(idx, dev)
+        w = bucket(int(buf.history_len[idx].max()))
+        return obs._replace(history=obs.history[:, :w].contiguous()), priv, sc
+
+    idx = np.sort(rng.choice(n, size=1536, replace=False))
+    obs, priv, sc = load(idx)
+    seats = torch.from_numpy(M.relative_seat_agents(
+        seat_of[buf.episode[idx]], buf.seat[idx])).to(dev)
+
+    def critic_call():
+        return critic(obs.history, obs.history_len, priv, context=obs.context,
+                      cards=obs.cards, trick=obs.planes[:, 5:9], seat_agents=seats)
+
+    def timed_inference(fn, label):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16), M.static_shapes():
+            sync()
+            t0 = time.perf_counter()
+            fn()
+            fn()
+            sync()
+            first = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            for _ in range(30):
+                fn()
+            sync()
+        ms = (time.perf_counter() - t0) / 30 * 1e3
+        print(f"  probe {label:34} {ms:7.2f} ms  first {first:6.1f}s", flush=True)
+        return {"ms": ms, "first_s": first}
+
+    critic.eval()
+    out["critic_eager"] = timed_inference(critic_call, "critic 1536 eager")
+
+    # 1a. The failure, with its traceback.
+    try:
+        out["critic_compile"] = timed_inference(
+            torch.compile(critic_call, dynamic=False), "critic 1536 compile")
+    except Exception:  # noqa: BLE001
+        tb = traceback.format_exc()
+        out["critic_compile"] = {"error": tb[-6000:]}
+        print("  probe critic compile FAILED; traceback tail:", flush=True)
+        for line in tb.splitlines()[-60:]:
+            print("    | " + line, flush=True)
+    torch._dynamo.reset()
+
+    # 1b. The mask without torch.arange: a cumulative sum of ones.
+    original = M._length_mask
+
+    def mask_no_arange(lengths, size):
+        if M._static():
+            idx_ = torch.ones(size, dtype=lengths.dtype, device=lengths.device).cumsum(0) - 1
+            return idx_.unsqueeze(0) < lengths.unsqueeze(1)
+        return original(lengths, size)
+
+    M._length_mask = mask_no_arange
+    try:
+        out["critic_compile_no_arange"] = timed_inference(
+            torch.compile(critic_call, dynamic=False), "critic 1536 compile, no arange")
+    except Exception:  # noqa: BLE001
+        tb = traceback.format_exc()
+        out["critic_compile_no_arange"] = {"error": tb[-4000:]}
+        print("  probe critic compile (no arange) FAILED:", flush=True)
+        for line in tb.splitlines()[-30:]:
+            print("    | " + line, flush=True)
+    finally:
+        M._length_mask = original
+    torch._dynamo.reset()
+
+    # 2. The critic's training step, eager and compiled.
+    def train_step_fn(compiled: bool):
+        opt = torch.optim.AdamW(critic.parameters(), lr=3e-4, fused=True)
+
+        def step(o, p, s, target):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                v = critic(o.history, o.history_len, p, context=o.context, cards=o.cards,
+                           trick=o.planes[:, 5:9], seat_agents=s)
+            return F.mse_loss(v.float(), target)
+
+        fn = torch.compile(step, dynamic=False) if compiled else step
+        mb = [np.sort(rng.choice(n, size=256, replace=False)) for _ in range(40)]
+        # Fixed widths: every minibatch trimmed to its bucket.
+        loaded = [load(i) for i in mb]
+        seats_mb = [torch.from_numpy(M.relative_seat_agents(
+            seat_of[buf.episode[i]], buf.seat[i])).to(dev) for i in mb]
+        critic.train()
+        with M.static_shapes():
+            sync()
+            t0 = time.perf_counter()
+            seen = set()
+            for (o, p, s_), s in zip(loaded, seats_mb):
+                if o.history.shape[1] in seen:
+                    continue
+                seen.add(o.history.shape[1])
+                loss = fn(o, p, s, s_["ret"].float())
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+            sync()
+            first = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            for (o, p, s_), s in zip(loaded, seats_mb):
+                loss = fn(o, p, s, s_["ret"].float())
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+            sync()
+        ms = (time.perf_counter() - t0) / len(mb) * 1e3
+        label = "compiled" if compiled else "eager"
+        print(f"  probe critic train step {label:9} {ms:7.2f} ms/mb  first {first:6.1f}s  "
+              f"widths {len(seen)}", flush=True)
+        return {"ms_per_minibatch": ms, "first_s": first, "widths": len(seen)}
+
+    for compiled in (False, True):
+        key = "critic_train_" + ("compiled" if compiled else "eager")
+        try:
+            out[key] = train_step_fn(compiled)
+        except Exception:  # noqa: BLE001
+            tb = traceback.format_exc()
+            out[key] = {"error": tb[-4000:]}
+            print(f"  probe {key} FAILED:", flush=True)
+            for line in tb.splitlines()[-30:]:
+                print("    | " + line, flush=True)
+        torch._dynamo.reset()
+
+    # 3. Eight agents stacked, all in training mode.
+    try:
+        from torch.func import functional_call, stack_module_state, vmap
+
+        for net in nets:
+            net.train()
+        mbs = [np.sort(rng.choice(n, size=256, replace=False)) for _ in range(8)]
+        w = max(bucket(int(buf.history_len[i].max())) for i in mbs)
+        loaded = [buf.as_torch(i, dev) for i in mbs]
+        stacked_obs = M.ObsBatch(*(
+            torch.stack([o[0][f][:, :w] if f == 0 else o[0][f] for o in loaded])
+            for f in range(len(M.ObsBatch._fields))))
+        stacked_priv = torch.stack([o[1] for o in loaded])
+        params, buffers = stack_module_state(nets)
+        for p in params.values():
+            p.requires_grad_(True)
+        base_net = nets[0]
+
+        def one(p, b, o, pr):
+            out_, _v = functional_call(base_net, (p, b), (M.ObsBatch(*o), pr))
+            return out_.log_probs.logsumexp(-1).mean() + out_.value.mean()
+
+        def run_stacked():
+            with M.static_shapes(), torch.autocast("cuda", dtype=torch.bfloat16):
+                losses = vmap(one, randomness="different")(
+                    params, buffers, tuple(stacked_obs), stacked_priv)
+            losses.sum().backward()
+
+        def run_loop():
+            with M.static_shapes(), torch.autocast("cuda", dtype=torch.bfloat16):
+                total = 0.0
+                for k, net in enumerate(nets):
+                    o = M.ObsBatch(*(t[k] for t in stacked_obs))
+                    out_, _v = net(o, stacked_priv[k])
+                    total = total + out_.log_probs.logsumexp(-1).mean() + out_.value.mean()
+            total.backward()
+
+        timings = {}
+        for name, fn in (("stacked (vmap)", run_stacked), ("eight in a loop", run_loop)):
+            fn()
+            sync()
+            t0 = time.perf_counter()
+            for _ in range(10):
+                fn()
+            sync()
+            timings[name] = (time.perf_counter() - t0) / 10 * 1e3
+            print(f"  probe eight agents fwd+bwd, {name:16} {timings[name]:7.1f} ms", flush=True)
+        out["stacked"] = {"width": w, "ms": timings}
+    except Exception:  # noqa: BLE001
+        tb = traceback.format_exc()
+        out["stacked"] = {"error": tb[-4000:]}
+        print("  probe stacked FAILED:", flush=True)
+        for line in tb.splitlines()[-30:]:
+            print("    | " + line, flush=True)
+    return out
+
+
+@app.function(image=image, gpu="L40S", volumes={VOLUME: volume}, timeout=2 * 3600,
+              cpu=12.0, memory=65536)
+def opt_probe_l40s(arch: str, hands: int) -> dict:
+    import json
+    import os
+
+    res = _opt_probe(arch, hands)
+    os.makedirs(f"{VOLUME}/bench", exist_ok=True)
+    with open(f"{VOLUME}/bench/opt-probe-{arch}.json", "w") as fh:
+        json.dump(res, fh, indent=2)
+    volume.commit()
+    return res
+
+
+@app.local_entrypoint()
+def opt_probe(arch: str = "v6", hands: int = 1024) -> None:
+    """``modal run --detach modal_perf.py::opt_probe``, spawned; the result
+    lands in ``/vol/bench/opt-probe-<arch>.json``."""
+    call = opt_probe_l40s.spawn(arch, hands)
+    print(f"spawned {call.object_id}; result -> /vol/bench/opt-probe-{arch}.json")

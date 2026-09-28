@@ -557,3 +557,43 @@ def test_the_overlapped_rollout_with_the_shared_critic() -> None:
                                   agents=seat_of, critic=critic, overlap=True)
     _check_round(buf, stats, hands)
     _check_shared_values(critic, buf, seat_of)
+
+
+# --- fixed shapes: what torch.compile needs, exercised eagerly -----------------
+
+
+def test_fixed_shapes_skip_only_ragged_minibatches_and_learn() -> None:
+    from ..train.critic_learner import CriticLearner, CriticTrainConfig
+    from ..train.gae import compute_gae
+    from ..train.ppo import PPOConfig, PPOLearner
+
+    nets, critic = _actors(), _shared()
+    seat_of = hand_agents(_table(9), 4)
+    buf = RolloutBuffer(400, SMALL)
+    collect(nets, np.random.default_rng(3), buf, n_hands=4, device="cpu", cfg=ACTOR_ONLY,
+            pool=4, agents=seat_of, critic=critic)
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    n = len(buf)
+    learner = PPOLearner(nets[0], PPOConfig(minibatch=32, length_buckets=4, epochs=1,
+                                            fixed_shapes=True, bf16=False), "cpu")
+    m = learner.update(buf)
+    assert np.isfinite(m["policy_loss"])
+    # Only minibatches short of 32 rows were skipped, at most one per bucket.
+    assert 0 <= m["skipped_ragged_rows"] < 4 * 32
+    assert m["skipped_ragged_rows"] + m["n_minibatches"] * 32 == n
+
+    seats = relative_seat_agents(seat_of[buf.episode[:n]], buf.seat[:n])
+    fitter = CriticLearner(critic, CriticTrainConfig(minibatch=32, fixed_shapes=True,
+                                                     bf16=False))
+    st = fitter.update(buf, seats)
+    assert np.isfinite(st["critic/value_loss"])
+    assert st["critic/skipped_ragged_rows"] < 4 * 32
+
+
+def test_a_population_trains_on_fixed_shapes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, hands_per_step=4,
+                   ppo={"epochs": 1, "minibatch": 32, "bf16": False, "fixed_shapes": True})
+        out = train_population(cfg)
+        row = out["final"]
+        assert np.isfinite(row["ppo/policy_loss"]) and np.isfinite(row["critic/value_loss"])

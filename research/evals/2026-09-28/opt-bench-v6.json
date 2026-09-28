@@ -1,0 +1,171 @@
+{
+  "collect": {
+    "lockstep, pool 2048": {
+      "seconds": 42.824627693,
+      "forwards": 252,
+      "mean_batch": 1441.4920634920634,
+      "gather": 3.27,
+      "forward": 14.46,
+      "sample": 1.11,
+      "critic": 5.67,
+      "writeback": 0.01,
+      "release": 0.13,
+      "copy_out": 0.24
+    },
+    "overlap, pool 2048": {
+      "seconds": 37.450763906000006,
+      "forwards": 500,
+      "mean_batch": 726.0,
+      "gather": 3.94,
+      "forward": 24.39,
+      "sample": 1.44,
+      "critic": 5.33,
+      "writeback": 0.01,
+      "release": 0.25,
+      "copy_out": 0.26
+    },
+    "overlap, pool 4096": {
+      "seconds": 28.42900304599999,
+      "forwards": 320,
+      "mean_batch": 1138.9625,
+      "gather": 3.52,
+      "forward": 15.61,
+      "sample": 1.19,
+      "critic": 5.0,
+      "writeback": 0.01,
+      "release": 0.17,
+      "copy_out": 0.27
+    },
+    "lockstep, pool 4096": {
+      "seconds": 40.96820237699998,
+      "forwards": 160,
+      "mean_batch": 2272.325,
+      "gather": 3.49,
+      "forward": 13.41,
+      "sample": 1.05,
+      "critic": 5.35,
+      "writeback": 0.0,
+      "release": 0.08,
+      "copy_out": 0.28
+    }
+  },
+  "rows": 363572,
+  "mean_history": 44.18311091063118,
+  "update": {
+    "eager 256": {
+      "minibatch": 256,
+      "static": false,
+      "mode": "eager",
+      "ms_per_minibatch": 36.011440366666626,
+      "us_per_row": 140.6696889322915,
+      "widths": 1,
+      "first_calls_s": 0.8248295340000027
+    },
+    "eager 256 static": {
+      "minibatch": 256,
+      "static": true,
+      "mode": "eager",
+      "ms_per_minibatch": 34.608351416666494,
+      "us_per_row": 135.1888727213535,
+      "widths": 5,
+      "first_calls_s": 0.17120820100004153
+    },
+    "eager 512 static": {
+      "minibatch": 512,
+      "static": true,
+      "mode": "eager",
+      "ms_per_minibatch": 62.32933685000006,
+      "us_per_row": 121.73698603515638,
+      "widths": 5,
+      "first_calls_s": 0.34762919000002057
+    },
+    "eager 1024 static": {
+      "minibatch": 1024,
+      "static": true,
+      "mode": "eager",
+      "ms_per_minibatch": 131.46475924999996,
+      "us_per_row": 128.38355395507807,
+      "widths": 4,
+      "first_calls_s": 0.5399779700000522
+    },
+    "compile 256": {
+      "minibatch": 256,
+      "static": true,
+      "mode": "default",
+      "ms_per_minibatch": 24.266657383333268,
+      "us_per_row": 94.79163040364558,
+      "widths": 5,
+      "first_calls_s": 254.07784974900002
+    },
+    "compile 1024": {
+      "minibatch": 1024,
+      "static": true,
+      "mode": "default",
+      "ms_per_minibatch": 98.59968903333348,
+      "us_per_row": 96.28875882161472,
+      "widths": 4,
+      "first_calls_s": 212.3882401339999
+    },
+    "cudagraphs 256": {
+      "minibatch": 256,
+      "static": true,
+      "mode": "reduce-overhead",
+      "ms_per_minibatch": 450.6652577000011,
+      "us_per_row": 1760.4111628906294,
+      "widths": 5,
+      "first_calls_s": 221.24075494599992
+    },
+    "cudagraphs 1024": {
+      "minibatch": 1024,
+      "static": true,
+      "mode": "reduce-overhead",
+      "ms_per_minibatch": 506.6228298166683,
+      "us_per_row": 494.74885724284013,
+      "widths": 4,
+      "first_calls_s": 153.58526006800014
+    }
+  },
+  "dropped_rows_frac": {
+    "256": 0.00014302531548082698,
+    "512": 0.002959523835718958,
+    "1024": 0.008592520876195109
+  },
+  "cross_agent": {
+    "graphs_after_agent0": 5,
+    "graphs_after_agent1": 5,
+    "agent1_first_calls_s": 0.12376322799991613,
+    "agent0_first_calls_s": 54.55711155500012
+  },
+  "agreement": {
+    "eager": 0.38612908124923706,
+    "compiled": 0.3862714171409607,
+    "eager_trimmed": 0.38612908124923706
+  },
+  "forward": {
+    "actor 192 eager": {
+      "ms": 7.364069866662248,
+      "first_s": 0.022145621000163374
+    },
+    "actor 192 compile": {
+      "ms": 5.347741666666176,
+      "first_s": 32.435988453999926
+    },
+    "actor 192 cudagraphs": {
+      "ms": 5.260100533337209,
+      "first_s": 39.796209807000196
+    },
+    "critic 1536 eager": {
+      "ms": 32.71171900000051,
+      "first_s": 0.06715928800008442
+    },
+    "critic 1536 compile": {
+      "error": "BackendCompilerFailed: backend='inductor' raised:\nTypeError: Expected a number but got Identity:\n\nSet TORCH_LOGS=\"+dynamo\" and TORCHDYNAMO_VERBOSE=1 for more information\n\n\nYou can suppress this exception and fall back to eager by setting:\n    import torch._dynamo\n    torch._dynamo.config.suppress_errors = True\n"
+    },
+    "critic 1536 cudagraphs": {
+      "error": "BackendCompilerFailed: backend='inductor' raised:\nTypeError: Expected a number but got Identity:\n\nSet TORCH_LOGS=\"+dynamo\" and TORCHDYNAMO_VERBOSE=1 for more information\n\n\nYou can suppress this exception and fall back to eager by setting:\n    import torch._dynamo\n    torch._dynamo.config.suppress_errors = True\n"
+    }
+  },
+  "stacked": {
+    "error": "RuntimeError: stack_module_state: Expected all models to have the same training/eval mode."
+  }
+}

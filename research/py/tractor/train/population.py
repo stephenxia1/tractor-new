@@ -333,7 +333,7 @@ def build_critic(cfg: PopulationConfig, device: torch.device) -> CriticLearner |
     return CriticLearner(critic, CriticTrainConfig(
         lr=ppo_cfg.lr, minibatch=ppo_cfg.minibatch, epochs=ppo_cfg.epochs,
         length_buckets=ppo_cfg.length_buckets, max_grad_norm=ppo_cfg.max_grad_norm,
-        bf16=ppo_cfg.bf16,
+        bf16=ppo_cfg.bf16, compile=ppo_cfg.compile, fixed_shapes=ppo_cfg.fixed_shapes,
     ), device)
 
 

@@ -225,7 +225,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_evaluator: str = "actor", bury_policy: bool = False,
            restart_schedule: bool = False, population: int = 0,
            reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
-           forward_chunks: int = 1, rollout_overlap: bool = False) -> None:
+           forward_chunks: int = 1, rollout_overlap: bool = False,
+           compile: bool = False) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -320,7 +321,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             "rollout_workers": rollout_workers,
             # `length_buckets` 4 took a 1024-hand update from 9.7 s to
             # 7.9 s on an L40S with the same losses and KL (modal_perf.py).
-            "ppo": {"epochs": epochs, "length_buckets": length_buckets},
+            "ppo": {"epochs": epochs, "length_buckets": length_buckets,
+                    # The update through torch.compile on fixed shapes
+                    # (PPOConfig.compile): a third off an update, ~4 min
+                    # of compiling at the start.
+                    "compile": compile},
             # A hand writes at most 100 rows, and a round that cannot
             # fit every hand silently collects fewer of them.
             "buffer_capacity": buffer_capacity or hands * 100,
