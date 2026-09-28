@@ -516,6 +516,7 @@ def _opt_bench(arch: str, hands: int, n_timed: int) -> dict:
             "agent1_first_calls_s": b["first_calls_s"],
             "agent0_first_calls_s": a["first_calls_s"],
         }
+        print(f"  cross-agent {out['cross_agent']}", flush=True)
     except Exception as exc:  # noqa: BLE001
         out["cross_agent"] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
     torch._dynamo.reset()
@@ -534,6 +535,7 @@ def _opt_bench(arch: str, hands: int, n_timed: int) -> dict:
         full_obs, _pr, _sc = buf.as_torch(idx, dev)
         trimmed_loss, _p = learner.losses(full_obs, priv, sc)
         out["agreement"]["eager_trimmed"] = float(trimmed_loss)
+        print(f"  agreement {out['agreement']}", flush=True)
     except Exception as exc:  # noqa: BLE001
         out["agreement"] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
     torch._dynamo.reset()
@@ -638,15 +640,25 @@ def _opt_bench(arch: str, hands: int, n_timed: int) -> dict:
 @app.function(image=image, gpu="L40S", volumes={VOLUME: volume}, timeout=3 * 3600,
               cpu=12.0, memory=65536)
 def opt_bench_l40s(arch: str, hands: int, n_timed: int) -> dict:
-    return _opt_bench(arch, hands, n_timed)
+    """The result is written to ``/vol/bench/opt-<arch>.json`` from here:
+    a local client that dies cancels a ``.remote`` call even detached,
+    and the first run of this lost its compile arms that way."""
+    import json
+    import os
+
+    res = _opt_bench(arch, hands, n_timed)
+    os.makedirs(f"{VOLUME}/bench", exist_ok=True)
+    with open(f"{VOLUME}/bench/opt-{arch}.json", "w") as fh:
+        json.dump(res, fh, indent=2)
+    volume.commit()
+    return res
 
 
 @app.local_entrypoint()
 def opt_bench(arch: str = "v6", hands: int = 4096, n_timed: int = 60) -> None:
-    """``modal run modal_perf.py::opt_bench``: compile, minibatch size, stacking."""
-    import json
-
-    res = opt_bench_l40s.remote(arch, hands, n_timed)
-    print(json.dumps(res, indent=2))
-    with open(f"runs/opt-bench-{arch}.json", "w") as fh:
-        json.dump(res, fh, indent=2)
+    """``modal run --detach modal_perf.py::opt_bench``: compile, minibatch
+    size, stacking. Spawned, so this client may exit; the result lands in
+    ``/vol/bench/opt-<arch>.json`` (``modal volume get tractor-rl
+    bench/opt-v6.json``) and the lines stream to ``modal app logs``."""
+    call = opt_bench_l40s.spawn(arch, hands, n_timed)
+    print(f"spawned {call.object_id}; result -> /vol/bench/opt-{arch}.json")

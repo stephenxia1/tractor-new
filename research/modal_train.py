@@ -940,9 +940,14 @@ def critic_bakeoff(checkpoint: str = "/vol/v5-bury/checkpoints/final.pt",
     """
     import json
 
-    res = critic_bakeoff_l40s.remote(checkpoint, rounds, hands, epochs, seed,
+    # Spawned and then waited on: if this client dies, a spawned call runs
+    # on (a ``.remote`` one is cancelled, detached or not), and its result
+    # is on the volume at /vol/bakeoff/critic-<tag or seed>.json.
+    call = critic_bakeoff_l40s.spawn(checkpoint, rounds, hands, epochs, seed,
                                      [a.strip() for a in arms.split(",") if a.strip()],
                                      tag)
+    print(f"spawned {call.object_id}")
+    res = call.get()
     path = out or f"runs/critic-bakeoff-{tag or seed}.json"
     with open(path, "w") as fh:
         json.dump(res, fh)
