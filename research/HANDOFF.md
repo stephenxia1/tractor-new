@@ -306,9 +306,13 @@ nothing.
    explained variance 0.368 against 0.161–0.213 for the flat critic,
    paired +0.21 overall and +0.23 at play start; a widened flat critic
    gained nothing). README § *The v6 architecture, and the critic
-   bake-off*. The v6 smoke run (`pop8v6-smoke`) ran clean at 134–141 s a
-   play step, 26 s a pre-play step, 8.7 GB GPU, 2.4 GB a checkpoint; add
-   `--arch v6` to the smoke command above to rerun it.
+   bake-off*. The critic's width then came down to 128 at the user's
+   request (as good as 256 in a width bake-off). The v6 smoke runs
+   (`pop8v6-smoke` at width 256, `pop8v6b-smoke` at 128 with 10 workers)
+   ran clean at ~125–140 s a play step and ~26 s a pre-play step, 8.7 GB
+   GPU; where the time goes and what was bought back is in README §
+   *The critic's width, and where a v6 step goes*. Add `--arch v6
+   --rollout-workers 10` to the smoke command above to rerun it.
 
    **The proposed run** (the warm-up length and step count are proposals,
    not the user's decisions yet). A Modal function stops at 24 hours. At
@@ -320,7 +324,7 @@ nothing.
 
    ```bash
    modal run --detach modal_train.py::launch --gpu l40s --name pop8 --arch v6 \
-     --population 8 --reshuffle-every 10 --hands 4096 --steps 550 \
+     --rollout-workers 10 --population 8 --reshuffle-every 10 --hands 4096 --steps 550 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
      --length-buckets 4 --checkpoint-every 50 --keep-last 6
