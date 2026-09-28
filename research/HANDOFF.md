@@ -95,7 +95,8 @@ play only" is **stale**.
 | play simulator | `py/tractor/sim/state.py`, `actions.py` | the rules in numpy; parity with the TS engine is tested |
 | deal + declaration env | `sim/deal.py` | `DealEnv`: 100 cards from the landlord, a decision per card when a declaration is legal (pass or one of 10), closing round until 4 passes, kitty flip. Legality matches the engine on 600 scenarios (`src/dumpDeclare.ts` → `tests/fixtures/declare.json`) |
 | burial | `sim/bury.py` | `heuristic_burial`, `random_burial`; the value climb (`value_burials`, actor or critic scored); the policy's sampler `policy_burials` + `bury_context` + `BuryRows` |
-| play network | `nn/model.py` | `ActorCritic` (10.7M): enumerate-and-score actor, privileged critic reading all hands + kitty + the context vector (`Critic.context_proj`, zero-init; `load_model` accepts checkpoints without it) |
+| play network | `nn/model.py` | `ActorCritic`: enumerate-and-score actor (10.68M at v5), privileged critic reading all hands + kitty + the context vector (`Critic.context_proj`, zero-init; `load_model` accepts checkpoints without it). v6: `ffn="swiglu"`, `critic_kind="cards"` (`CardCritic`) |
+| architectures | `nn/arch.py` | `ARCHES` (`v5`, `v6`; `launch --arch`), rebuilding a checkpoint's declaration and burial nets from their saved configs, `check_saved`. Every config defaults to v5; `tests/test_arch.py` pins v5's layouts and outputs |
 | declaration network | `nn/declare.py` | `DeclareNet`, MLP, 11 actions, privileged critic |
 | burial network | `nn/bury_net.py` | `BuryNet`: set transformer over 54 card types (2 layers, d 128), 8 sequential picks, masked logits, value head that reads the other hands |
 | play training | `train/loop.py`, `ppo.py`, `rollout.py`, `parallel.py`, `shared.py` | PPO, GAE γ 1 λ 0.95, points-only reward; `RolloutPool` workers + batched forward in the parent |
@@ -110,9 +111,11 @@ its team, and the kitty bonus is credited with the last trick
 expected team point margin from that position.
 
 **Checkpoint format** (`train/loop.py`): `model`, `optimizer`, `step`,
-`config`, plus for full-hand runs `declare: {model, optimizer,
-phases_done}` and, when the burial policy is on, `bury: {model,
-optimizer}`.
+`config`, `model_config`, plus for full-hand runs `declare: {model,
+optimizer, phases_done, config}` and, when the burial policy is on,
+`bury: {model, optimizer, config}` (the two `config`s from 2026-09-28
+on; absent means v5). A population checkpoint holds `agents`, a list of
+those per-agent parts; `read_checkpoint("….pt#k")` returns one.
 
 ---
 
