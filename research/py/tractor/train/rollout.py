@@ -92,8 +92,14 @@ import torch
 import torch.nn.functional as F
 
 from ..gen.episode import deal_sizes, generate
-from ..nn.features import POINTS_PER_DECK, Cache, encode
-from ..nn.model import MASK_LOGIT, ModelConfig, privileged_view
+from ..nn.features import PLANE_TRICK, POINTS_PER_DECK, Cache, encode
+from ..nn.model import (
+    MASK_LOGIT,
+    ModelConfig,
+    ObsBatch,
+    privileged_view,
+    relative_seat_agents,
+)
 from ..rules.cards import NUM_TYPES
 from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, hand_result, team_of
@@ -229,12 +235,11 @@ def _evaluate(net: Any, obs: Any, privileged: torch.Tensor) -> tuple[Any, Any]:
     will not use; its own imperfect-information value head answers
     instead.
     """
-    has_pair = (
-        getattr(net, "critic", None) is not None
-        and getattr(net, "actor", None) is not None
-    )
-    if has_pair:
-        return net(obs, privileged)
+    actor = getattr(net, "actor", None)
+    if actor is not None:
+        # An ActorCritic; with no critic of its own (a population sharing
+        # one) the value is ``None`` and the caller supplies it.
+        return net(obs, privileged) if net.critic is not None else (actor(obs), None)
     out = net(obs)
     return out, out.value
 
@@ -319,6 +324,8 @@ def routed_step(
     spans: Any = None,
     lengths: np.ndarray | None = None,
     chunks: int = 1,
+    critic: Any = None,
+    seat_agents: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each row through its owner's network. -> ``(slots, logp, value)``.
 
@@ -334,11 +341,17 @@ def routed_step(
     measured at 4096 hands, a mean history of 43.5 against a longest of
     ~95 -- so shorter rows stop paying for the longest one. The values
     are the same up to float rounding; the draws are made per chunk.
+
+    ``critic``, a population's shared critic, values every row in one
+    forward after the actors have acted, reading ``seat_agents[i]``, the
+    agent in each seat relative to row ``i``'s. The networks in ``nets``
+    are then actors alone.
     """
     n = len(owner)
     slots = np.empty(n, dtype=np.int64)
     logp = np.empty(n, dtype=np.float32)
     value = np.empty(n, dtype=np.float32)
+    kept: list = []
     for agent in np.unique(owner):
         idx = np.nonzero(owner == agent)[0]
         if chunks > 1 and lengths is not None and len(idx) >= 2 * chunks:
@@ -355,7 +368,25 @@ def routed_step(
                 slots[part], logp[part] = _choose(
                     out.logits, obs.candidate_mask, temperature, greedy, rng
                 )
-                value[part] = values.detach().float().cpu().numpy()
+                if values is not None:
+                    value[part] = values.detach().float().cpu().numpy()
+                elif critic is None:
+                    raise ValueError("an actor without a critic needs the shared one")
+            if critic is not None:
+                kept.append((part, obs, privileged))
+    if critic is not None:
+        # One forward for the whole round, over the batches the actors
+        # read, stitched back together on the device.
+        order = np.concatenate([part for part, _o, _p in kept])
+        obs = ObsBatch(*(torch.cat(fields) for fields in zip(*(o for _i, o, _p in kept))))
+        privileged = torch.cat([p for _i, _o, p in kept])
+        with _span(spans, "critic"):
+            v = critic(
+                obs.history, obs.history_len, privileged, context=obs.context,
+                cards=obs.cards, trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_SEATS],
+                seat_agents=torch.from_numpy(seat_agents[order]).to(obs.history.device),
+            )
+            value[order] = v.detach().float().cpu().numpy()
     return slots, logp, value
 
 
@@ -460,6 +491,7 @@ def collect(
     starts: Any = None,
     agents: Any = None,
     chunks: int = 1,
+    critic: Any = None,
 ) -> dict[str, float]:
     """Play ``n_hands`` self-play hands into ``buffer``.
 
@@ -474,7 +506,9 @@ def collect(
     A population passes a list of networks as ``net`` and ``agents``,
     int64[n_hands, 4]: the network in each seat of each hand, in the
     order the hands start. Every row is then acted and valued by its
-    seat's network, and its critic is the one that records the value.
+    seat's network, and its critic is the one that records the value --
+    or, with ``critic``, the population's one shared critic values every
+    row.
 
     ``temperature`` scales the logits before sampling and ``greedy`` takes
     the argmax instead. ``level_weight`` weighs the terminal term against
@@ -490,6 +524,8 @@ def collect(
     """
     nets = as_nets(net)
     cfg = cfg or getattr(nets[0], "cfg", None) or ModelConfig()
+    if critic is not None and agents is None:
+        raise ValueError("a shared critic needs the seating to know who is who")
     if cfg.max_candidates != buffer.candidates.shape[1]:
         raise ValueError(
             f"cfg.max_candidates {cfg.max_candidates} does not match the "
@@ -590,16 +626,20 @@ def collect(
                     ).to(device)
                     return obs, privileged
 
+                hand_idx = np.array([hand.episode - first_episode for hand in active])
+                seats = np.array([d.seat for d in packed])
                 if seating is None:
                     owner = np.zeros(len(packed), dtype=np.int64)
                 else:
-                    owner = seating[
-                        [hand.episode - first_episode for hand in active],
-                        [d.seat for d in packed],
-                    ]
+                    owner = seating[hand_idx, seats]
                 slots, chosen_logp, value_np = routed_step(
                     nets, owner, gather, temperature, greedy, rng, spans,
                     lengths=np.array([d.history_len for d in packed]), chunks=chunks,
+                    critic=critic,
+                    seat_agents=(
+                        None if critic is None
+                        else relative_seat_agents(seating[hand_idx], seats)
+                    ),
                 )
 
                 with _span(spans, "step"):

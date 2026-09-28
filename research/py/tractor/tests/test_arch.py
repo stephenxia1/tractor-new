@@ -296,3 +296,45 @@ def test_the_critic_bakeoff_runs_end_to_end() -> None:
     # Paired against the flat critic, pass for pass.
     assert set(out["paired"]) == {"v5", "flat-wide", "cards"}
     assert len(out["paired"]["cards"]) == 1
+
+
+@pytest.mark.parametrize("kind", ["flat", "cards"])
+def test_static_shapes_compute_what_the_trimmed_path_does(kind: str) -> None:
+    """``static_shapes`` runs on the width handed in, with no host read;
+    trimmed to any width at least the batch's longest history, it must
+    give what the host-trimmed eager path gives."""
+    from ..nn.model import static_shapes
+
+    cfg = replace(SMALL_V6, critic_kind=kind, ffn="gelu" if kind == "flat" else "swiglu")
+    torch.manual_seed(2)
+    net = ActorCritic(cfg).eval()
+    obs, priv = dummy_batch(cfg, batch=6, history_len=40, seed=4)
+    obs = obs._replace(history_len=torch.tensor([0, 5, 40, 17, 33, 1]))
+    with torch.no_grad():
+        out, value = net(obs, priv)
+        for width in (40, 48, 128):
+            with static_shapes():
+                o2, v2 = net(obs._replace(history=obs.history[:, :width]), priv)
+            torch.testing.assert_close(o2.logits, out.logits, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(o2.value, out.value, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(v2, value, rtol=1e-5, atol=1e-5)
+
+
+def test_the_shared_critic_under_static_shapes() -> None:
+    from ..nn.model import shared_critic, static_shapes
+
+    torch.manual_seed(3)
+    critic = shared_critic(SMALL_V6, 8).eval()
+    obs, priv = dummy_batch(SMALL_V6, batch=5, history_len=30, seed=6)
+    obs = obs._replace(history_len=torch.tensor([0, 30, 7, 12, 29]))
+    seats = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7], [7, 6, 5, 4], [1, 3, 5, 7], [2, 2, 2, 2]])
+
+    def value(history: torch.Tensor) -> torch.Tensor:
+        return critic(history, obs.history_len, priv, context=obs.context, cards=obs.cards,
+                      trick=obs.planes[:, 5:9], seat_agents=seats)
+
+    with torch.no_grad():
+        eager = value(obs.history)
+        with static_shapes():
+            static = value(obs.history[:, :32])
+    torch.testing.assert_close(static, eager, rtol=1e-5, atol=1e-5)

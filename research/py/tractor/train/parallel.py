@@ -60,6 +60,7 @@ from ..gen.episode import deal_sizes, generate
 from ..nn.features import POINTS_PER_DECK, Cache
 from ..nn.model import ModelConfig
 from .buffer import RolloutBuffer, obs_batch_from_arrays
+from ..nn.model import relative_seat_agents
 from .rollout import (
     DECKS,
     _credit_terminal,
@@ -113,35 +114,42 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
             cmd = rep_q.get(timeout=WORKER_TIMEOUT_S)
             if cmd[0] == "stop":
                 return
-            _tag, n_hands, episode_base, seed, level_weight, pool, starts = cmd
+            (_tag, n_hands, episode_base, seed, level_weight, pool, starts,
+             halves) = cmd
 
             window.reset()
             rng = np.random.default_rng(seed)
             weight = np.float32(level_weight)
-            active: list[_InFlight] = []
+            # One pool of hands per half. With one half this is the
+            # lockstep round. With two, each half's batch waits at the
+            # parent while this process steps and packs the other, so the
+            # forward and the simulator overlap.
+            pools: list[list[_InFlight]] = [[] for _ in range(halves)]
+            per_half = max(1, pool // halves)
             started = 0
             stats = dict.fromkeys(_STAT_KEYS, 0)
 
-            while True:
+            def refill(h: int) -> None:
+                nonlocal started
+                in_flight = [hand for p in pools for hand in p]
                 while (
-                    len(active) < pool
+                    len(pools[h]) < per_half
                     and started < n_hands
-                    and _room_for_another(window, active, max_decisions)
+                    and _room_for_another(window, in_flight, max_decisions)
                 ):
                     if starts is not None:
                         state = start_state(starts[started])
                     else:
                         state, _info = generate(rng, DECKS)
-                    active.append(
-                        _InFlight(state=state, episode=episode_base + started)
-                    )
+                    hand = _InFlight(state=state, episode=episode_base + started)
+                    pools[h].append(hand)
+                    in_flight.append(hand)
                     started += 1
-                if not active:
-                    break
 
-                packed = [_pack(hand, cache, cfg) for hand in active]
+            def send(h: int) -> tuple[list, int]:
+                packed = [_pack(hand, cache, cfg) for hand in pools[h]]
                 first_local = len(window)
-                for hand, decision in zip(active, packed):
+                for hand, decision in zip(pools[h], packed):
                     row = window.add(
                         history=decision.history,
                         history_len=decision.history_len,
@@ -153,7 +161,7 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                         candidate_mask=decision.candidate_mask,
                         privileged=decision.privileged,
                         # Placeholders. The parent overwrites all three
-                        # before it releases this worker.
+                        # before it releases this half.
                         action=0,
                         logp=0.0,
                         value=0.0,
@@ -162,15 +170,16 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                     )
                     hand.trick_rows.append(row)
                     hand.last_row[decision.seat] = row
-
                 # ``add`` fills sequentially, so one batch is one
-                # contiguous run and the parent needs two numbers.
-                req_q.put(("batch", wid, start + first_local, len(packed)))
-                if rep_q.get(timeout=WORKER_TIMEOUT_S)[0] != "go":
-                    return  # the parent is shutting the round down
+                # contiguous run and the parent needs two numbers. An
+                # empty half still reports, so the parent's lockstep per
+                # half stays whole.
+                req_q.put(("batch", wid, h, start + first_local, len(packed)))
+                return packed, first_local
 
+            def step(h: int, packed: list, first_local: int) -> None:
                 finished: list[int] = []
-                for i, (hand, decision) in enumerate(zip(active, packed)):
+                for i, (hand, decision) in enumerate(zip(pools[h], packed)):
                     row = first_local + i
                     slot = int(window.action[row])
                     stats["decisions"] += 1
@@ -190,7 +199,31 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                         stats["hands"] += 1
                         finished.append(i)
                 for i in reversed(finished):
-                    active.pop(i)
+                    pools[h].pop(i)
+
+            if n_hands == 0:
+                req_q.put(("done", wid, len(window), stats))
+                continue
+            pending = []
+            for h in range(halves):
+                refill(h)
+                pending.append(send(h))
+            h = 0
+            while True:
+                if rep_q.get(timeout=WORKER_TIMEOUT_S)[0] != "go":
+                    return  # the parent is shutting the round down
+                step(h, *pending[h])
+                refill(h)
+                if started >= n_hands and not any(pools):
+                    # Each other half has one empty batch at the parent;
+                    # take its go first, so none is left in this queue
+                    # to be read as the next round's command.
+                    for _ in range(halves - 1):
+                        if rep_q.get(timeout=WORKER_TIMEOUT_S)[0] != "go":
+                            return
+                    break
+                pending[h] = send(h)
+                h = (h + 1) % halves
 
             req_q.put(("done", wid, len(window), stats))
     finally:
@@ -268,8 +301,16 @@ class RolloutPool:
         starts: Any = None,
         agents: Any = None,
         chunks: int = 1,
+        critic: Any = None,
+        overlap: bool = False,
     ) -> tuple[RolloutBuffer, dict[str, float]]:
         """One round. -> ``(buffer, stats)``, same keys as ``collect``.
+
+        ``overlap`` splits every worker's hands into two halves that take
+        turns: while the parent runs the forward on one half's rows, the
+        workers step and pack the other's. Lockstep costs the sum of the
+        parent's time and the workers'; this costs about the larger. Each
+        forward is then half as wide, so pair it with a doubled ``pool``.
 
         ``starts``, when given, are the round's play starts (``train.starts.
         Start``), one per hand, in place of the workers' own uniform draw.
@@ -294,6 +335,8 @@ class RolloutPool:
             )
         nets = as_nets(net)
         seating = check_agents(agents, n_hands, nets)
+        if critic is not None and seating is None:
+            raise ValueError("a shared critic needs the seating to know who is who")
         workers = self.workers
         pool_total = int(pool) if pool else 128
         per_worker_pool = max(1, pool_total // workers)
@@ -329,23 +372,28 @@ class RolloutPool:
                 self._rep_qs[w].put((
                     "round", hands_each[w], base,
                     int(rng.integers(0, 2**31 - 1)), float(level_weight),
-                    per_worker_pool, mine,
+                    per_worker_pool, mine, 2 if overlap else 1,
                 ))
                 base += hands_each[w]
                 live.add(w)
 
             ends: dict[int, int] = {}
+            halves = 2 if overlap else 1
+            # Batches by half. With two halves a worker's next batch for
+            # one half can arrive while the other is being collected.
+            waiting: list[dict[int, tuple[int, int]]] = [{} for _ in range(halves)]
+            half = 0
             with torch.no_grad(), torch.autocast(
                 device_type=torch.device(device).type,
                 dtype=torch.bfloat16,
                 enabled=amp,
             ):
                 while live:
-                    # Every live worker blocks after reporting, so
-                    # waiting for all of them is safe and makes the
-                    # batch as wide as the pool. It is also lockstep.
-                    pending: dict[int, tuple[int, int]] = {}
-                    while len(pending) < len(live):
+                    # Every live worker reports each half before it moves
+                    # on, so waiting for all of them is safe and makes
+                    # the batch as wide as that half. It is lockstep per
+                    # half.
+                    while len(waiting[half]) < len(live):
                         msg = self._req_q.get(timeout=WORKER_TIMEOUT_S)
                         if msg[0] == "done":
                             _tag, wid, rows, stats = msg
@@ -353,17 +401,27 @@ class RolloutPool:
                             live.discard(wid)
                             for key in totals:
                                 totals[key] += int(stats[key])
+                            for w_half in waiting:
+                                w_half.pop(wid, None)
                         else:
-                            _tag, wid, first, count = msg
-                            pending[wid] = (first, count)
-                    if not pending:
+                            _tag, wid, h, first, count = msg
+                            waiting[h][wid] = (first, count)
+                    if not live:
                         break
+                    pending = waiting[half]
+                    waiting[half] = {}
 
                     rows = np.concatenate([
                         np.arange(first, first + count, dtype=np.int64)
                         for first, count in
                         (pending[w] for w in sorted(pending))
                     ])
+                    if rows.size == 0:
+                        # Every worker's half is empty: nothing to act.
+                        for w in pending:
+                            self._rep_qs[w].put(("go", half))
+                        half = (half + 1) % halves
+                        continue
 
                     # Fancy indexing, so each of these materialises a
                     # copy: at 1024 hands a round moves about 2.4 GiB
@@ -386,14 +444,20 @@ class RolloutPool:
                         ).to(device)
                         return obs, privileged
 
+                    hand_idx = buf.episode[rows] - episode_base
+                    seats = buf.seat[rows]
                     if seating is None:
                         owner = np.zeros(len(rows), dtype=np.int64)
                     else:
-                        owner = seating[buf.episode[rows] - episode_base,
-                                        buf.seat[rows]]
+                        owner = seating[hand_idx, seats]
                     slots, chosen_logp, values = routed_step(
                         nets, owner, gather, temperature, greedy, rng, spans,
                         lengths=buf.history_len[rows], chunks=chunks,
+                        critic=critic,
+                        seat_agents=(
+                            None if critic is None
+                            else relative_seat_agents(seating[hand_idx], seats)
+                        ),
                     )
                     with _span(spans, "writeback"):
                         buf.action[rows] = slots
@@ -403,7 +467,8 @@ class RolloutPool:
                     batch_total += int(rows.size)
                     with _span(spans, "release"):
                         for w in pending:
-                            self._rep_qs[w].put(("go",))
+                            self._rep_qs[w].put(("go", half))
+                    half = (half + 1) % halves
 
             # Each worker's rows go straight to their place in the
             # caller's buffer: one pass over the round's bytes, where
@@ -498,6 +563,8 @@ def collect_parallel(
     capacity: int | None = None,
     agents: Any = None,
     chunks: int = 1,
+    critic: Any = None,
+    overlap: bool = False,
 ) -> tuple[RolloutBuffer, dict[str, float]]:
     """One round through a throwaway pool.
 
@@ -515,5 +582,5 @@ def collect_parallel(
             net, rng, buffer, n_hands=int(n_hands), device=device,
             temperature=temperature, greedy=greedy,
             level_weight=level_weight, pool=pool, amp=amp, spans=spans,
-            agents=agents, chunks=chunks,
+            agents=agents, chunks=chunks, critic=critic, overlap=overlap,
         )

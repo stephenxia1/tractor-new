@@ -575,7 +575,9 @@ class PPOLearner:
 
         # Out of autocast from here down: the reductions are float32.
         log_probs = out.log_probs.float()
-        value = value.float()
+        # ``None`` for an actor whose critic is a population's shared one,
+        # trained apart (``train.critic_learner``): no value term here.
+        value = None if value is None else value.float()
 
         new_logp = log_probs.gather(1, action).squeeze(1)
         log_ratio = new_logp - old_logp
@@ -599,7 +601,9 @@ class PPOLearner:
             ratio.clamp(1.0 - cfg.clip, 1.0 + cfg.clip) * advantage,
         )
         policy_loss = -surrogate.mean()
-        value_loss = F.mse_loss(value, returns)
+        value_loss = (
+            returns.new_zeros(()) if value is None else F.mse_loss(value, returns)
+        )
         entropy = masked_entropy(log_probs, obs.candidate_mask).mean()
 
         target, weight = belief_target(obs, privileged.float())

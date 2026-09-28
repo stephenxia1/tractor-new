@@ -31,8 +31,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..nn.features import D_STATIC, Cache, context_vector
-from ..nn.model import privileged_view
+from ..nn.features import D_STATIC, HISTORY_DIM, Cache, context_vector
+from ..nn.model import privileged_view, relative_seat_agents
 from ..rules.cards import Ctx
 from ..sim.bury import (
     BuryConfig,
@@ -385,7 +385,7 @@ def make_starts(
 
 def critic_values(
     play_net: Any, starts: list[Start], device: Any = "cpu", chunk: int = 512,
-    num_decks: int = 2, agents: Any = None,
+    num_decks: int = 2, agents: Any = None, shared: Any = None,
 ) -> np.ndarray:
     """float32[n, 4]: the privileged critic at each seat's play start.
 
@@ -395,7 +395,9 @@ def critic_values(
     seat's context vector.
 
     A population passes its list of play networks and ``agents``,
-    int64[n, 4]; each seat is then valued by its own agent's critic.
+    int64[n, 4]; each seat is then valued by its own agent's critic --
+    or, with ``shared``, by the population's one critic, told which agent
+    sits in each seat.
     """
     ctx_rows: list[np.ndarray] = []
     priv_rows: list[np.ndarray] = []
@@ -413,6 +415,25 @@ def critic_values(
     priv = np.stack(priv_rows) if priv_rows else np.zeros((0, 5, 54), np.float32)
     static_all = np.stack(static) if static else np.zeros((0, 54, D_STATIC), np.float32)
     out = np.empty(len(ctx_rows), dtype=np.float32)
+    if shared is not None:
+        if agents is None:
+            raise ValueError("a shared critic needs the seating to know who is who")
+        table = np.repeat(np.asarray(agents, dtype=np.int64), NUM_SEATS, axis=0)
+        seats = np.tile(np.arange(NUM_SEATS), len(starts))
+        seat_agents = relative_seat_agents(table, seats)
+        with torch.no_grad():
+            for lo in range(0, len(out), chunk):
+                r = np.arange(lo, min(lo + chunk, len(out)))
+                v = shared(
+                    torch.zeros(len(r), 1, HISTORY_DIM, device=device),
+                    torch.zeros(len(r), dtype=torch.int64, device=device),
+                    torch.from_numpy(priv[r]).to(device),
+                    context=torch.from_numpy(context[r]).to(device),
+                    cards=torch.from_numpy(static_all[r // NUM_SEATS]).to(device),
+                    seat_agents=torch.from_numpy(seat_agents[r]).to(device),
+                )
+                out[r] = v.float().cpu().numpy()
+        return out.reshape(len(starts), NUM_SEATS)
     # Rows are hand-major, seat-minor, as ``agents`` flattens.
     owner = (
         np.zeros(len(out), dtype=np.int64) if agents is None

@@ -49,7 +49,14 @@ import torch
 import torch.nn.functional as F
 
 from ..nn.arch import bury_net_from, declare_net_from
-from ..nn.model import ActorCritic, CardCritic, Critic, ModelConfig, load_model
+from ..nn.model import (
+    ActorCritic,
+    CardCritic,
+    Critic,
+    ModelConfig,
+    load_model,
+    shared_critic,
+)
 from ..sim.state import NUM_SEATS
 from .buffer import RolloutBuffer
 from .critic_diag import _clustered_ev_interval, _slope
@@ -68,10 +75,12 @@ def _arm_config(arm: str, actor_cfg: ModelConfig) -> ModelConfig:
     """The critic config an arm builds, sized against the actor it reads.
 
     ``cards-<d>`` is the card critic at width ``d``: v6's depth, a head
-    per 64 of width, feed-forward ``4 * d``.
+    per 64 of width, feed-forward ``4 * d``. ``cards-raw-<d>`` is the same
+    as a population's shared critic builds it (``model.shared_critic``):
+    reading the raw history rather than the actor's encoding.
     """
     if arm.startswith("cards-"):
-        d = int(arm.split("-", 1)[1])
+        d = int(arm.rsplit("-", 1)[1])
         return replace(actor_cfg, critic_kind="cards", ffn="swiglu", critic_d=d,
                        critic_layers=4, critic_heads=max(1, d // 64), critic_d_ff=4 * d)
     # The first card critic's size, 256 x 4, which ``cards`` and
@@ -154,6 +163,14 @@ def _values(critic: Any, actor: Any, gpu: dict, idx: np.ndarray, device: torch.d
 
 
 def _forward(critic: Any, actor: Any, gpu: dict, i: torch.Tensor) -> torch.Tensor:
+    if getattr(critic, "agents", 0):
+        # A shared critic reads the raw history, not the actor's encoding;
+        # here there is one agent, so every seat is agent 0.
+        return critic(gpu["history"][i].float(), gpu["history_len"][i],
+                      gpu["privileged"][i].float(), context=gpu["context"][i].float(),
+                      cards=gpu["cards"][i].float(), trick=gpu["trick"][i].float(),
+                      seat_agents=torch.zeros(len(i), NUM_SEATS, dtype=torch.int64,
+                                              device=i.device))
     with torch.no_grad():
         enc, _keep = actor.history(gpu["history"][i].float(), gpu["history_len"][i])
     return critic(enc, gpu["history_len"][i], gpu["privileged"][i].float(), detach=True,
@@ -223,8 +240,15 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
     def score(arm: str, critic: Any, epoch: int, seconds: float) -> dict[str, float]:
         p_held = _values(critic, net.actor, gpu, held, device)
         p_fit = _values(critic, net.actor, gpu, fit_probe, device)
-        scorer = SimpleNamespace(critic=critic, cfg=actor_cfg)
-        p_start = critic_values(scorer, held_starts, device).reshape(-1)[start_keys - held_hand_lo * NUM_SEATS]
+        if getattr(critic, "agents", 0):
+            p_start = critic_values(
+                None, held_starts, device,
+                agents=np.zeros((len(held_starts), NUM_SEATS), dtype=np.int64), shared=critic,
+            )
+        else:
+            p_start = critic_values(SimpleNamespace(critic=critic, cfg=actor_cfg),
+                                    held_starts, device)
+        p_start = p_start.reshape(-1)[start_keys - held_hand_lo * NUM_SEATS]
         preds.setdefault(arm, {})[epoch] = (p_held, p_start)
         lo, hi = _clustered_ev_interval(p_held, actual_held, held_hand, rng, draws=500)
         s_lo, s_hi = _clustered_ev_interval(p_start, start_actual, start_hand, rng, draws=500)
@@ -253,7 +277,10 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
             results["arms"][arm] = {"params": params, "passes": [score(arm, critic, 0, 0.0)]}
             continue
         cfg = _arm_config(arm, actor_cfg)
-        critic = (CardCritic(cfg) if cfg.critic_kind == "cards" else Critic(cfg)).to(device)
+        if arm.startswith("cards-raw-"):
+            critic = shared_critic(cfg, agents=1).to(device)
+        else:
+            critic = (CardCritic(cfg) if cfg.critic_kind == "cards" else Critic(cfg)).to(device)
         params = sum(p.numel() for p in critic.parameters())
         opt = torch.optim.AdamW(critic.parameters(), lr=lr, weight_decay=0.0)
         order_rng = np.random.default_rng(seed + 2)  # same order for every arm

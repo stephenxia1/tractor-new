@@ -359,3 +359,201 @@ def test_copy_ranges_is_compaction_then_a_copy() -> None:
     compact_ranges(src, [(s, s + c) for s, c in filled])
     for name in src.fields:
         assert np.array_equal(getattr(dst, name)[:46], getattr(src, name)[:46]), name
+
+
+# --- the shared critic --------------------------------------------------------
+
+from ..nn.model import privileged_view, relative_seat_agents, shared_critic  # noqa: E402
+
+ACTOR_ONLY = replace(SMALL, critic_kind="none")
+
+
+def _actors(n: int = AGENTS) -> list[ActorCritic]:
+    torch.manual_seed(11)
+    return [ActorCritic(ACTOR_ONLY).eval() for _ in range(n)]
+
+
+def _shared() -> torch.nn.Module:
+    torch.manual_seed(12)
+    return _jitter(shared_critic(SMALL, AGENTS), 3)
+
+
+def _shared_values(critic, buf: RolloutBuffer, rows: np.ndarray, seat_agents: np.ndarray):
+    obs, privileged, _ = buf.as_torch(rows)
+    with torch.no_grad():
+        return critic(obs.history, obs.history_len, privileged, context=obs.context,
+                      cards=obs.cards, trick=obs.planes[:, 5:9],
+                      seat_agents=torch.from_numpy(seat_agents)).numpy()
+
+
+def _check_shared_values(critic, buf: RolloutBuffer, seat_of: np.ndarray) -> None:
+    n = len(buf)
+    rows = np.arange(n)
+    seats = relative_seat_agents(seat_of[buf.episode[:n]], buf.seat[:n])
+    np.testing.assert_allclose(_shared_values(critic, buf, rows, seats), buf.value[:n],
+                               rtol=1e-4, atol=1e-4)
+    # The check has power: the same rows with the seats' agents rotated.
+    wrong = _shared_values(critic, buf, rows, np.roll(seats, 1, axis=1))
+    assert not np.allclose(wrong, buf.value[:n], rtol=1e-4, atol=1e-4)
+
+
+def test_relative_seat_agents_reads_the_table_from_each_seat() -> None:
+    table = np.array([[10, 11, 12, 13]] * 4)
+    got = relative_seat_agents(table, np.array([0, 1, 2, 3]))
+    assert got.tolist() == [[10, 11, 12, 13], [11, 12, 13, 10],
+                            [12, 13, 10, 11], [13, 10, 11, 12]]
+
+
+def test_the_shared_critic_values_every_row_knowing_who_sits_where() -> None:
+    nets, critic = _actors(), _shared()
+    hands = 6
+    seat_of = hand_agents(_table(3), hands)
+    buf = RolloutBuffer(hands * 100, SMALL)
+    collect(nets, np.random.default_rng(5), buf, n_hands=hands, device="cpu",
+            cfg=ACTOR_ONLY, pool=4, agents=seat_of, critic=critic)
+    _check_shared_values(critic, buf, seat_of)
+
+
+def test_the_parallel_rollout_uses_the_shared_critic_the_same_way() -> None:
+    nets, critic = _actors(), _shared()
+    hands = 6
+    seat_of = hand_agents(_table(4), hands)
+    buf, _stats = collect_parallel(nets, np.random.default_rng(5), None, n_hands=hands,
+                                   device="cpu", cfg=ACTOR_ONLY, pool=4, workers=2,
+                                   agents=seat_of, critic=critic)
+    _check_shared_values(critic, buf, seat_of)
+
+
+def test_an_actor_without_a_critic_is_refused_without_the_shared_one() -> None:
+    seat_of = hand_agents(_table(), 2)
+    with pytest.raises(ValueError, match="shared one"):
+        collect(_actors(), np.random.default_rng(0), RolloutBuffer(200, SMALL),
+                n_hands=2, device="cpu", cfg=ACTOR_ONLY, agents=seat_of)
+
+
+def test_play_start_values_come_from_the_shared_critic_per_seat() -> None:
+    critic = _shared()
+    n = 4
+    seat_of = hand_agents(_table(5), n)
+    starts, _rows, _st = make_starts(np.random.default_rng(2), n, None, None)
+    got = critic_values(_actors(), starts, agents=seat_of, shared=critic)
+    cache_obs = []
+    from ..nn.features import Cache, encode
+    from ..nn.model import batch_observations, batch_privileged
+    cache = Cache()
+    for h, st in enumerate(starts):
+        state = st.state()
+        obs = batch_observations(
+            [encode(state, s, cache) for s in range(NUM_SEATS)],
+            [[np.zeros(54, dtype=np.int8)]] * NUM_SEATS, SMALL,
+        )
+        priv = batch_privileged([privileged_view(state.hands, state.kitty, s)
+                                 for s in range(NUM_SEATS)])
+        seats = relative_seat_agents(np.repeat(seat_of[h : h + 1], NUM_SEATS, 0),
+                                     np.arange(NUM_SEATS))
+        with torch.no_grad():
+            want = critic(obs.history, obs.history_len, priv, context=obs.context,
+                          cards=obs.cards, trick=obs.planes[:, 5:9],
+                          seat_agents=torch.from_numpy(seats))
+        np.testing.assert_allclose(got[h], want.numpy(), rtol=1e-4, atol=1e-4)
+        cache_obs.append(h)
+    assert len(cache_obs) == n
+
+
+def test_the_critic_learner_fits_what_it_is_shown() -> None:
+    from ..train.critic_learner import CriticLearner, CriticTrainConfig
+    from ..train.gae import compute_gae
+
+    nets, critic = _actors(), _shared()
+    seat_of = hand_agents(_table(6), 4)
+    buf = RolloutBuffer(400, SMALL)
+    collect(nets, np.random.default_rng(7), buf, n_hands=4, device="cpu", cfg=ACTOR_ONLY,
+            pool=4, agents=seat_of, critic=critic)
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    n = len(buf)
+    seats = relative_seat_agents(seat_of[buf.episode[:n]], buf.seat[:n])
+    learner = CriticLearner(critic, CriticTrainConfig(minibatch=64, bf16=False, lr=1e-3))
+    before = float(np.mean((_shared_values(critic, buf, np.arange(n), seats) - buf.ret[:n]) ** 2))
+    for _ in range(6):
+        stats = learner.update(buf, seats)
+    after = float(np.mean((_shared_values(critic, buf, np.arange(n), seats) - buf.ret[:n]) ** 2))
+    assert after < before
+    assert stats["critic/rows"] == n
+
+
+def test_a_shared_critic_population_trains_saves_and_resumes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, checkpoint_every=1)
+        assert cfg.shared_critic
+        out = train_population(cfg)
+        row = out["final"]
+        assert row["critic/rows"] == row["rollout/decisions"]
+        blob = torch.load(Path(tmp) / "final.pt", weights_only=False)
+        assert blob["critic"]["agents"] == AGENTS
+        # The agents are actors alone.
+        assert not any(k.startswith("critic.") for k in blob["agents"][0]["model"])
+        first = torch.load(Path(tmp) / "step_0000001.pt", weights_only=False)
+        assert any(not torch.equal(v, first["critic"]["model"][k])
+                   for k, v in blob["critic"]["model"].items())
+        one = read_checkpoint(f"{Path(tmp) / 'final.pt'}#2")
+        net = ActorCritic(ModelConfig(**one["model_config"]))
+        assert net.critic is None
+        load_model(net, one["model"])
+        # Resuming restores the shared critic too.
+        train_population(replace(cfg, total_steps=3, checkpoint_dir=tmp + "/b"),
+                         resume=Path(tmp) / "final.pt")
+        # A run with its own critics refuses a shared-critic checkpoint.
+        with pytest.raises(ValueError, match="shared critic"):
+            train_population(replace(cfg, total_steps=3, shared_critic=False,
+                                     checkpoint_dir=tmp + "/c"),
+                             resume=Path(tmp) / "final.pt")
+
+
+def test_agents_can_still_keep_their_own_critics() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = train_population(_cfg(tmp, shared_critic=False))
+        assert "critic/rows" not in out["final"]
+        blob = torch.load(Path(tmp) / "final.pt", weights_only=False)
+        assert "critic" not in blob
+        assert any(k.startswith("critic.") for k in blob["agents"][0]["model"])
+
+
+# --- the overlapped rollout ---------------------------------------------------
+
+
+def _check_round(buf: RolloutBuffer, stats: dict, hands: int) -> None:
+    n = len(buf)
+    assert stats["hands"] == hands and n == stats["decisions"] > 0
+    assert buf.candidate_mask[np.arange(n), buf.action[:n]].all()
+    assert set(np.unique(buf.episode[:n]).tolist()) == set(range(hands))
+    for e in range(hands):
+        rows = np.nonzero(buf.episode[:n] == e)[0]
+        assert int(buf.done[rows].sum()) == NUM_SEATS, e
+        assert (np.diff(buf.history_len[rows]) >= 0).all(), e
+
+
+def test_the_overlapped_rollout_keeps_every_invariant_round_after_round() -> None:
+    from ..train.parallel import RolloutPool
+
+    nets = _nets()
+    hands = 10
+    seat_of = hand_agents(_table(7), hands)
+    with RolloutPool(cfg=SMALL, workers=2, hands_per_round=hands) as pool:
+        # A second round on the same workers: a go-ahead left in a
+        # worker's queue by the first would be read as its next command.
+        for r in range(2):
+            buf, stats = pool.collect(nets, np.random.default_rng(r), None, n_hands=hands,
+                                      device="cpu", pool=6, agents=seat_of, overlap=True)
+            _check_round(buf, stats, hands)
+            _check_rows_belong_to_their_seats(nets, buf, seat_of)
+
+
+def test_the_overlapped_rollout_with_the_shared_critic() -> None:
+    nets, critic = _actors(), _shared()
+    hands = 8
+    seat_of = hand_agents(_table(8), hands)
+    buf, stats = collect_parallel(nets, np.random.default_rng(9), None, n_hands=hands,
+                                  device="cpu", cfg=ACTOR_ONLY, pool=6, workers=2,
+                                  agents=seat_of, critic=critic, overlap=True)
+    _check_round(buf, stats, hands)
+    _check_shared_values(critic, buf, seat_of)

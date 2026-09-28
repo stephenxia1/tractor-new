@@ -307,6 +307,8 @@ class _DeviceBases:
                       chunk: int) -> np.ndarray:
         """float32[N]: the critic's value, averaged over the sampled deals."""
         critic = net.critic
+        if critic is None:
+            raise ValueError("the critic-scored climb needs a network with its own critic")
         cfg = net.cfg
         dev = self.device
         assert self.others is not None

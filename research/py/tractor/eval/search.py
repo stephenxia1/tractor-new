@@ -213,6 +213,11 @@ def _forward(
     ).to(device)
     with torch.no_grad():
         out, value = _evaluate(net, obs, privileged)
+    if value is None:
+        raise ValueError(
+            "search scores leaves with the critic, and this network has none "
+            "(a population agent's critic is the population's shared one)"
+        )
     return packed, out, value
 
 

@@ -32,12 +32,20 @@ gave the single agent).
 Seatings are a function of ``(seed, epoch)`` rather than of a live
 generator, so a resumed run sits every agent where the original run
 would have.
+
+The critic is shared (``shared_critic``, the default, the user's call):
+one ``CardCritic`` for the whole population, trained on every row of the
+round by ``train.critic_learner``, reading the raw history and told
+which agent sits in each seat. It records every row's value in the
+rollout, and it values every seat's play start for the pre-play rewards.
+Each agent is then an actor alone -- its policy, its own value, belief
+and outcome heads -- updated on its own rows.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,12 +57,19 @@ from ..nn.arch import check_saved
 from ..nn.bury_net import BuryNet, BuryNetConfig
 from ..nn.declare import DeclareConfig, DeclareNet
 from ..nn.features import Cache
-from ..nn.model import ActorCritic, ModelConfig, load_model
+from ..nn.model import (
+    ActorCritic,
+    ModelConfig,
+    load_model,
+    relative_seat_agents,
+    shared_critic,
+)
 from ..sim.bury import BuryConfig
 from ..sim.state import NUM_SEATS
 from ..telemetry import Spans, memory_snapshot
 from .buffer import RolloutBuffer
 from .bury_loop import BuryLearner
+from .critic_learner import CriticLearner, CriticTrainConfig
 from .declare_loop import DeclareLearner, DeclareTrainConfig
 from .gae import compute_gae
 from .loop import TrainConfig, _prune, reward_mix
@@ -86,6 +101,10 @@ class PopulationConfig(TrainConfig):
     agents: int = 8
     reshuffle_every: int = 10
     pool: int = 2048
+    # One critic for every agent (the user's call, 2026-09-28): trained on
+    # all rows, told which agent sits in each seat, reading raw history.
+    # The agents are then actors alone. False gives each agent its own.
+    shared_critic: bool = True
 
 
 # Salts that keep the play and pre-play seating streams apart.
@@ -137,16 +156,25 @@ def _state(agent: _Agent, phases_done: int) -> dict:
 
 def save_population(
     path: Path, agents: list[_Agent], step: int, cfg: PopulationConfig,
-    phases_done: int,
+    phases_done: int, critic: CriticLearner | None = None,
 ) -> Path:
+    """All the agents, and the shared critic when there is one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    blob = {
         "step": step,
         "config": asdict(cfg),
         "model_config": asdict(agents[0].net.cfg),
         "phases_done": phases_done,
         "agents": [_state(a, phases_done) for a in agents],
-    }, path)
+    }
+    if critic is not None:
+        blob["critic"] = {
+            "model": critic.critic.state_dict(),
+            "optimizer": critic.opt.state_dict(),
+            "config": asdict(critic.critic.cfg),
+            "agents": critic.critic.agents,
+        }
+    torch.save(blob, path)
     return path
 
 
@@ -190,6 +218,7 @@ def _preplay_step(
     rng: np.random.Generator,
     device: torch.device,
     cache: Cache,
+    shared: Any = None,
 ) -> dict[str, float]:
     """One pre-play step for every agent, on one shared deal.
 
@@ -212,7 +241,7 @@ def _preplay_step(
         pre=cfg.pre, record=True, cache=cache, bury_net=bury_nets, agents=seat_of,
     )
     t_critic = time.perf_counter()
-    values = critic_values(nets, starts, device, agents=seat_of)
+    values = critic_values(nets, starts, device, agents=seat_of, shared=shared)
     landlord = np.array([s.landlord for s in starts], dtype=np.int64)
     t_update = time.perf_counter()
 
@@ -250,6 +279,7 @@ def _preplay_phase(
     device: torch.device,
     cache: Cache,
     block: int,
+    shared: Any = None,
 ) -> dict[str, float]:
     """``cfg.declare_phase_steps`` pre-play steps, reseating on schedule."""
     totals: dict[str, float] = {}
@@ -260,7 +290,7 @@ def _preplay_phase(
         epoch = (block * steps + i) // cfg.reshuffle_every
         st = _preplay_step(
             agents, seating(cfg.seed, epoch, cfg.agents, _PRE), declare_cfg, rng,
-            device, cache,
+            device, cache, shared,
         )
         for k, v in st.items():
             totals[k] = totals.get(k, 0.0) + float(v)
@@ -283,12 +313,51 @@ def _preplay_phase(
     return out
 
 
+def agent_model_config(cfg: PopulationConfig) -> ModelConfig:
+    """Each agent's network: an actor alone when the critic is shared."""
+    model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
+    return replace(model_cfg, critic_kind="none") if cfg.shared_critic else model_cfg
+
+
+def build_critic(cfg: PopulationConfig, device: torch.device) -> CriticLearner | None:
+    """The population's shared critic and its learner, or ``None``.
+
+    Its widths are the model config's critic widths; its optimiser takes
+    the actors' PPO settings, so the two halves of a step learn alike.
+    """
+    if not cfg.shared_critic:
+        return None
+    model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
+    ppo_cfg = PPOConfig(**cfg.ppo) if cfg.ppo else PPOConfig()
+    critic = shared_critic(model_cfg, cfg.agents).to(device)
+    return CriticLearner(critic, CriticTrainConfig(
+        lr=ppo_cfg.lr, minibatch=ppo_cfg.minibatch, epochs=ppo_cfg.epochs,
+        length_buckets=ppo_cfg.length_buckets, max_grad_norm=ppo_cfg.max_grad_norm,
+        bf16=ppo_cfg.bf16,
+    ), device)
+
+
+def load_critic(learner: CriticLearner | None, blob: dict) -> None:
+    """Restore the shared critic a population checkpoint holds."""
+    saved = blob.get("critic")
+    if learner is None:
+        if saved is not None:
+            raise ValueError("the checkpoint has a shared critic and this run does not")
+        return
+    if saved is None:
+        raise ValueError("this run shares a critic and the checkpoint has none")
+    if int(saved["agents"]) != learner.critic.agents:
+        raise ValueError(f"the checkpoint's critic knows {saved['agents']} agents")
+    learner.critic.load_state_dict(saved["model"])
+    learner.opt.load_state_dict(saved["optimizer"])
+
+
 def build_agents(
     cfg: PopulationConfig, device: torch.device, declare_cfg: DeclareTrainConfig
 ) -> list[_Agent]:
     """``cfg.agents`` fresh agents, built one after another from the current
     torch seed: independent initialisations, reproducible as a set."""
-    model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
+    model_cfg = agent_model_config(cfg)
     ppo_cfg = PPOConfig(**cfg.ppo) if cfg.ppo else PPOConfig()
     full_hand = cfg.declare_phase_steps > 0
     agents: list[_Agent] = []
@@ -355,7 +424,7 @@ def train_population(
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
+    model_cfg = agent_model_config(cfg)
     full_hand = cfg.declare_phase_steps > 0
     bury_cfg = BuryConfig(
         rounds=cfg.bury_rounds, consider=cfg.bury_consider,
@@ -368,10 +437,16 @@ def train_population(
     })
 
     agents = build_agents(cfg, device, declare_cfg)
+    critic = build_critic(cfg, device)
+    shared = None if critic is None else critic.critic
     start = 0
     phases_done = 0
     if resume is not None and Path(resume).exists():
         blob = torch.load(Path(resume), map_location="cpu", weights_only=False)
+        # The critic first: a shared-critic checkpoint's agents have no
+        # critics, and loading them into agents that do would fail on
+        # missing weights rather than on the reason.
+        load_critic(critic, blob)
         start = load_agents(agents, blob)
         phases_done = 0 if cfg.restart_schedule else int(blob.get("phases_done", 0))
         del blob
@@ -417,7 +492,7 @@ def train_population(
                 if block >= phases_done:
                     with spans.span("declare_phase"):
                         pre_stats = _preplay_phase(
-                            agents, cfg, declare_cfg, rng, device, cache, block
+                            agents, cfg, declare_cfg, rng, device, cache, block, shared
                         )
                     phases_done = block + 1
                 with spans.span("starts"):
@@ -437,10 +512,11 @@ def train_population(
                     n_hands=cfg.hands_per_step, device=device,
                     temperature=cfg.temperature, level_weight=level_weight,
                     pool=cfg.pool, amp=amp, spans=spans, starts=starts,
-                    agents=seat_of, chunks=cfg.forward_chunks,
+                    agents=seat_of, chunks=cfg.forward_chunks, critic=shared,
                 )
                 if rollout_pool is not None:
-                    buffer, stats = rollout_pool.collect(nets, rng, buffer, **kwargs)
+                    buffer, stats = rollout_pool.collect(
+                        nets, rng, buffer, overlap=cfg.rollout_overlap, **kwargs)
                 else:
                     stats = collect(nets, rng, buffer, cfg=model_cfg, **kwargs)
 
@@ -455,6 +531,11 @@ def train_population(
                     rows = np.nonzero(owner == k)[0]
                     agent.net.train()
                     per_agent.append(agent.learner.update(buffer, rows=rows))
+            critic_stats: dict[str, float] = {}
+            if critic is not None:
+                with spans.span("critic_update"):
+                    critic_stats = critic.update(buffer, relative_seat_agents(
+                        seat_of[buffer.episode[:n]], buffer.seat[:n]))
 
             now = time.perf_counter()
             elapsed = now - started
@@ -483,6 +564,7 @@ def train_population(
                 **{f"span/{k}": v["total"] for k, v in spans.summary().items()},
                 **{f"mem/{k}": v for k, v in memory_snapshot(device).items()},
                 **{f"pre/{k}": v for k, v in pre_stats.items()},
+                **critic_stats,
             }
             if run is not None:
                 run.log(row)
@@ -498,21 +580,23 @@ def train_population(
                 f"  gpu {100.0 * gpu_s / max(step_s, 1e-9):4.1f}%"
                 f"  {row.get('decisions_per_s', 0.0):5.0f} dec/s"
                 f"  ev {np.mean(evs):+.3f} [{min(evs):+.2f},{max(evs):+.2f}]"
-                f"  seats e{epoch}",
+                + (f"  critic {row.get('span/critic_update', 0.0):4.1f}s"
+                   if critic is not None else "")
+                + f"  seats e{epoch}",
                 flush=True,
             )
 
             if cfg.checkpoint_every and (step + 1) % cfg.checkpoint_every == 0:
                 written = save_population(
                     ckpt_dir / f"step_{step + 1:07d}.pt", agents, step + 1, cfg,
-                    phases_done,
+                    phases_done, critic,
                 )
                 _prune(ckpt_dir, cfg.keep_last)
                 if on_checkpoint is not None:
                     on_checkpoint(written)
 
         final = save_population(
-            ckpt_dir / "final.pt", agents, cfg.total_steps, cfg, phases_done
+            ckpt_dir / "final.pt", agents, cfg.total_steps, cfg, phases_done, critic
         )
         if on_checkpoint is not None:
             on_checkpoint(final)

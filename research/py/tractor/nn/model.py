@@ -49,9 +49,10 @@ so a benchmark has something to divide measured time by.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
-from typing import NamedTuple, Sequence
+from typing import Iterator, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -171,7 +172,9 @@ class ModelConfig:
     # ``critic_kind``: "flat" is ``Critic`` -- a transformer over the
     # history plus an MLP over the raw privileged counts, which is all it
     # reads at play start. "cards" is ``CardCritic`` -- one transformer
-    # over a context token, a token per card type and the history.
+    # over a context token, a token per card type and the history. "none"
+    # is an actor alone, for a population whose agents share one critic
+    # (``CardCritic`` with ``agents`` set, held outside the agents).
     critic_kind: str = "flat"
 
     def __post_init__(self) -> None:
@@ -183,8 +186,10 @@ class ModelConfig:
             raise ValueError("padded extents must be positive")
         if self.ffn not in ("gelu", "swiglu"):
             raise ValueError(f"ffn must be 'gelu' or 'swiglu', not {self.ffn!r}")
-        if self.critic_kind not in ("flat", "cards"):
-            raise ValueError(f"critic_kind must be 'flat' or 'cards', not {self.critic_kind!r}")
+        if self.critic_kind not in ("flat", "cards", "none"):
+            raise ValueError(
+                f"critic_kind must be 'flat', 'cards' or 'none', not {self.critic_kind!r}"
+            )
         if self.critic_kind == "flat" and self.ffn != "gelu":
             # The flat critic's privileged MLP adds the context into its
             # first layer by index; it is the legacy design and stays GELU.
@@ -272,8 +277,45 @@ class ActorOutput(NamedTuple):
 _MASK_INDEX: dict[tuple[int, str, int], Tensor] = {}
 
 
+# Static shapes: see ``static_shapes``.
+_STATIC = False
+
+
+@contextlib.contextmanager
+def static_shapes() -> Iterator[None]:
+    """Run the model on the history width it is handed.
+
+    By default the history encoder and the critics read the batch's
+    longest history back to the host and trim to it -- one sync per call,
+    and a new width almost every call. That is right for an eager model
+    and wrong for a compiled or ``vmap``-ped one: a host read is a graph
+    break (and impossible under ``vmap``), and a new width is a new graph.
+    Inside this context, and whenever ``torch.compile`` is tracing, the
+    caller trims the history to a width of its choosing -- a bucket, so
+    that there are few -- and the model computes on exactly that width.
+    Positions past a row's length are masked either way, so the values
+    are those of the eager path up to float rounding.
+    """
+    global _STATIC
+    before = _STATIC
+    _STATIC = True
+    try:
+        yield
+    finally:
+        _STATIC = before
+
+
+def _static() -> bool:
+    return _STATIC or torch.compiler.is_compiling()
+
+
 def _length_mask(lengths: Tensor, size: int) -> Tensor:
     """bool[B, size]: True for the first ``lengths[b]`` positions."""
+    if _static():
+        # No cache: a module-level dict is a side effect a trace cannot
+        # keep, and the arange is one small kernel.
+        idx = torch.arange(size, device=lengths.device)
+        return idx.unsqueeze(0) < lengths.unsqueeze(1).to(idx.dtype)
     device = lengths.device
     key = (size, device.type, -1 if device.index is None else device.index)
     idx = _MASK_INDEX.get(key)
@@ -616,6 +658,15 @@ class HistoryEncoder(nn.Module):
         length; the model is run eager, so a varying width costs no
         recompilation.
         """
+        if _static():
+            # The width the caller chose, and nothing read back.
+            width = history.shape[1]
+            keep = _length_mask(history_len, width)
+            gate = keep.unsqueeze(-1).to(history.dtype)
+            x = (self.in_proj(history) + self.pos[:width]) * gate
+            for block in self.blocks:
+                x = block(x) * gate
+            return self.norm(x) * gate, keep
         size = self.cfg.max_history
         keep = _length_mask(history_len, size)
         # At least one position, so an all-empty batch still runs the
@@ -1167,7 +1218,7 @@ class Critic(nn.Module):
             history_enc = history_enc.detach()
 
         b = history_enc.shape[0]
-        if b > 0 and int(history_len.max()) == 0:
+        if not _static() and b > 0 and int(history_len.max()) == 0:
             # No history in any row: every key but the CLS token is
             # masked, so CLS attends to itself alone and the pooled
             # vector is the same for every row. Computed once, on the CLS
@@ -1180,9 +1231,10 @@ class Critic(nn.Module):
                 x = block(x, one)
             pooled = self.norm(x[:, 0]).expand(b, self.cfg.critic_d)
         else:
-            keep = _length_mask(history_len, self.cfg.max_history)
+            width = history_enc.shape[1]
+            keep = _length_mask(history_len, width)
             gate = keep.unsqueeze(-1).to(history_enc.dtype)
-            h = (self.in_proj(history_enc) + self.pos) * gate
+            h = (self.in_proj(history_enc) + self.pos[:width]) * gate
 
             cls = self.cls.unsqueeze(0).expand(b, 1, self.cfg.critic_d)
             x = torch.cat((cls, h), dim=1)
@@ -1238,16 +1290,29 @@ class CardCritic(nn.Module):
     different context, and here the context is in every card token.
 
     ``detach`` behaves as in ``Critic``.
+
+    **Shared across a population** (``agents`` > 0): one critic for every
+    agent, so it cannot read any one agent's history encoding -- eight
+    encoders, eight representations. It reads the raw history tokens
+    instead (``history_in = HISTORY_DIM``), and four more tokens say
+    which agent sits in each seat, relative to the seat being valued:
+    the value of a position depends on who is playing it.
     """
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(self, cfg: ModelConfig, history_in: int | None = None,
+                 agents: int = 0) -> None:
         super().__init__()
         self.cfg = cfg
+        self.agents = int(agents)
+        self.history_in = int(history_in or cfg.d_model)
         cd = cfg.critic_d
         self.card_in = nn.Linear(CARD_CRITIC_IN, cd)
         self.card_embed = nn.Parameter(torch.zeros(NUM_TYPES, cd))
         self.ctx_in = nn.Linear(CONTEXT_DIM, cd)
-        self.hist_in = nn.Linear(cfg.d_model, cd)
+        self.hist_in = nn.Linear(self.history_in, cd)
+        if self.agents:
+            self.agent_embed = nn.Parameter(torch.zeros(self.agents, cd))
+            self.seat_embed = nn.Parameter(torch.zeros(NUM_REL_SEATS, cd))
         self.pos = nn.Parameter(torch.zeros(cfg.max_history, cd))
         self.cls = nn.Parameter(torch.zeros(1, cd))
         self.blocks = nn.ModuleList(
@@ -1259,6 +1324,9 @@ class CardCritic(nn.Module):
         self.apply(_init_module)
         for p in (self.card_embed, self.pos, self.cls):
             nn.init.normal_(p, std=0.02)
+        if self.agents:
+            for p in (self.agent_embed, self.seat_embed):
+                nn.init.normal_(p, std=0.02)
         _scale_residual_outputs(self.blocks)
 
     def forward(
@@ -1270,13 +1338,19 @@ class CardCritic(nn.Module):
         context: Tensor | None = None,
         cards: Tensor | None = None,
         trick: Tensor | None = None,
+        seat_agents: Tensor | None = None,
     ) -> Tensor:
-        """-> [B]. ``privileged`` float[B, 5, 54] raw counts; ``context``
-        float[B, CONTEXT_DIM]; ``cards`` float[B, 54, >= D_STATIC] whose
-        first ``D_STATIC`` columns are the static block; ``trick``
-        float[B, 4, 54] raw counts, or ``None`` for no trick in progress."""
+        """-> [B]. ``history_enc`` is the actor's encoding, or for a shared
+        critic the raw history tokens; ``privileged`` float[B, 5, 54] raw
+        counts; ``context`` float[B, CONTEXT_DIM]; ``cards`` float[B, 54,
+        >= D_STATIC] whose first ``D_STATIC`` columns are the static block;
+        ``trick`` float[B, 4, 54] raw counts, or ``None`` for no trick in
+        progress; ``seat_agents`` int64[B, 4], the agent in each relative
+        seat, for a shared critic."""
         if context is None or cards is None:
             raise ValueError("CardCritic needs the context and the card features")
+        if self.agents and seat_agents is None:
+            raise ValueError("a shared critic needs the agent in each seat")
         if detach:
             history_enc = history_enc.detach()
         b = privileged.shape[0]
@@ -1292,11 +1366,17 @@ class CardCritic(nn.Module):
         ctx_tok = self.ctx_in(context).unsqueeze(1)
         cls = self.cls.unsqueeze(0).expand(b, 1, cd)
 
-        parts = [cls, ctx_tok, card_tok]
-        keep = [torch.ones(b, 2 + NUM_TYPES, dtype=torch.bool, device=card_tok.device)]
+        parts = [cls, ctx_tok]
+        if self.agents:
+            parts.append(self.agent_embed[seat_agents] + self.seat_embed)  # [B, 4, cd]
+        parts.append(card_tok)
+        fixed = sum(p.shape[1] for p in parts)
+        keep = [torch.ones(b, fixed, dtype=torch.bool, device=card_tok.device)]
         # Only to the longest real history in the batch: past it every
         # key is masked, so the rest would be arithmetic on padding.
-        longest = int(history_len.max()) if b else 0
+        # Static: the width handed in. Otherwise only to the longest real
+        # history in the batch.
+        longest = history_enc.shape[1] if _static() else (int(history_len.max()) if b else 0)
         if longest > 0:
             hist_keep = _length_mask(history_len, longest)
             h = self.hist_in(history_enc[:, :longest]) + self.pos[:longest]
@@ -1311,6 +1391,24 @@ class CardCritic(nn.Module):
         return self.head(self.norm(x[:, 0])).squeeze(-1)
 
 
+def shared_critic(cfg: ModelConfig, agents: int) -> CardCritic:
+    """The one critic a population of ``agents`` shares: ``CardCritic`` at
+    ``cfg``'s critic widths, reading raw history and the seats' agents."""
+    return CardCritic(cfg, history_in=HISTORY_DIM, agents=agents)
+
+
+def relative_seat_agents(table: np.ndarray, seat: np.ndarray) -> np.ndarray:
+    """int64[n, 4]: the agent in each seat relative to ``seat[i]``.
+
+    ``table`` is int64[n, 4], row ``i`` the agents of row ``i``'s hand by
+    absolute seat. Column 0 is the seat itself, 1 the next, 2 its
+    partner, 3 the one before -- the order every other relative view
+    here uses.
+    """
+    rel = (np.asarray(seat, dtype=np.int64)[:, None] + np.arange(NUM_REL_SEATS)) % NUM_REL_SEATS
+    return np.take_along_axis(np.asarray(table, dtype=np.int64), rel, axis=1)
+
+
 class ActorCritic(nn.Module):
     """Convenience container. The two towers stay addressable apart."""
 
@@ -1318,14 +1416,21 @@ class ActorCritic(nn.Module):
         super().__init__()
         self.cfg = cfg or ModelConfig()
         self.actor = TractorNet(self.cfg)
+        kind = self.cfg.critic_kind
         self.critic = (
-            CardCritic(self.cfg) if self.cfg.critic_kind == "cards" else Critic(self.cfg)
+            CardCritic(self.cfg) if kind == "cards"
+            else None if kind == "none"
+            else Critic(self.cfg)
         )
 
     def forward(
         self, obs: ObsBatch, privileged: Tensor, detach_critic: bool = True
-    ) -> tuple[ActorOutput, Tensor]:
+    ) -> tuple[ActorOutput, Tensor | None]:
+        """-> ``(ActorOutput, value)``; ``value`` is ``None`` for an actor
+        whose critic is held elsewhere (``critic_kind="none"``)."""
         out = self.actor(obs)
+        if self.critic is None:
+            return out, None
         value = self.critic(
             out.history_enc,
             obs.history_len,
@@ -1742,7 +1847,9 @@ def analytic_flops(
     cd = cfg.critic_d
     cff = cfg.critic_d_ff
     ch = cfg.critic_heads
-    if cfg.critic_kind == "cards":
+    if cfg.critic_kind == "none":
+        crit = 0
+    elif cfg.critic_kind == "cards":
         crit = _card_critic_flops(cfg, lh, lin, elem, norm, hidden, sa_ffn_block) * batch
     else:
         lc = lh + 1  # + the CLS token
@@ -1811,6 +1918,9 @@ __all__ = [
     "CandidateScorer",
     "CardCritic",
     "Critic",
+    "relative_seat_agents",
+    "shared_critic",
+    "static_shapes",
     "HistoryEncoder",
     "MASK_LOGIT",
     "ModelConfig",

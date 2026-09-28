@@ -225,7 +225,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_evaluator: str = "actor", bury_policy: bool = False,
            restart_schedule: bool = False, population: int = 0,
            reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
-           forward_chunks: int = 1) -> None:
+           forward_chunks: int = 1, rollout_overlap: bool = False) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -296,6 +296,9 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     # Measured at 4096 hands, v6, eight agents: 2 saves 1-3 s of a ~65 s
     # round, 3 costs 13-15 s -- each forward carries a fixed overhead.
     extra["forward_chunks"] = forward_chunks
+    # Two halves per rollout worker taking turns with the forward; pair it
+    # with a doubled --pool so each forward stays as wide.
+    extra["rollout_overlap"] = rollout_overlap
     call = fn.spawn(
         steps,
         hands,

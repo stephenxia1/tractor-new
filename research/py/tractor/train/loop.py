@@ -96,6 +96,9 @@ class TrainConfig:
     # Forwards per network per lockstep round, rows split by history
     # length (``rollout.routed_step``). 1 is one forward, as before.
     forward_chunks: int = 1
+    # Two halves per rollout worker taking turns with the parent's forward
+    # (``RolloutPool.collect(overlap=)``). Parallel rollout only.
+    rollout_overlap: bool = False
 
     # Reward anneal, described in the module docstring. Both zero:
     # the reward is trick points and the terminal level term is off.
@@ -537,6 +540,7 @@ def train(
                         spans=spans,
                         starts=starts,
                         chunks=cfg.forward_chunks,
+                        overlap=cfg.rollout_overlap,
                     )
                 else:
                     stats = collect(

@@ -130,8 +130,8 @@ def _pop_profile(checkpoint: str, arch: str, hands: int, declare_hands: int,
     from tractor.train.gae import compute_gae
     from tractor.train.parallel import RolloutPool
     from tractor.train.population import (
-        _PRE, PopulationConfig, _preplay_step, build_agents, hand_agents,
-        load_agents, seating,
+        _PRE, PopulationConfig, _preplay_step, build_agents, build_critic, hand_agents,
+        load_agents, load_critic, seating,
     )
     from tractor.train.ppo import _minibatches
     from tractor.train.starts import PrePlayConfig
@@ -152,8 +152,12 @@ def _pop_profile(checkpoint: str, arch: str, hands: int, declare_hands: int,
     })
     torch.manual_seed(0)
     agents = build_agents(cfg, dev, declare_cfg)
+    critic_learner = build_critic(cfg, dev)
+    shared = None if critic_learner is None else critic_learner.critic
     if checkpoint:
-        load_agents(agents, torch.load(checkpoint, map_location="cpu", weights_only=False))
+        blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        load_critic(critic_learner, blob)
+        load_agents(agents, blob)
     nets = [a.net for a in agents]
     mcfg = nets[0].cfg
     rng = np.random.default_rng(0)
@@ -167,13 +171,15 @@ def _pop_profile(checkpoint: str, arch: str, hands: int, declare_hands: int,
         pool = RolloutPool(cfg=mcfg, workers=workers, hands_per_round=hands)
         try:
             pool.collect(nets, rng, buf, n_hands=256, device=dev, pool=cfg.pool, amp=True,
-                         level_weight=0.0, agents=seat_of[:256])  # warm the device
+                         level_weight=0.0, agents=seat_of[:256],
+                         critic=shared)  # warm the device
             for chunks in chunk_counts:
                 spans = Spans(enabled=True, device=dev)
                 t0 = time.perf_counter()
                 buf, st = pool.collect(nets, rng, buf, n_hands=hands, device=dev,
                                        pool=cfg.pool, amp=True, level_weight=0.0,
-                                       spans=spans, agents=seat_of, chunks=chunks)
+                                       spans=spans, agents=seat_of, chunks=chunks,
+                                       critic=shared)
                 collect_s = time.perf_counter() - t0
                 parts = {k: v["total"] for k, v in spans.summary().items()}
                 out["collect"][f"workers {workers}, chunks {chunks}"] = {
@@ -278,7 +284,8 @@ def _pop_profile(checkpoint: str, arch: str, hands: int, declare_hands: int,
     # -- 4. one pre-play step -------------------------------------------------
     sync()
     a = time.perf_counter()
-    st = _preplay_step(agents, seating(0, 0, cfg.agents, _PRE), declare_cfg, rng, dev, Cache())
+    st = _preplay_step(agents, seating(0, 0, cfg.agents, _PRE), declare_cfg, rng, dev, Cache(),
+                       shared)
     sync()
     out["preplay"] = {
         "seconds": time.perf_counter() - a,
@@ -314,3 +321,332 @@ def pop_profile(checkpoint: str = "", arch: str = "v6", hands: int = 4096,
     print(table)
     with open(f"runs/pop-profile-{arch}.json", "w") as fh:
         json.dump({**res, "update_kernels": table}, fh, indent=2)
+
+
+# --- torch.compile, larger minibatches, stacked updates ------------------------
+
+
+def _opt_bench(arch: str, hands: int, n_timed: int) -> dict:
+    """Update and forward throughput under each candidate optimisation.
+
+    All in one container, on one round of real rows, because host CPUs
+    differ between containers by more than some of these effects.
+
+    What the earlier compile attempt got wrong, and what this avoids
+    (``PPOConfig.compile``'s notes):
+
+    * Ragged minibatches -- the last of every epoch was 24 rows against
+      256 -- recompiled the graph for each new size. Here every timed
+      minibatch is exactly ``m`` rows (ragged tails are left out, and the
+      fraction dropped reported).
+    * The history encoder read ``history_len.max()`` on the host to trim
+      each batch, a graph break and a new width per minibatch. Here the
+      caller trims to a bucket -- a multiple of 16 -- and the model runs
+      in ``static_shapes`` mode, trusting the width it is handed: at most
+      eight widths, each compiled once.
+    * Eight agents are eight module instances; whether their identical
+      graphs are shared or recompiled per agent is measured, and the
+      dynamo cache is widened so a recompile shows up as time rather
+      than as a silent fall back to eager.
+    """
+    import contextlib
+    import time
+    from dataclasses import replace
+
+    import numpy as np
+    import torch
+    import torch._dynamo
+
+    from tractor.nn.arch import ARCHES
+    from tractor.nn.model import (
+        ActorCritic, ModelConfig, ObsBatch, shared_critic, static_shapes,
+    )
+    from tractor.train.buffer import RolloutBuffer
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import hand_agents, seating
+    from tractor.train.ppo import PPOConfig, PPOLearner, _minibatches
+
+    torch._dynamo.config.cache_size_limit = 256
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+    dev = torch.device("cuda")
+
+    def sync() -> None:
+        torch.cuda.synchronize()
+
+    base = ModelConfig(**ARCHES[arch]["model"])
+    actor_cfg = replace(base, critic_kind="none")
+    torch.manual_seed(0)
+    nets = [ActorCritic(actor_cfg).to(dev) for _ in range(8)]
+    critic = shared_critic(base, 8).to(dev)
+    rng = np.random.default_rng(0)
+    seat_of = hand_agents(seating(0, 0, 8), hands)
+    buf = RolloutBuffer(hands * 100, actor_cfg)
+    out: dict = {"collect": {}}
+
+    # -- 0. the rollout: lockstep against overlapped, at two pool widths ------
+    from tractor.telemetry import Spans
+
+    with RolloutPool(cfg=actor_cfg, workers=10, hands_per_round=hands) as pool:
+        pool.collect(nets, rng, buf, n_hands=hands, device=dev, pool=2048, amp=True,
+                     level_weight=0.0, agents=seat_of, critic=critic)  # warm
+        for name, width, overlap in (("lockstep, pool 2048", 2048, False),
+                                     ("overlap, pool 2048", 2048, True),
+                                     ("overlap, pool 4096", 4096, True),
+                                     ("lockstep, pool 4096", 4096, False)):
+            spans = Spans(enabled=True, device=dev)
+            t0 = time.perf_counter()
+            buf, st = pool.collect(nets, rng, buf, n_hands=hands, device=dev, pool=width,
+                                   amp=True, level_weight=0.0, agents=seat_of,
+                                   critic=critic, spans=spans, overlap=overlap)
+            secs = time.perf_counter() - t0
+            parts = {k: round(v["total"], 2) for k, v in spans.summary().items()}
+            out["collect"][name] = {"seconds": secs, "forwards": st["forwards"],
+                                    "mean_batch": st["mean_batch"], **parts}
+            print(f"  collect {name:22} {secs:6.1f}s  forwards {st['forwards']}  "
+                  f"batch {st['mean_batch']:.0f}  {parts}", flush=True)
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    n = len(buf)
+    out.update({"rows": n, "mean_history": float(buf.history_len[:n].mean())})
+
+    def bucket(width: int) -> int:
+        return min(128, max(16, -(-width // 16) * 16))
+
+    def batches(m: int, static: bool) -> list:
+        order = rng.permutation(n)
+        mbs = _minibatches(order, buf, m, 4)
+        if static:
+            full = [b for b in mbs if len(b) == m]
+            out.setdefault("dropped_rows_frac", {})[m] = 1 - sum(map(len, full)) / n
+            mbs = full
+        return mbs
+
+    def load(idx: np.ndarray, static: bool):
+        obs, priv, sc = buf.as_torch(idx, dev)
+        if static:
+            w = bucket(int(buf.history_len[idx].max()))
+            obs = obs._replace(history=obs.history[:, :w].contiguous())
+        return obs, priv, sc
+
+    # -- 1. the update, per minibatch ----------------------------------------
+    def update_arm(name: str, m: int, static: bool, mode: str | None,
+                   agent: int = 0) -> dict:
+        net = nets[agent]
+        learner = PPOLearner(net, PPOConfig(minibatch=m, length_buckets=4,
+                                            check_actions=mode is None), dev)
+        fn = learner.losses
+        if mode is not None:
+            fn = torch.compile(learner.losses, dynamic=False,
+                               mode=None if mode == "default" else mode)
+        mbs = batches(m, static)
+        widths_seen: dict = {}
+        first_calls = 0.0
+        ctx = static_shapes() if static else contextlib.nullcontext()
+        net.train()
+        with ctx:
+            # Warm: every width the timed minibatches will use, once.
+            for idx in mbs:
+                w = bucket(int(buf.history_len[idx].max())) if static else 0
+                if w in widths_seen:
+                    continue
+                obs, priv, sc = load(idx, static)
+                sync()
+                t0 = time.perf_counter()
+                loss, _p = fn(obs, priv, sc)
+                learner.opt.zero_grad(set_to_none=True)
+                loss.backward()
+                learner.opt.step()
+                sync()
+                widths_seen[w] = time.perf_counter() - t0
+                first_calls += widths_seen[w]
+            timed = mbs[:n_timed]
+            sync()
+            t0 = time.perf_counter()
+            for idx in timed:
+                obs, priv, sc = load(idx, static)
+                loss, _p = fn(obs, priv, sc)
+                learner.opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                learner.opt.step()
+            sync()
+            elapsed = time.perf_counter() - t0
+        rows = sum(map(len, timed))
+        res = {
+            "minibatch": m, "static": static, "mode": mode or "eager",
+            "ms_per_minibatch": elapsed / len(timed) * 1e3,
+            "us_per_row": elapsed / rows * 1e6,
+            "widths": len(widths_seen), "first_calls_s": first_calls,
+        }
+        print(f"  update {name:22} {res['ms_per_minibatch']:7.2f} ms/mb "
+              f"{res['us_per_row']:6.1f} us/row  widths {len(widths_seen)}  "
+              f"first calls {first_calls:6.1f}s", flush=True)
+        return res
+
+    out["update"] = {}
+    arms = [
+        ("eager 256", 256, False, None),
+        ("eager 256 static", 256, True, None),
+        ("eager 512 static", 512, True, None),
+        ("eager 1024 static", 1024, True, None),
+        ("compile 256", 256, True, "default"),
+        ("compile 1024", 1024, True, "default"),
+        ("cudagraphs 256", 256, True, "reduce-overhead"),
+        ("cudagraphs 1024", 1024, True, "reduce-overhead"),
+    ]
+    for name, m, static, mode in arms:
+        try:
+            out["update"][name] = update_arm(name, m, static, mode)
+        except Exception as exc:  # noqa: BLE001 - a failed arm is a finding
+            out["update"][name] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
+            print(f"  update {name}: FAILED {out['update'][name]['error']}", flush=True)
+        torch._dynamo.reset()
+
+    # Does a second agent reuse the first's compiled graphs?
+    try:
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        a = update_arm("compile 256 agent 0", 256, True, "default", agent=0)
+        graphs_after_first = counters["stats"]["unique_graphs"]
+        b = update_arm("compile 256 agent 1", 256, True, "default", agent=1)
+        out["cross_agent"] = {
+            "graphs_after_agent0": graphs_after_first,
+            "graphs_after_agent1": counters["stats"]["unique_graphs"],
+            "agent1_first_calls_s": b["first_calls_s"],
+            "agent0_first_calls_s": a["first_calls_s"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["cross_agent"] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
+    torch._dynamo.reset()
+
+    # Compiled and eager agree on one minibatch.
+    try:
+        net = nets[2]
+        learner = PPOLearner(net, PPOConfig(check_actions=False), dev)
+        idx = batches(256, True)[0]
+        obs, priv, sc = load(idx, True)
+        with static_shapes():
+            eager_loss, _p = learner.losses(obs, priv, sc)
+            comp_loss, _p = torch.compile(learner.losses, dynamic=False)(obs, priv, sc)
+        out["agreement"] = {"eager": float(eager_loss), "compiled": float(comp_loss)}
+        # And the static path agrees with the host-trimmed one.
+        full_obs, _pr, _sc = buf.as_torch(idx, dev)
+        trimmed_loss, _p = learner.losses(full_obs, priv, sc)
+        out["agreement"]["eager_trimmed"] = float(trimmed_loss)
+    except Exception as exc:  # noqa: BLE001
+        out["agreement"] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
+    torch._dynamo.reset()
+
+    # -- 2. the rollout forward: one agent, ~190 rows; the critic, ~1500 --------
+    def fwd_arm(name: str, module, rows: int, mode: str | None, critic_call: bool) -> dict:
+        idx = np.sort(rng.choice(n, size=rows, replace=False))
+        obs, priv, _sc = load(idx, True)
+        seats = torch.zeros(rows, 4, dtype=torch.int64, device=dev)
+
+        def call():
+            if critic_call:
+                return module(obs.history, obs.history_len, priv, context=obs.context,
+                              cards=obs.cards, trick=obs.planes[:, 5:9], seat_agents=seats)
+            return module(obs, priv)
+
+        fn = call if mode is None else torch.compile(
+            call, dynamic=False, mode=None if mode == "default" else mode)
+        module.eval()
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16), static_shapes():
+            sync()
+            t0 = time.perf_counter()
+            fn()
+            fn()
+            sync()
+            first = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            for _ in range(30):
+                fn()
+            sync()
+            ms = (time.perf_counter() - t0) / 30 * 1e3
+        print(f"  forward {name:26} {ms:7.2f} ms  first {first:6.1f}s", flush=True)
+        return {"ms": ms, "first_s": first}
+
+    out["forward"] = {}
+    for name, module, rows, mode, is_critic in [
+        ("actor 192 eager", nets[0], 192, None, False),
+        ("actor 192 compile", nets[0], 192, "default", False),
+        ("actor 192 cudagraphs", nets[0], 192, "reduce-overhead", False),
+        ("critic 1536 eager", critic, 1536, None, True),
+        ("critic 1536 compile", critic, 1536, "default", True),
+        ("critic 1536 cudagraphs", critic, 1536, "reduce-overhead", True),
+    ]:
+        try:
+            out["forward"][name] = fwd_arm(name, module, rows, mode, is_critic)
+        except Exception as exc:  # noqa: BLE001
+            out["forward"][name] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
+            print(f"  forward {name}: FAILED {out['forward'][name]['error']}", flush=True)
+        torch._dynamo.reset()
+
+    # -- 3. eight agents stacked: vmap over their parameters --------------------
+    try:
+        from torch.func import functional_call, stack_module_state, vmap
+
+        m = 256
+        mbs = batches(m, True)[:8]
+        w = max(bucket(int(buf.history_len[i].max())) for i in mbs)
+        loaded = [buf.as_torch(i, dev) for i in mbs]
+        obs = ObsBatch(*(torch.stack([o[0][f][:, :w] if f == 0 else o[0][f]
+                                      for o in loaded]) for f in range(len(ObsBatch._fields))))
+        priv = torch.stack([o[1] for o in loaded])
+        params, buffers = stack_module_state(nets)
+        base_net = nets[0]
+
+        def one(p, b, o, pr):
+            out_, _v = functional_call(base_net, (p, b), (ObsBatch(*o), pr))
+            return out_.log_probs.logsumexp(-1).mean() + out_.value.mean()
+
+        def run_stacked():
+            with static_shapes(), torch.autocast("cuda", dtype=torch.bfloat16):
+                losses = vmap(one)(params, buffers, tuple(obs), priv)
+            losses.sum().backward()
+
+        def run_loop():
+            with static_shapes(), torch.autocast("cuda", dtype=torch.bfloat16):
+                total = 0.0
+                for k, net in enumerate(nets):
+                    o = ObsBatch(*(t[k] for t in obs))
+                    out_, _v = net(o, priv[k])
+                    total = total + out_.log_probs.logsumexp(-1).mean() + out_.value.mean()
+            total.backward()
+
+        for p in params.values():
+            p.requires_grad_(True)
+        timings = {}
+        for name, fn in (("stacked (vmap)", run_stacked), ("eight in a loop", run_loop)):
+            fn()
+            sync()
+            t0 = time.perf_counter()
+            for _ in range(10):
+                fn()
+            sync()
+            timings[name] = (time.perf_counter() - t0) / 10 * 1e3
+            print(f"  eight agents fwd+bwd, {name:16} {timings[name]:7.1f} ms", flush=True)
+        out["stacked"] = {"width": w, "ms": timings}
+    except Exception as exc:  # noqa: BLE001
+        out["stacked"] = {"error": f"{type(exc).__name__}: {exc}"[:800]}
+        print(f"  stacked: FAILED {out['stacked']['error']}", flush=True)
+    return out
+
+
+@app.function(image=image, gpu="L40S", volumes={VOLUME: volume}, timeout=3 * 3600,
+              cpu=12.0, memory=65536)
+def opt_bench_l40s(arch: str, hands: int, n_timed: int) -> dict:
+    return _opt_bench(arch, hands, n_timed)
+
+
+@app.local_entrypoint()
+def opt_bench(arch: str = "v6", hands: int = 4096, n_timed: int = 60) -> None:
+    """``modal run modal_perf.py::opt_bench``: compile, minibatch size, stacking."""
+    import json
+
+    res = opt_bench_l40s.remote(arch, hands, n_timed)
+    print(json.dumps(res, indent=2))
+    with open(f"runs/opt-bench-{arch}.json", "w") as fh:
+        json.dump(res, fh, indent=2)
