@@ -240,8 +240,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            restart_schedule: bool = False, population: int = 0,
            reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
            forward_chunks: int = 1, rollout_overlap: bool = False,
-           compile: bool = False, cuda_graphs: bool = False,
-           history_cache: bool = False) -> None:
+           compile: bool = False, cuda_graphs: bool = False) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -318,9 +317,6 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     # --compile compiles the rollout's forwards too (dynamic shapes): a
     # round 101.8 -> 62.7 ms on an L40S, ~4 min of compiling up front.
     extra["rollout_forwards"] = "compiled" if compile else "eager"
-    # Each (hand, seat)'s history encoded a trick at a time in the rollout,
-    # the actors' and the shared critic's (rollout.RolloutCaches).
-    extra["history_cache"] = history_cache
     call = fn.spawn(
         steps,
         hands,

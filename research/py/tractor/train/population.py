@@ -522,7 +522,7 @@ def train_population(
                     temperature=cfg.temperature, level_weight=level_weight,
                     pool=cfg.pool, amp=amp, spans=spans, starts=starts,
                     agents=seat_of, chunks=cfg.forward_chunks, critic=shared,
-                    forwards=cfg.rollout_forwards, history_cache=cfg.history_cache,
+                    forwards=cfg.rollout_forwards,
                 )
                 if rollout_pool is not None:
                     buffer, stats = rollout_pool.collect(

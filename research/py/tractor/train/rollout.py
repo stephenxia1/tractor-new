@@ -95,7 +95,6 @@ from ..gen.episode import deal_sizes, generate
 from ..nn.features import PLANE_TRICK, POINTS_PER_DECK, Cache, encode
 from ..nn.model import (
     MASK_LOGIT,
-    HistoryStore,
     ModelConfig,
     ObsBatch,
     history_bucket,
@@ -229,74 +228,38 @@ def _pack(
     )
 
 
-def _evaluate(net: Any, obs: Any, privileged: torch.Tensor,
-              history_enc: torch.Tensor | None = None) -> tuple[Any, Any]:
+def _evaluate(net: Any, obs: Any, privileged: torch.Tensor) -> tuple[Any, Any]:
     """``(ActorOutput, value)`` from an ActorCritic, or from a bare actor.
 
     An ``ActorCritic`` is the intended argument and gives the privileged
     value the critic exists for. A bare ``TractorNet`` is accepted so that
     a smoke test or an evaluation run does not have to build a critic it
     will not use; its own imperfect-information value head answers
-    instead. ``history_enc`` is the net's own encoding of the history,
-    from a ``HistoryStore``, when the caller keeps one.
+    instead.
     """
     actor = getattr(net, "actor", None)
     if actor is not None:
         # An ActorCritic; with no critic of its own (a population sharing
         # one) the value is ``None`` and the caller supplies it.
-        if net.critic is not None:
-            return net(obs, privileged, history_enc=history_enc)
-        return actor(obs, history_enc), None
-    out = net(obs, history_enc)
+        return net(obs, privileged) if net.critic is not None else (actor(obs), None)
+    out = net(obs)
     return out, out.value
 
 
-def _actor_forward(net: Any, obs: Any, privileged: torch.Tensor,
-                   history_enc: torch.Tensor | None = None) -> tuple[Any, Any]:
+def _actor_forward(net: Any, obs: Any, privileged: torch.Tensor) -> tuple[Any, Any]:
     """``(logits, value)``: ``_evaluate``, keeping only what the sampler reads."""
-    out, values = _evaluate(net, obs, privileged, history_enc)
+    out, values = _evaluate(net, obs, privileged)
     return out.logits, values
 
 
 def _critic_forward(critic: Any, obs: Any, privileged: torch.Tensor,
-                    seat_agents: torch.Tensor,
-                    history_enc: torch.Tensor | None = None) -> torch.Tensor:
-    """A population's shared critic on a batch of rows; ``history_enc``,
-    its own encoder's encoding from a ``HistoryStore``, in place of
-    encoding the history again."""
+                    seat_agents: torch.Tensor) -> torch.Tensor:
+    """A population's shared critic on a batch of rows."""
     return critic(
-        obs.history if history_enc is None else history_enc, obs.history_len, privileged,
-        context=obs.context, cards=obs.cards,
-        trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_SEATS],
-        seat_agents=seat_agents, encoded=history_enc is not None,
+        obs.history, obs.history_len, privileged, context=obs.context,
+        cards=obs.cards, trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_SEATS],
+        seat_agents=seat_agents,
     )
-
-
-class RolloutCaches:
-    """The history stores of one round of play (``model.HistoryStore``).
-
-    A slot is a (hand, seat), numbered ``hand * 4 + seat``. Each agent's
-    encoder keeps a store over the slots it plays, and a shared critic
-    with an encoder of its own a store over all of them. At 4096 hands,
-    v6: about 11 GB for the actors and 11 GB for the critic, in bf16.
-    """
-
-    def __init__(self, nets: list, critic: Any, seating: np.ndarray | None,
-                 n_hands: int, device: Any, dtype: torch.dtype) -> None:
-        n = n_hands * NUM_SEATS
-        owner = (np.zeros(n, dtype=np.int64) if seating is None
-                 else np.asarray(seating, dtype=np.int64)[:n_hands].reshape(-1))
-        self.local = np.zeros(n, dtype=np.int64)
-        self.actors: list[HistoryStore | None] = []
-        for agent, net in enumerate(nets):
-            mine = np.nonzero(owner == agent)[0]
-            self.local[mine] = np.arange(len(mine))
-            actor = getattr(net, "actor", net)
-            self.actors.append(
-                HistoryStore(actor.history, len(mine), device, dtype) if len(mine) else None
-            )
-        encoder = getattr(critic, "encoder", None)
-        self.critic = None if encoder is None else HistoryStore(encoder, n, device, dtype)
 
 
 FORWARDS = ("eager", "static", "compiled")
@@ -403,8 +366,6 @@ def routed_step(
     critic: Any = None,
     seat_agents: np.ndarray | None = None,
     forwards: str = "eager",
-    caches: RolloutCaches | None = None,
-    cache_slots: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each row through its owner's network. -> ``(slots, logp, value)``.
 
@@ -433,13 +394,7 @@ def routed_step(
     dynamic shapes. Measured on an L40S (v6, pool 4096, the shared
     critic): a 1140-row round 101.8 ms eager, 62.7 ms compiled, after
     about four minutes of compiling the first rounds of a run.
-
-    ``caches``, with each row's (hand, seat) slot in ``cache_slots`` and
-    its history length in ``lengths``, encodes only the history each row
-    has added since its slot's last decision (``RolloutCaches``).
     """
-    if caches is not None and (cache_slots is None or lengths is None):
-        raise ValueError("a history cache needs each row's slot and history length")
     actor_fn, critic_fn = _forwards(forwards)
     static = forwards != "eager"
     n = len(owner)
@@ -459,20 +414,13 @@ def routed_step(
                 obs, privileged = gather(part)
             with _span(spans, "forward"):
                 net = nets[int(agent)]
-                cut = obs
                 if static:
                     width = history_bucket(_longest(lengths, part, obs))
                     cut = obs._replace(history=obs.history[:, :width].contiguous())
-                enc = None
-                store = None if caches is None else caches.actors[int(agent)]
-                if store is not None:
-                    enc = store.advance(caches.local[cache_slots[part]], cut.history,
-                                        lengths[part])
-                if static:
                     with static_shapes():
-                        logits, values = actor_fn(net, cut, privileged, enc)
+                        logits, values = actor_fn(net, cut, privileged)
                 else:
-                    logits, values = actor_fn(net, cut, privileged, enc)
+                    logits, values = actor_fn(net, obs, privileged)
             with _span(spans, "sample"):
                 slots[part], logp[part] = _choose(
                     logits, obs.candidate_mask, temperature, greedy, rng
@@ -494,14 +442,10 @@ def routed_step(
             if static:
                 width = history_bucket(_longest(lengths, order, obs))
                 obs = obs._replace(history=obs.history[:, :width].contiguous())
-            enc = None
-            if caches is not None and caches.critic is not None:
-                enc = caches.critic.advance(cache_slots[order], obs.history, lengths[order])
-            if static:
                 with static_shapes():
-                    v = critic_fn(critic, obs, privileged, seats, enc)
+                    v = critic_fn(critic, obs, privileged, seats)
             else:
-                v = critic_fn(critic, obs, privileged, seats, enc)
+                v = critic_fn(critic, obs, privileged, seats)
             value[order] = v.detach().float().cpu().numpy()
     return slots, logp, value
 
@@ -617,7 +561,6 @@ def collect(
     chunks: int = 1,
     critic: Any = None,
     forwards: str = "eager",
-    history_cache: bool = False,
 ) -> dict[str, float]:
     """Play ``n_hands`` self-play hands into ``buffer``.
 
@@ -693,11 +636,6 @@ def collect(
     next_episode = 0 if filled == 0 else int(buffer.episode[:filled].max()) + 1
     # A hand's index into ``starts`` and ``agents`` is its episode less this.
     first_episode = next_episode
-    # Each (hand, seat)'s history encoded once, a trick at a time.
-    caches = RolloutCaches(
-        nets, critic, seating, n_hands, device,
-        torch.bfloat16 if amp and device.type == "cuda" else torch.float32,
-    ) if history_cache else None
 
     active: list[_InFlight] = []
     started = 0
@@ -766,8 +704,7 @@ def collect(
                 slots, chosen_logp, value_np = routed_step(
                     nets, owner, gather, temperature, greedy, rng, spans,
                     lengths=np.array([d.history_len for d in packed]), chunks=chunks,
-                    critic=critic, forwards=forwards, caches=caches,
-                    cache_slots=hand_idx * NUM_SEATS + seats,
+                    critic=critic, forwards=forwards,
                     seat_agents=(
                         None if critic is None
                         else relative_seat_agents(seating[hand_idx], seats)

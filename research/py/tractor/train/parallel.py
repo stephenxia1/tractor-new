@@ -61,10 +61,8 @@ from ..nn.features import POINTS_PER_DECK, Cache
 from ..nn.model import ModelConfig
 from .buffer import RolloutBuffer, obs_batch_from_arrays
 from ..nn.model import relative_seat_agents
-from ..sim.state import NUM_SEATS
 from .rollout import (
     DECKS,
-    RolloutCaches,
     _credit_terminal,
     _credit_trick,
     _InFlight,
@@ -306,7 +304,6 @@ class RolloutPool:
         critic: Any = None,
         overlap: bool = False,
         forwards: str = "eager",
-        history_cache: bool = False,
     ) -> tuple[RolloutBuffer, dict[str, float]]:
         """One round. -> ``(buffer, stats)``, same keys as ``collect``.
 
@@ -355,11 +352,6 @@ class RolloutPool:
                 n.eval()
 
         started_at = time.perf_counter()
-        # Each (hand, seat)'s history encoded once, a trick at a time.
-        caches = RolloutCaches(
-            nets, critic, seating, n_hands, device,
-            torch.bfloat16 if amp and torch.device(device).type == "cuda" else torch.float32,
-        ) if history_cache else None
         totals = dict.fromkeys(_STAT_KEYS, 0)
         n_forwards = 0
         batch_total = 0
@@ -462,8 +454,7 @@ class RolloutPool:
                     slots, chosen_logp, values = routed_step(
                         nets, owner, gather, temperature, greedy, rng, spans,
                         lengths=buf.history_len[rows], chunks=chunks,
-                        critic=critic, forwards=forwards, caches=caches,
-                        cache_slots=hand_idx * NUM_SEATS + seats,
+                        critic=critic, forwards=forwards,
                         seat_agents=(
                             None if critic is None
                             else relative_seat_agents(seating[hand_idx], seats)
@@ -576,7 +567,6 @@ def collect_parallel(
     critic: Any = None,
     overlap: bool = False,
     forwards: str = "eager",
-    history_cache: bool = False,
 ) -> tuple[RolloutBuffer, dict[str, float]]:
     """One round through a throwaway pool.
 
@@ -595,5 +585,5 @@ def collect_parallel(
             temperature=temperature, greedy=greedy,
             level_weight=level_weight, pool=pool, amp=amp, spans=spans,
             agents=agents, chunks=chunks, critic=critic, overlap=overlap,
-            forwards=forwards, history_cache=history_cache,
+            forwards=forwards,
         )
