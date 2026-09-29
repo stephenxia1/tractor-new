@@ -1633,3 +1633,222 @@ def opt_bench2(hands: int = 4096, declare_hands: int = 8192, more_workers: int =
     section to ``/vol/bench/opt2-v6.json``."""
     call = opt_bench2_l40s.spawn(hands, declare_hands, more_workers)
     print(f"spawned {call.object_id}; result -> /vol/bench/opt2-v6.json")
+
+
+# --- hardware: a bigger GPU, more CPUs --------------------------------------
+
+
+def _hw_bench(hands: int, declare_hands: int, worker_counts: list, out_path: str | None,
+              requested_cpus: float = 0.0, model_overrides: dict | None = None) -> dict:
+    """A population step's parts on the code the run uses, on this container.
+
+    Run on an H100 and an L40S with the same CPU count, the pair separates
+    what the GPU buys from what the CPUs buy. On the L40S at 12 CPUs the
+    rollout was bound by its parent, not its workers (``opt_bench2``: 10
+    and 20 workers both 30.8 s); with the forward compiled the parent is
+    busy ~18.5 s of a ~20.7 s collection, so whether the workers now
+    bound it is a question for a sweep.
+
+    * collection, compiled forwards, overlap, pool 4096, at each worker
+      count: seconds, and the parent's busy time (its spans' sum);
+    * the eight agents' updates on the round kept on the device, and the
+      shared critic's -- the production path, compiled;
+    * one pre-play step (``population._preplay_step``), after a warm one.
+    """
+    import json
+    import os
+    import time
+    import traceback
+
+    import numpy as np
+    import torch
+
+    import tractor.nn.model as M
+    from tractor.nn.arch import ARCHES
+    from tractor.nn.features import Cache
+    from tractor.sim.bury import BuryConfig
+    from tractor.telemetry import Spans
+    from tractor.train.buffer import DeviceRows, RolloutBuffer
+    from tractor.train.declare_loop import DeclareTrainConfig
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import (
+        PopulationConfig, _preplay_step, agent_model_config, build_agents, build_critic,
+        hand_agents, seating,
+    )
+    from tractor.train.starts import PrePlayConfig
+
+    cuda = torch.cuda.is_available()
+    dev = torch.device("cuda" if cuda else "cpu")
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except AttributeError:
+        affinity = os.cpu_count()
+    out: dict = {
+        "gpu": torch.cuda.get_device_name(0) if cuda else "cpu",
+        "requested_cpus": requested_cpus, "cpu_affinity": affinity,
+        "torch": torch.__version__, "hands": hands, "declare_hands": declare_hands,
+    }
+    print(out, flush=True)
+
+    def sync() -> None:
+        if cuda:
+            torch.cuda.synchronize()
+
+    def save() -> None:
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2, default=float)
+            if out_path.startswith(VOLUME):
+                volume.commit()
+
+    def section(name: str, fn) -> None:
+        t0 = time.perf_counter()
+        print(f"== {name}", flush=True)
+        try:
+            out[name] = fn()
+        except Exception:  # noqa: BLE001
+            out[name] = {"error": traceback.format_exc()[-3000:]}
+            print(f"  {name} FAILED\n{out[name]['error'][-1500:]}", flush=True)
+        out.setdefault("section_seconds", {})[name] = time.perf_counter() - t0
+        if cuda:
+            out.setdefault("peak_gpu_gib", {})[name] = torch.cuda.max_memory_allocated() / 2**30
+        save()
+
+    cfg = PopulationConfig(
+        hands_per_step=hands, buffer_capacity=hands * 100, declare_phase_steps=1,
+        bury_policy=True, pool=4096, rollout_overlap=True,
+        rollout_forwards="compiled" if cuda else "static",
+        ppo={"epochs": 1, "length_buckets": 4, "compile": cuda, "bf16": cuda},
+        declare={"hands_per_step": declare_hands},
+        **{**ARCHES["v6"], "model": {**ARCHES["v6"]["model"], **(model_overrides or {})}},
+    )
+    declare_cfg = DeclareTrainConfig(**{
+        **cfg.declare,
+        "pre": PrePlayConfig(random_burial_frac=0.0, bury=BuryConfig(), burial="policy"),
+    })
+    torch.manual_seed(0)
+    agents = build_agents(cfg, dev, declare_cfg)
+    critic_learner = build_critic(cfg, dev)
+    shared = critic_learner.critic
+    nets = [a.net for a in agents]
+    mcfg = agent_model_config(cfg)
+    rng = np.random.default_rng(0)
+    seat_of = hand_agents(seating(0, 0, 8), hands)
+    state = {"buf": RolloutBuffer(hands * 100, mcfg)}
+    parent_spans = ("gather", "forward", "sample", "critic", "writeback", "release")
+
+    def collect_sweep():
+        res = {}
+        for workers in worker_counts:
+            with RolloutPool(cfg=mcfg, workers=workers, hands_per_round=hands) as pool:
+                runs = []
+                for rep in range(3):  # the first warms (and, once, compiles)
+                    spans = Spans(enabled=True, device=dev if cuda else "cpu")
+                    t0 = time.perf_counter()
+                    buf, st = pool.collect(
+                        nets, rng, state["buf"], n_hands=hands, device=dev, pool=4096,
+                        amp=cuda, level_weight=0.0, agents=seat_of, critic=shared,
+                        spans=spans, overlap=True, forwards=cfg.rollout_forwards)
+                    secs = time.perf_counter() - t0
+                    state["buf"] = buf
+                    parts = {k: v["total"] for k, v in spans.summary().items()}
+                    busy = sum(parts.get(k, 0.0) for k in parent_spans)
+                    runs.append({"seconds": secs, "parent_busy_s": busy,
+                                 "decisions": st["decisions"], **parts})
+                    print(f"  collect {workers:2d} workers rep {rep}: {secs:6.1f}s, parent busy "
+                          f"{busy:5.1f}s  fwd {parts.get('forward', 0):5.1f}  critic "
+                          f"{parts.get('critic', 0):4.1f}  gather {parts.get('gather', 0):4.1f}",
+                          flush=True)
+            timed = runs[1:]
+            res[f"{workers} workers"] = {
+                "seconds": float(np.mean([r["seconds"] for r in timed])),
+                "parent_busy_s": float(np.mean([r["parent_busy_s"] for r in timed])),
+                "runs": runs,
+            }
+        return res
+
+    section("collect", collect_sweep)
+    buf = state["buf"]
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    n = len(buf)
+    out["rows"] = int(n)
+    owner = seat_of[buf.episode[:n], buf.seat[:n]]
+    sa = M.relative_seat_agents(seat_of[buf.episode[:n]], buf.seat[:n])
+
+    def updates():
+        res = {}
+        for rep in ("first (compiles)", "timed", "timed again"):
+            for a in agents:
+                a.net.train()
+            sync()
+            t0 = time.perf_counter()
+            on_device = DeviceRows(buf, dev)
+            sync()
+            t_up = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            mbs = 0
+            for k, a in enumerate(agents):
+                m = a.learner.update(buf, rows=np.nonzero(owner == k)[0], device_rows=on_device)
+                mbs += int(m["n_minibatches"])
+            sync()
+            t_actor = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            c = critic_learner.update(buf, sa, device_rows=on_device)
+            sync()
+            t_critic = time.perf_counter() - t0
+            del on_device
+            res[rep] = {"upload_s": t_up, "actors_s": t_actor, "critic_s": t_critic,
+                        "actor_minibatches": mbs,
+                        "actor_ms_per_minibatch": t_actor / max(mbs, 1) * 1e3,
+                        "critic_value_loss": c["critic/value_loss"]}
+            print(f"  update {rep:17} upload {t_up:4.1f}s  actors {t_actor:6.1f}s "
+                  f"({t_actor / max(mbs, 1) * 1e3:5.1f} ms/mb)  critic {t_critic:5.1f}s",
+                  flush=True)
+        return res
+
+    section("updates", updates)
+
+    def preplay():
+        res = {}
+        table = seating(0, 0, 8)
+        for rep in ("warm", "timed"):
+            t0 = time.perf_counter()
+            st = _preplay_step(agents, table, declare_cfg, rng, dev, Cache(), shared)
+            secs = time.perf_counter() - t0
+            res[rep] = {"seconds": secs,
+                        **{k: v for k, v in st.items() if k.startswith("time/")}}
+            print(f"  pre-play {rep:5} {secs:5.1f}s  "
+                  f"{ {k: round(v, 2) for k, v in st.items() if k.startswith('time/')} }",
+                  flush=True)
+        return res
+
+    section("preplay", preplay)
+    return out
+
+
+_HW = dict(volumes={VOLUME: volume}, timeout=3 * 3600, cpu=32.0, memory=131072)
+
+
+@app.function(image=image, gpu="H100", **_HW)
+def hw_bench_h100(hands: int, declare_hands: int, workers: list) -> dict:
+    return _hw_bench(hands, declare_hands, workers, f"{VOLUME}/bench/hw-h100.json", 32.0)
+
+
+@app.function(image=image, gpu="L40S", **_HW)
+def hw_bench_l40s(hands: int, declare_hands: int, workers: list) -> dict:
+    return _hw_bench(hands, declare_hands, workers, f"{VOLUME}/bench/hw-l40s.json", 32.0)
+
+
+@app.local_entrypoint()
+def hw_bench(hands: int = 4096, declare_hands: int = 8192, workers: str = "10,16,24,30",
+             gpus: str = "h100,l40s") -> None:
+    """``modal run --detach modal_perf.py::hw_bench``: the same measurement
+    on each GPU, 32 CPUs apiece, spawned; results in
+    ``/vol/bench/hw-<gpu>.json``."""
+    counts = [int(w) for w in workers.split(",")]
+    fns = {"h100": hw_bench_h100, "l40s": hw_bench_l40s}
+    for g in gpus.split(","):
+        call = fns[g].spawn(hands, declare_hands, counts)
+        print(f"spawned {g}: {call.object_id}; result -> /vol/bench/hw-{g}.json")

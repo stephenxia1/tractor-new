@@ -865,6 +865,33 @@ newly seen widths (update 57.8 s, critic 24.7 s). The GPU peaked at
 gather 3.5 s -- and arithmetic in the updates, which only changing what
 is computed (model size, minibatches a step) would move.
 
+**A bigger GPU, more CPUs** (`modal run modal_perf.py::hw_bench`; an H100
+SXM and, as the control, an L40S, 32 CPUs each; the code the run uses;
+`evals/2026-09-28/hw-h100.json`, `hw-l40s.json`):
+
+| | L40S | H100 |
+| --- | --- | --- |
+| collect, 10 / 16 / 24 / 30 workers | 21.1 / **18.2** / 20.5 / 20.6 s | 19.7 / **15.2** / 17.8 / 18.3 s |
+| actor updates, eight agents | 29.4 s (20.9 ms a minibatch) | 23.9 s (17.0 ms) |
+| shared critic update | 9.4 s | 11.8 s |
+| pre-play step | 17.1 s | 13.9 s |
+| a play step, 16 workers (sum of the parts) | ~62 s | ~56 s |
+
+- **More workers help up to 16**, ~3 s a step, then the parent is the
+  bound again (busy 17.0 s of 18.2 on the L40S) and more cost time.
+  At 10 workers 32 CPUs are no faster than 12 (21.1 s against 20.7).
+- **The H100 buys ~10% of a step.** The rollout's forwards are small
+  batches and barely speed up (8.1 → 6.6 s), and the updates stop being
+  the device's: the critic's is *slower* on the H100, and the H100
+  host's copies were ~15% slower too (the parent's gather 3.8 against
+  3.3 s), so the updates are bound by the host launching their kernels
+  -- ~17 ms an actor minibatch, ~8 ms a critic one there. On the L40S the
+  actor update is the device's (20.2 of 20.9 ms) but the critic's, 6.6
+  ms a minibatch for a 1.2M-parameter network, is the host's as well.
+  Removing that host time (capturing a whole training step as a CUDA
+  graph) is what would let a faster GPU pay; the H100 at ~2x the price
+  an hour does not, as things stand.
+
 ---
 
 ## Next steps
