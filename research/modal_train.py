@@ -232,6 +232,65 @@ def smoke() -> None:
     print(json.dumps(train_smoke.remote(), indent=2, default=str))
 
 
+@app.function(image=image, volumes={VOLUME: volume}, timeout=86400,
+              cpu=0.5, memory=1024)
+def keep_milestones(name: str, every: int, extra: list, poll_s: int) -> list:
+    """Copy a run's checkpoints at every ``every`` steps, and at the steps
+    in ``extra``, to ``/vol/<name>/milestones/``, where ``--keep-last``
+    cannot delete them: the points of a strength-over-steps curve.
+
+    ``torch.save`` writes a checkpoint in place, and the volume can show
+    a half-written file, so a checkpoint is copied only once a later one
+    (or ``final.pt``) is there. Returns the steps kept when ``final.pt``
+    appears.
+    """
+    import re
+    import shutil
+    import time
+
+    src = pathlib.Path(VOLUME) / name / "checkpoints"
+    dst = pathlib.Path(VOLUME) / name / "milestones"
+    kept = []
+    while True:
+        volume.reload()
+        final = (src / "final.pt").exists()
+        steps = sorted(int(m.group(1)) for p in src.glob("step_*.pt")
+                       if (m := re.fullmatch(r"step_(\d+)\.pt", p.name)))
+        for s in steps:
+            out = dst / f"step_{s:07d}.pt"
+            if ((s % every and s not in extra) or out.exists()
+                    or not (final or s < steps[-1])):
+                continue
+            dst.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp")
+            try:
+                shutil.copyfile(src / out.name, tmp)
+            except FileNotFoundError:
+                print(f"step {s} was pruned before it could be kept", flush=True)
+                continue
+            os.replace(tmp, out)
+            volume.commit()
+            kept.append(s)
+            print(f"kept step {s}", flush=True)
+        if final:
+            return kept
+        time.sleep(poll_s)
+
+
+@app.local_entrypoint()
+def milestones(name: str, every: int = 250, extra: str = "",
+               poll_s: int = 300) -> None:
+    """Keep a run's milestone checkpoints past ``--keep-last``, beside it
+    (an app name of its own, or it would stop the run):
+
+        TRACTOR_TRAIN_APP=tractor-milestones-pop8b modal run --detach \\
+          modal_train.py::milestones --name pop8b --extra 150
+    """
+    steps = [int(s) for s in extra.split(",") if s.strip()]
+    call = keep_milestones.spawn(name, every, steps, poll_s)
+    print(f"keeping {name} every {every} steps (and {steps}): call {call.object_id}")
+
+
 @app.local_entrypoint()
 def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            gpu: str = "l40s", wandb_on: bool = True, resume: str = "",

@@ -394,8 +394,20 @@ nothing.
    cut the run off. Use a new app name for each launch:
 
    ```bash
-   TRACTOR_TRAIN_APP=tractor-train-pop8-b modal run --detach modal_train.py::launch \
-     --gpu h100 --name pop8 --resume latest --steps 3000 <the same flags as above>
+   TRACTOR_TRAIN_APP=tractor-train-pop8b-2 modal run --detach modal_train.py::launch \
+     --gpu h100 --name pop8b --resume latest --steps 3000 <the same flags as above>
+   ```
+
+   **Milestones.** `--keep-last 6` keeps only the newest 300 steps of
+   checkpoints, too few for a strength-over-steps curve, so a small job
+   beside the run copies every 250th (and step 150) to
+   `/vol/pop8b/milestones/`, each once the next checkpoint exists, and
+   ends at `final.pt` (running since 2026-09-29; relaunch it with a
+   resumed run):
+
+   ```bash
+   TRACTOR_TRAIN_APP=tractor-milestones-pop8b modal run --detach \
+     modal_train.py::milestones --name pop8b --extra 150
    ```
 
    **Evaluating it.** Every agent against the whole ladder -- the four
@@ -404,9 +416,11 @@ nothing.
    1.5 h on up to eight A10Gs; a rerun with the same `--out` resumes):
 
    ```bash
-   TRACTOR_EVAL_APP=tractor-eval-pop8 modal run --detach modal_eval.py::population \
-     --checkpoint /vol/pop8/checkpoints/final.pt --out runs/pop8-final.jsonl
-   # a mid-run checkpoint the same way: --checkpoint /vol/pop8/checkpoints/step_0001000.pt
+   TRACTOR_EVAL_APP=tractor-eval-pop8b modal run --detach modal_eval.py::population \
+     --checkpoint /vol/pop8b/checkpoints/final.pt --out runs/pop8b-final.jsonl
+   # a milestone the same way: --checkpoint /vol/pop8b/milestones/step_0001000.pt
+   # (step 150: evals/2026-09-29/pop8b-150-random.jsonl, --pre-play random,
+   # since declaring and burial train only from step 300)
    # --pre-play random for play alone; pair the best agents against
    # evals/2026-09-24/v5-final-{policy,random}.jsonl with tab_evals.py --paired
    ```
