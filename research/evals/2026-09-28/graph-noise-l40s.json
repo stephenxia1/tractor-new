@@ -1,0 +1,50 @@
+{
+  "gpu": "NVIDIA L40S",
+  "torch": "2.6.0+cu124",
+  "rows": 363432,
+  "critic": {
+    "minibatches": 352,
+    "widths": [
+      32,
+      48,
+      64,
+      96,
+      112
+    ],
+    "device 1: first pass": {
+      "seconds": 100.79900905600002,
+      "enqueue_s": 100.798626878,
+      "ms_per_minibatch": 286.3608211818182
+    },
+    "device 1: second pass": {
+      "seconds": 2.186202363999996,
+      "enqueue_s": 2.1858207839999864,
+      "ms_per_minibatch": 6.210802170454535
+    },
+    "device 2: first pass": {
+      "seconds": 2.163705639,
+      "enqueue_s": 2.1633214889999977,
+      "ms_per_minibatch": 6.146891019886363
+    },
+    "device 2: second pass": {
+      "seconds": 2.1282169540000098,
+      "enqueue_s": 2.127825974000018,
+      "ms_per_minibatch": 6.046070892045482
+    },
+    "max_param_diff": 0.008298320695757866,
+    "max_param": 1.00496244430542,
+    "metric_sums_device": [
+      1944.4539794921875,
+      2209.789306640625,
+      704.0
+    ],
+    "metric_sums_graphed": [
+      1944.4549560546875,
+      2210.417724609375,
+      704.0
+    ]
+  },
+  "peak_gpu_gib": {
+    "critic": 12.605852603912354
+  }
+}

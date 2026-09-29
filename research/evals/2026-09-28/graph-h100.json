@@ -1,0 +1,111 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "torch": "2.6.0+cu124",
+  "rows": 363568,
+  "actor": {
+    "minibatches": 176,
+    "widths": [
+      32,
+      48,
+      80,
+      96,
+      112
+    ],
+    "device: first pass": {
+      "seconds": 214.901533848,
+      "enqueue_s": 214.901480921,
+      "ms_per_minibatch": 1221.031442318182
+    },
+    "device: second pass": {
+      "seconds": 2.8826187280000113,
+      "enqueue_s": 2.882573159000003,
+      "ms_per_minibatch": 16.378515500000066
+    },
+    "graphed: first pass": {
+      "seconds": 6.636126880999996,
+      "enqueue_s": 6.580838110000002,
+      "ms_per_minibatch": 37.70526636931815
+    },
+    "graphed: second pass": {
+      "seconds": 1.6545119749999913,
+      "enqueue_s": 1.5991930470000284,
+      "ms_per_minibatch": 9.400636221590858
+    },
+    "capture_s": 4.626291535000007,
+    "graphs": 4,
+    "max_param_diff": 0.0,
+    "max_param": 1.0136439800262451,
+    "metric_sums_device": [
+      1209.5264892578125,
+      0.0,
+      140886.578125,
+      114761.4453125,
+      875.4979248046875,
+      49650.78125,
+      16679.62890625,
+      2057.011962890625,
+      22981.0,
+      76362.71875
+    ],
+    "metric_sums_graphed": [
+      1209.5264892578125,
+      0.0,
+      140886.578125,
+      114761.4453125,
+      875.4979248046875,
+      49650.78125,
+      16679.62890625,
+      2057.011962890625,
+      22981.0,
+      76362.71875
+    ]
+  },
+  "peak_gpu_gib": {
+    "actor": 12.81654691696167,
+    "critic": 12.81654691696167
+  },
+  "critic": {
+    "minibatches": 352,
+    "widths": [
+      32,
+      48,
+      64,
+      96,
+      112
+    ],
+    "device: first pass": {
+      "seconds": 120.04836349499999,
+      "enqueue_s": 120.048298279,
+      "ms_per_minibatch": 341.0464872017045
+    },
+    "device: second pass": {
+      "seconds": 2.9789317679999954,
+      "enqueue_s": 2.9788635269999872,
+      "ms_per_minibatch": 8.462874340909078
+    },
+    "graphed: first pass": {
+      "seconds": 9.659686738000005,
+      "enqueue_s": 9.58709448999997,
+      "ms_per_minibatch": 27.442291869318193
+    },
+    "graphed: second pass": {
+      "seconds": 1.150675868999997,
+      "enqueue_s": 1.0781260549999843,
+      "ms_per_minibatch": 3.26896553693181
+    },
+    "capture_s": 8.320532929999956,
+    "graphs": 5,
+    "max_param_diff": 0.0674177035689354,
+    "max_param": 1.0262293815612793,
+    "metric_sums_device": [
+      1747.115478515625,
+      2240.239990234375,
+      704.0
+    ],
+    "metric_sums_graphed": [
+      1747.900634765625,
+      2277.677490234375,
+      704.0
+    ]
+  }
+}

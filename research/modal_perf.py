@@ -1852,3 +1852,362 @@ def hw_bench(hands: int = 4096, declare_hands: int = 8192, workers: str = "10,16
     for g in gpus.split(","):
         call = fns[g].spawn(hands, declare_hands, counts)
         print(f"spawned {g}: {call.object_id}; result -> /vol/bench/hw-{g}.json")
+
+
+# --- a training step as one CUDA graph --------------------------------------
+
+
+def _graph_bench(hands: int, out_path: str | None, warm: int = 2,
+                 ways: tuple = ("device", "graphed"), kinds: tuple = ("actor", "critic"),
+                 lockstep: bool = False) -> dict:
+    """The device-path update against the same step captured as a CUDA graph.
+
+    ``hw_bench`` found the updates bound by the host launching kernels on
+    an H100 (the critic's slower there than on an L40S). A captured step
+    -- the minibatch's gather from the device rows, the compiled forward
+    and loss, the backward, the clip, the fused AdamW's step with its
+    on-device refusal of a non-finite one, the metric sums -- is one
+    replay a minibatch instead of ~1000 launches.
+
+    One graph per history width (at most eight), captured after ``warm``
+    real steps of that width on a side stream, all in one memory pool:
+    nothing in the pool outlives a replay (gradients are recomputed each
+    step, and the parameters, optimiser state and metric sums were made
+    outside it), so the graphs may share it in any order. The fused AdamW
+    is switched to ``capturable``.
+
+    Two learners on copies of one agent's network see the same
+    minibatches, one each way; the weights after two passes say whether
+    the graph is the same step, and the second pass times both. The same
+    for the shared critic. "enqueue" is the host's time to issue a pass,
+    before the final sync -- equal to the pass's time where the host is
+    the bound.
+    """
+    import copy
+    import json
+    import os
+    import time
+    import traceback
+
+    import numpy as np
+    import torch
+
+    import tractor.nn.model as M
+    from tractor.nn.arch import ARCHES
+    from tractor.nn.features import PLANE_TRICK
+    from tractor.sim.state import NUM_SEATS
+    from tractor.train.buffer import DeviceRows, RolloutBuffer
+    from tractor.train.critic_learner import CriticLearner
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import (
+        PopulationConfig, agent_model_config, build_critic, hand_agents, seating,
+    )
+    from tractor.train.ppo import _LOSS_KEYS, PPOConfig, PPOLearner, _minibatches
+
+    dev = torch.device("cuda")
+    out: dict = {"gpu": torch.cuda.get_device_name(0), "torch": torch.__version__}
+    print(out, flush=True)
+
+    def save() -> None:
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2, default=float)
+            if out_path.startswith(VOLUME):
+                volume.commit()
+
+    cfg = PopulationConfig(hands_per_step=hands, buffer_capacity=hands * 100,
+                           ppo={"epochs": 1, "length_buckets": 4, "compile": True},
+                           **ARCHES["v6"])
+    torch.manual_seed(0)
+    mcfg = agent_model_config(cfg)
+    nets = [M.ActorCritic(mcfg).to(dev) for _ in range(8)]
+    critic_learner = build_critic(cfg, dev)
+    shared = critic_learner.critic
+    rng = np.random.default_rng(0)
+    seat_of = hand_agents(seating(0, 0, 8), hands)
+    buf = RolloutBuffer(hands * 100, mcfg)
+    with RolloutPool(cfg=mcfg, workers=10, hands_per_round=hands) as pool:
+        buf, _st = pool.collect(nets, rng, buf, n_hands=hands, device=dev, pool=4096, amp=True,
+                                level_weight=0.0, agents=seat_of, critic=shared, overlap=True,
+                                forwards="static")
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    n = len(buf)
+    owner = seat_of[buf.episode[:n], buf.seat[:n]]
+    sa = torch.from_numpy(M.relative_seat_agents(seat_of[buf.episode[:n]], buf.seat[:n])).to(dev)
+    rows = DeviceRows(buf, dev)
+    lengths = np.asarray(buf.history_len)
+    out["rows"] = int(n)
+    size = 256
+    zero = torch.zeros((), device=dev)
+
+    class Graphed:
+        def __init__(self, opt, body):
+            self.opt, self.body = opt, body
+            self.pos = torch.zeros(size, dtype=torch.int64, device=dev)
+            self.graphs: dict = {}
+            self.seen: dict = {}
+            self.pool = torch.cuda.graph_pool_handle()
+            self.side = torch.cuda.Stream()
+            self.capture_s = 0.0
+            for group in opt.param_groups:
+                group["capturable"] = True
+
+        def step(self, pos, width):
+            self.pos.copy_(pos)
+            g = self.graphs.get(width)
+            if g is not None:
+                g.replay()
+                return
+            k = self.seen.get(width, 0)
+            self.seen[width] = k + 1
+            if k < warm:
+                self.side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.side):
+                    self.opt.zero_grad(set_to_none=True)
+                    self.body(self.pos, width)
+                torch.cuda.current_stream().wait_stream(self.side)
+                return
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            self.opt.zero_grad(set_to_none=True)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self.pool):
+                self.body(self.pos, width)
+            self.graphs[width] = g
+            self.capture_s += time.perf_counter() - t0
+            g.replay()
+
+    def actor_body(learner, sums, counts):
+        def body(pos, width):
+            obs, priv, batch = rows.rows(pos, width)
+            with M.static_shapes():
+                loss, parts = learner._losses(obs, priv, batch)
+            loss.backward()
+            gn = torch.nn.utils.clip_grad_norm_(learner.net.parameters(),
+                                                learner.cfg.max_grad_norm)
+            ok = torch.isfinite(loss) & torch.isfinite(gn)
+            learner.opt.found_inf = (~ok).to(torch.float32)
+            learner.opt.step()
+            vals = torch.stack([parts[k].detach().float() for k in _LOSS_KEYS]
+                               + [gn.detach().float()])
+            sums.add_(torch.where(ok, vals * size, zero))
+            okf = ok.to(torch.float32)
+            counts.add_(torch.stack((okf * size, okf, 1.0 - okf,
+                                     torch.where(ok, parts["outcome_rows"].float(), zero),
+                                     torch.where(ok, parts["ratio_clamped"].float(), zero))))
+        return body
+
+    def critic_body(learner, sums):
+        t = rows.t
+
+        def body(pos, width):
+            inputs = dict(
+                history_enc=t["history"][pos, :width].float(),
+                history_len=t["history_len"][pos],
+                privileged=t["privileged"][pos].float(),
+                context=t["context"][pos].float(),
+                cards=t["cards"][pos].float(),
+                trick=t["planes"][pos, PLANE_TRICK: PLANE_TRICK + NUM_SEATS].float(),
+                seat_agents=sa[pos],
+            )
+            with M.static_shapes():
+                loss = learner._step(inputs, t["ret"][pos].float())
+            loss.backward()
+            norm = torch.nn.utils.clip_grad_norm_(learner.critic.parameters(),
+                                                  learner.cfg.max_grad_norm)
+            ok = torch.isfinite(loss) & torch.isfinite(norm)
+            learner.opt.found_inf = (~ok).to(torch.float32)
+            learner.opt.step()
+            sums.add_(torch.stack((torch.where(ok, loss.detach().float() * size, zero),
+                                   torch.where(ok, norm.detach().float() * size, zero),
+                                   ok.to(torch.float32))))
+        return body
+
+    def run(kind: str, make, pick_rows):
+        """Two passes each way over one minibatch sequence."""
+        order = pick_rows[rng.permutation(len(pick_rows))]
+        mbs = [b for b in _minibatches(order, buf, size, 4) if len(b) == size]
+        widths = [M.history_bucket(int(lengths[b].max())) for b in mbs]
+        flat = torch.from_numpy(np.concatenate(mbs)).to(dev)
+        res = {"minibatches": len(mbs), "widths": sorted(set(widths))}
+        if lockstep:
+            # Three copies stepped together: two uncaptured, one captured.
+            # The weight gap after every step, captured against uncaptured
+            # and uncaptured against uncaptured.
+            (m1, o1, b1, _s1), (m2, o2, b2, _s2), (m3, o3, b3, _s3) = make(), make(), make()
+            g = Graphed(o3, b3)
+            graphed_gap, noise_gap, replayed = [], [], []
+
+            def gap(a, b):
+                return max(float((p - q).abs().max()) for p, q in zip(a.parameters(), b.parameters()))
+
+            for _rep in range(2):
+                for i, w in enumerate(widths):
+                    pos = flat[i * size: (i + 1) * size]
+                    for opt, body in ((o1, b1), (o2, b2)):
+                        opt.zero_grad(set_to_none=True)
+                        body(pos, w)
+                    before = len(g.graphs)
+                    replayed.append(w in g.graphs)
+                    g.step(pos, w)
+                    graphed_gap.append(gap(m1, m3))
+                    noise_gap.append(gap(m1, m2))
+            first = replayed.index(True)
+            res.update({"graphed_gap": graphed_gap, "noise_gap": noise_gap,
+                        "first_replay_step": first})
+            print(f"  {kind} lockstep: first replay at step {first}; gap graphed/noise after "
+                  f"step {first}: {graphed_gap[first]:.3g}/{noise_gap[first]:.3g}; after 10 more: "
+                  f"{graphed_gap[first + 10]:.3g}/{noise_gap[first + 10]:.3g}; at the end: "
+                  f"{graphed_gap[-1]:.3g}/{noise_gap[-1]:.3g}", flush=True)
+            print(f"  {kind} graphed gap, steps 0..{first + 20}: "
+                  f"{[f'{x:.2g}' for x in graphed_gap[: first + 21]]}", flush=True)
+            print(f"  {kind} noise gap,   steps 0..{first + 20}: "
+                  f"{[f'{x:.2g}' for x in noise_gap[: first + 21]]}", flush=True)
+            return res
+        models = []
+        for way in ways:
+            module, opt, body, sums = make()
+            models.append((module, sums))
+            if way == "graphed":
+                g = Graphed(opt, body)
+                step = g.step
+            else:
+                def step(pos, width, opt=opt, body=body):
+                    opt.zero_grad(set_to_none=True)
+                    body(pos, width)
+            for rep in ("first pass", "second pass"):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                for i, w in enumerate(widths):
+                    step(flat[i * size: (i + 1) * size], w)
+                t_enq = time.perf_counter() - t0
+                torch.cuda.synchronize()
+                t_all = time.perf_counter() - t0
+                res[f"{way} {len(models)}: {rep}"] = {"seconds": t_all, "enqueue_s": t_enq,
+                                        "ms_per_minibatch": t_all / len(mbs) * 1e3}
+                print(f"  {kind} {way:8} {rep}: {t_all:6.2f}s ({t_all / len(mbs) * 1e3:6.2f} ms/mb,"
+                      f" enqueue {t_enq:6.2f}s)", flush=True)
+            if way == "graphed":
+                res["capture_s"] = g.capture_s
+                res["graphs"] = len(g.graphs)
+        (ma, sa_), (mb, sb) = models[0], models[-1]
+        diff = max(float((p - q).abs().max()) for p, q in zip(ma.parameters(), mb.parameters()))
+        scale = max(float(p.abs().max()) for p in ma.parameters())
+        res["max_param_diff"] = diff
+        res["max_param"] = scale
+        res["metric_sums_device"] = sa_.tolist()
+        res["metric_sums_graphed"] = sb.tolist()
+        print(f"  {kind}: max |param diff| {diff:.3g} (params up to {scale:.3g}); sums "
+              f"{[round(x, 3) for x in sa_.tolist()[:3]]} vs {[round(x, 3) for x in sb.tolist()[:3]]}",
+              flush=True)
+        return res
+
+    base = nets[0]
+
+    def make_actor():
+        net = copy.deepcopy(base).train()
+        learner = PPOLearner(net, PPOConfig(epochs=1, length_buckets=4, compile=True), dev)
+        sums = torch.zeros(len(_LOSS_KEYS) + 1, device=dev)
+        counts = torch.zeros(5, device=dev)
+        return net, learner.opt, actor_body(learner, sums, counts), sums
+
+    def make_critic():
+        critic = copy.deepcopy(shared).train()
+        learner = CriticLearner(critic, critic_learner.cfg, dev)
+        sums = torch.zeros(3, device=dev)
+        return critic, learner.opt, critic_body(learner, sums), sums
+
+    for kind, make, pick in (("actor", make_actor, np.nonzero(owner == 0)[0]),
+                             ("critic", make_critic, np.arange(n)[: n // 4])):
+        if kind not in kinds:
+            continue
+        print(f"== {kind}", flush=True)
+        try:
+            out[kind] = run(kind, make, pick)
+        except Exception:  # noqa: BLE001
+            out[kind] = {"error": traceback.format_exc()[-3000:]}
+            print(f"  {kind} FAILED\n{out[kind]['error'][-2000:]}", flush=True)
+        out.setdefault("peak_gpu_gib", {})[kind] = torch.cuda.max_memory_allocated() / 2**30
+        save()
+    return out
+
+
+_GB = dict(volumes={VOLUME: volume}, timeout=2 * 3600, cpu=16.0, memory=98304)
+
+
+@app.function(image=image, gpu="L40S", **_GB)
+def graph_bench_l40s(hands: int) -> dict:
+    return _graph_bench(hands, f"{VOLUME}/bench/graph-l40s.json")
+
+
+@app.function(image=image, gpu="H100", **_GB)
+def graph_bench_h100(hands: int) -> dict:
+    return _graph_bench(hands, f"{VOLUME}/bench/graph-h100.json")
+
+
+@app.function(image=image, gpu="L40S", **_GB)
+def graph_noise_l40s(hands: int) -> dict:
+    """Two uncaptured critic fits on one minibatch sequence: how far the
+    critic's weights drift apart with no graph involved."""
+    return _graph_bench(hands, f"{VOLUME}/bench/graph-noise-l40s.json",
+                        ways=("device", "device"), kinds=("critic",))
+
+
+@app.function(image=image, gpu="L40S", **_GB)
+def graph_lockstep_l40s(hands: int, kinds: list) -> dict:
+    return _graph_bench(hands, f"{VOLUME}/bench/graph-lockstep-l40s.json",
+                        kinds=tuple(kinds), lockstep=True)
+
+
+@app.local_entrypoint()
+def graph_lockstep(hands: int = 4096, kinds: str = "critic,actor") -> None:
+    """Captured and uncaptured steps in lockstep, the weight gap after each."""
+    call = graph_lockstep_l40s.spawn(hands, kinds.split(","))
+    print(f"spawned {call.object_id}; result -> /vol/bench/graph-lockstep-l40s.json")
+
+
+@app.local_entrypoint()
+def graph_noise(hands: int = 4096) -> None:
+    call = graph_noise_l40s.spawn(hands)
+    print(f"spawned {call.object_id}; result -> /vol/bench/graph-noise-l40s.json")
+
+
+@app.local_entrypoint()
+def graph_bench(hands: int = 4096, gpus: str = "l40s,h100") -> None:
+    """``modal run --detach modal_perf.py::graph_bench``: spawned on each GPU;
+    results in ``/vol/bench/graph-<gpu>.json``."""
+    fns = {"l40s": graph_bench_l40s, "h100": graph_bench_h100}
+    for g in gpus.split(","):
+        call = fns[g].spawn(hands)
+        print(f"spawned {g}: {call.object_id}; result -> /vol/bench/graph-{g}.json")
+
+
+# --- the GPU-only tests --------------------------------------------------------
+
+_test_image = modal_train.image.pip_install("pytest").add_local_python_source("modal_train")
+
+
+@app.function(image=_test_image, gpu="L40S", timeout=3600, cpu=8.0, memory=32768)
+def gpu_tests_l40s(files: list) -> dict:
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
+        cwd=f"{modal_train.RESEARCH}/py", capture_output=True, text=True,
+    )
+    text = done.stdout + done.stderr
+    return {"returncode": done.returncode,
+            "output": text if len(text) < 30000 else text[:15000] + " ... " + text[-15000:]}
+
+
+@app.local_entrypoint()
+def gpu_tests(files: str = "tractor/tests/test_cuda_graphs.py", args: str = "") -> None:
+    """``modal run modal_perf.py::gpu_tests``: pytest on an L40S, for what
+    only a GPU can run (``tests/test_cuda_graphs.py``)."""
+    res = gpu_tests_l40s.remote([f.strip() for f in files.split(",") if f.strip()]
+                                + args.split())
+    print(res["output"])
+    print("returncode", res["returncode"])
