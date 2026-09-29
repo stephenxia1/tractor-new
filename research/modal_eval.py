@@ -16,6 +16,10 @@ tighter than either interval alone.
 
     modal run modal_eval.py::smart \\
       --checkpoints /vol/v2-points/checkpoints/step_0000500.pt,/vol/v2-points/checkpoints/final.pt
+
+A population's agents, every one against the whole ladder, ranked:
+
+    modal run modal_eval.py::population --checkpoint /vol/pop8/checkpoints/final.pt
 """
 
 from __future__ import annotations
@@ -174,25 +178,14 @@ def _label(path: str) -> str:
             if len(parts) >= 3 else path)
 
 
-@app.local_entrypoint()
-def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
-          seed: int = 20260923, workers: int = 32, out: str = "",
-          pre_play: str = "random", search_worlds: int = 0,
-          search_top: int = 3, search_extra_tricks: int = 0,
-          search_confident: float = 0.9) -> None:
-    # `--search-worlds 0` is the plain policy, on CPU as before.
-    search = None
-    if search_worlds > 0:
-        search = {"worlds": search_worlds, "top_k": search_top,
-                  "extra_tricks": search_extra_tricks,
-                  "confident": search_confident}
+def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
+             path: str, pre_play: str, search: dict | None) -> dict | None:
+    """Every (checkpoint, bot) pair, measured or read back. -> the results,
+    or None while some pair is still unmeasured."""
     # Search, and the burial climb of --pre-play agent, are batched
     # forwards that a CPU thread runs at ~100 ms a row.
     fn = play_gpu if (search or pre_play.startswith("agent")) else play
-    ckpts = [c.strip() for c in checkpoints.split(",") if c.strip()]
-    names = [b.strip() for b in bots.split(",") if b.strip()]
     pairs = [(c, b) for c in ckpts for b in names]
-    path = out or f"eval-smart-{seed}.jsonl"
 
     # Each pair is appended the moment it lands, and a rerun with the
     # same `out` skips what is already there. A pair takes about twenty
@@ -232,38 +225,72 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
             fh.write(json.dumps(r) + "\n")
             fh.flush()
             print(f"  done {_label(r['checkpoint']):28} {r['bot']:10} "
-                  f"win {r['winrate']:.3f}  {r['seconds'] / 60:5.1f} min  "
-                  f"searched {int(r.get('searched_decisions', 0))}"
-                  f"/{int(r['decisions'])}")
+                  f"win {r['winrate']:.3f}  levels {r['levels']:+.3f}  "
+                  f"points {r['points']:+.1f}  {r['seconds'] / 60:5.1f} min")
     if any(p not in results for p in pairs):
         print("some pairs are unmeasured; rerun the same command to fill them")
-        return
+        return None
+    return results
 
+
+def _pooled(results: dict, c: str, names: list) -> dict:
+    """One checkpoint over the whole ladder: the win rate over every hand
+    against every bot, and levels and points averaged over the bots
+    (each played on the same number of deals), with 95% intervals."""
+    rs = [results[(c, b)] for b in names]
+    wins = [w for r in rs for w in r["per_hand_wins"]]
+    m = sum(wins) / len(wins)
+    half = Z95 * math.sqrt(m * (1 - m) / len(wins))
+    k = len(rs)
+    lv = sum(r["levels"] for r in rs) / k
+    lv_half = Z95 * math.sqrt(sum(r["levels_stderr"] ** 2 for r in rs)) / k
+    pt = sum(r["points"] for r in rs) / k
+    pt_half = Z95 * math.sqrt(sum(r["points_stderr"] ** 2 for r in rs)) / k
+    return {"checkpoint": c, "win": m, "win_ci": [m - half, m + half],
+            "levels": lv, "levels_half": lv_half, "points": pt, "points_half": pt_half,
+            "hands": len(wins), "bots": list(names)}
+
+
+def _report(ckpts: list, names: list, results: dict, paired: bool) -> list:
+    """Each checkpoint against each bot and over the whole ladder, then the
+    checkpoints ranked. -> the pooled rows, best first."""
     print()
     print(f"{'checkpoint':28} {'bot':10} {'win':>6} {'95% CI':>15} "
-          f"{'levels':>7} {'points':>7}")
+          f"{'levels':>8} {'points':>8}")
+    pooled = []
     for c in ckpts:
-        pooled = []
         for b in names:
             r = results[(c, b)]
-            pooled.extend(r["per_hand_wins"])
             print(f"{_label(c):28} {b:10} {r['winrate']:6.3f} "
                   f"[{r['winrate_ci_low']:.3f},{r['winrate_ci_high']:.3f}] "
-                  f"{r['levels']:+7.3f} {r['points']:+7.1f}")
-        m = sum(pooled) / len(pooled)
-        half = Z95 * math.sqrt(m * (1 - m) / len(pooled))
-        print(f"{_label(c):28} {'pooled':10} {m:6.3f} "
-              f"[{m - half:.3f},{m + half:.3f}]")
+                  f"{r['levels']:+8.3f} {r['points']:+8.1f}")
+        row = _pooled(results, c, names)
+        pooled.append(row)
+        print(f"{_label(c):28} {'ladder':10} {row['win']:6.3f} "
+              f"[{row['win_ci'][0]:.3f},{row['win_ci'][1]:.3f}] "
+              f"{row['levels']:+8.3f} {row['points']:+8.1f}   "
+              f"(levels +/-{row['levels_half']:.3f}, points +/-{row['points_half']:.1f})")
+        print()
+
+    ranked = sorted(pooled, key=lambda r: (-r["win"], -r["points"]))
+    if len(ckpts) > 1:
+        print(f"ranked over the ladder ({', '.join(names)}):")
+        print(f"  {'rank':>4} {'checkpoint':28} {'win':>6} {'95% CI':>15} "
+              f"{'levels':>8} {'points':>8}")
+        for i, r in enumerate(ranked, 1):
+            print(f"  {i:>4} {_label(r['checkpoint']):28} {r['win']:6.3f} "
+                  f"[{r['win_ci'][0]:.3f},{r['win_ci'][1]:.3f}] "
+                  f"{r['levels']:+8.3f} {r['points']:+8.1f}")
         print()
 
     # Paired: the same hands under each checkpoint, so the difference
     # carries only the policy's change and not the deal's luck.
-    if len(ckpts) > 1:
+    if paired and len(ckpts) > 1:
         print("paired win-rate change, each checkpoint minus the first")
         base = ckpts[0]
         for c in ckpts[1:]:
-            for b in (*names, "pooled"):
-                bs = names if b == "pooled" else [b]
+            for b in (*names, "ladder"):
+                bs = names if b == "ladder" else [b]
                 d = [y - x for k in bs
                      for x, y in zip(results[(base, k)]["per_hand_wins"],
                                      results[(c, k)]["per_hand_wins"])]
@@ -273,5 +300,56 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
                 half = Z95 * math.sqrt(var / n)
                 print(f"  {_label(c):28} {b:10} {mean:+.3f} "
                       f"[{mean - half:+.3f},{mean + half:+.3f}]")
+    return ranked
 
+
+@app.local_entrypoint()
+def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
+          seed: int = 20260923, workers: int = 32, out: str = "",
+          pre_play: str = "random", search_worlds: int = 0,
+          search_top: int = 3, search_extra_tricks: int = 0,
+          search_confident: float = 0.9) -> None:
+    # `--search-worlds 0` is the plain policy, on CPU as before.
+    search = None
+    if search_worlds > 0:
+        search = {"worlds": search_worlds, "top_k": search_top,
+                  "extra_tricks": search_extra_tricks,
+                  "confident": search_confident}
+    ckpts = [c.strip() for c in checkpoints.split(",") if c.strip()]
+    names = [b.strip() for b in bots.split(",") if b.strip()]
+    path = out or f"eval-smart-{seed}.jsonl"
+    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, search)
+    if results is None:
+        return
+    _report(ckpts, names, results, paired=True)
     print(f"\nraw results: {path}")
+
+
+@app.local_entrypoint()
+def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
+               deals: int = 770, seed: int = 20260923, workers: int = 32,
+               out: str = "", pre_play: str = "agent-policy") -> None:
+    """Every agent of a population checkpoint against the whole ladder.
+
+        modal run modal_eval.py::population --checkpoint /vol/pop8/checkpoints/final.pt
+
+    Agents ``#0 .. #agents-1``, each against every fair bot (the four
+    smart bots that play from their own seat) at ``deals`` deals, the
+    full hand as trained (``--pre-play agent-policy``: its own
+    declarations and learned burial). Each agent's win rate, levels and
+    points against each bot and over the ladder, and the agents ranked;
+    the ranking also lands in ``<out>.summary.json``. At the defaults,
+    32 pairs on up to eight A10Gs: about an hour and a half.
+    """
+    ckpts = [f"{checkpoint}#{k}" for k in range(agents)]
+    names = [b.strip() for b in bots.split(",") if b.strip()]
+    path = out or f"eval-{_label(checkpoint).replace('/', '-')}-{seed}.jsonl"
+    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, None)
+    if results is None:
+        return
+    ranked = _report(ckpts, names, results, paired=False)
+    summary = {"checkpoint": checkpoint, "deals": deals, "seed": seed,
+               "pre_play": pre_play, "bots": names, "ranked": ranked}
+    with open(path + ".summary.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print(f"raw results: {path}\nranking: {path}.summary.json")

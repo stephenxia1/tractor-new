@@ -363,15 +363,33 @@ nothing.
      --length-buckets 4 --checkpoint-every 50 --keep-last 6
    ```
 
-   **Evaluating it.** Rank the eight cheaply, then measure the best
-   properly against v5 final on the same seed:
+   **Launched 2026-09-29** (the user's call): `pop8` on an H100, the
+   command above with `--steps 1500`, app `tractor-train-pop8`, W&B run
+   `pop8`. It should end inside the 24-hour limit with `final.pt`.
+
+   **Training longer.** Resume with a larger absolute `--steps` and the
+   same flags; the step, the schedule's place and every optimiser come
+   back from the checkpoint, and the deals continue on a stream of their
+   own (seeded by the step). `--resume latest` takes the run's newest
+   checkpoint -- `final.pt`, or the last `step_*.pt` if the 24-hour limit
+   cut the run off. Use a new app name for each launch:
 
    ```bash
-   CK=/vol/pop8/checkpoints/final.pt
-   modal run --detach modal_eval.py::smart --bots smart-v18 --deals 192 --pre-play agent-policy \
-     --checkpoints $CK#0,$CK#1,$CK#2,$CK#3,$CK#4,$CK#5,$CK#6,$CK#7 --out runs/pop8-rank.jsonl
-   # then 770 deals, all four bots, --pre-play agent-policy and random, for the best agents;
-   # pair against evals/2026-09-24/v5-final-{policy,random}.jsonl with tab_evals.py --paired
+   TRACTOR_TRAIN_APP=tractor-train-pop8-b modal run --detach modal_train.py::launch \
+     --gpu h100 --name pop8 --resume latest --steps 3000 <the same flags as above>
+   ```
+
+   **Evaluating it.** Every agent against the whole ladder -- the four
+   fair bots, 770 deals each, the full hand as trained -- with win rate,
+   levels and points per bot and pooled, and the agents ranked (about
+   1.5 h on up to eight A10Gs; a rerun with the same `--out` resumes):
+
+   ```bash
+   TRACTOR_EVAL_APP=tractor-eval-pop8 modal run --detach modal_eval.py::population \
+     --checkpoint /vol/pop8/checkpoints/final.pt --out runs/pop8-final.jsonl
+   # a mid-run checkpoint the same way: --checkpoint /vol/pop8/checkpoints/step_0001000.pt
+   # --pre-play random for play alone; pair the best agents against
+   # evals/2026-09-24/v5-final-{policy,random}.jsonl with tab_evals.py --paired
    ```
 3. **Separate what broke the plateau**: one-change-at-a-time runs from v3
    step 2000.
