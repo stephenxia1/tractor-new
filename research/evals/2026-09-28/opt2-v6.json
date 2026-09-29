@@ -1,0 +1,211 @@
+{
+  "hands": 4096,
+  "declare_hands": 8192,
+  "torch": "2.6.0+cu124",
+  "G_collect": {
+    "10 workers": {
+      "seconds": 30.832777320999995,
+      "forwards": 324,
+      "mean_batch": 1122.4197530864199,
+      "gather": 4.16,
+      "forward": 17.11,
+      "sample": 1.3,
+      "critic": 5.1,
+      "writeback": 0.01,
+      "release": 0.27,
+      "copy_out": 0.26
+    },
+    "20 workers": {
+      "seconds": 30.82919553299999,
+      "forwards": 328,
+      "mean_batch": 1110.6341463414635,
+      "gather": 4.46,
+      "forward": 17.25,
+      "sample": 1.32,
+      "critic": 5.18,
+      "writeback": 0.01,
+      "release": 0.38,
+      "copy_out": 0.26
+    }
+  },
+  "section_seconds": {
+    "G_collect": 184.79507746800002,
+    "S_slots": 0.07016889299998752,
+    "A_parent": 267.935684614,
+    "E_actor_update": 412.606932753,
+    "F_critic_update": 218.57358246700005,
+    "C_preplay": 165.3141093559998
+  },
+  "rows": 364288,
+  "S_slots": {
+    "per_row_quantiles": {
+      "50": 4.0,
+      "90": 29.0,
+      "99": 105.0,
+      "99.9": 128.0,
+      "100": 128.0
+    },
+    "mean_per_row": 10.979304835734364,
+    "minibatch_max_at_most": {
+      "16": 0.0014084507042253522,
+      "32": 0.11056338028169015,
+      "48": 0.20492957746478874,
+      "64": 0.2471830985915493,
+      "96": 0.3049295774647887,
+      "128": 1.0
+    },
+    "round_max_at_most": {
+      "16": 0.0,
+      "32": 0.0,
+      "48": 0.0,
+      "64": 0.0,
+      "96": 0.01,
+      "128": 1.0
+    },
+    "history_len_quantiles": {
+      "50": 44.0,
+      "90": 80.0,
+      "99": 93.0,
+      "99.9": 98.0,
+      "100": 99.0
+    }
+  },
+  "A_parent": {
+    "stack_weights_s": 0.05219214799998895,
+    "today": {
+      "ms_per_round": 101.84670036666623,
+      "first_rounds_s": 3.1863044639999885,
+      "first_rounds": 30
+    },
+    "one gather, one sync": {
+      "ms_per_round": 100.05926501666664,
+      "first_rounds_s": 3.0244914360000053,
+      "first_rounds": 30
+    },
+    "one gather, one sync, agents stacked (vmap)": {
+      "ms_per_round": 164.6339905,
+      "first_rounds_s": 4.933814899999987,
+      "first_rounds": 30
+    },
+    "... and compiled, dynamic shapes": {
+      "ms_per_round": 62.699741099999066,
+      "first_rounds_s": 230.972426193,
+      "first_rounds": 30
+    }
+  },
+  "E_actor_update": {
+    "agent0_rows": 45472,
+    "update: first (compiles)": {
+      "seconds": 308.79342024999994,
+      "minibatches": 176.0,
+      "ms_per_minibatch": 1754.5080696022724
+    },
+    "update: today": {
+      "seconds": 5.36561610800004,
+      "minibatches": 176.0,
+      "ms_per_minibatch": 30.48645515909114
+    },
+    "resident": {
+      "bytes": 1297179744,
+      "gather_s": 0.28473496699996304,
+      "gather_8_threads_s": 0.12637638199998946,
+      "upload_pageable_s": 0.11088647899998705
+    },
+    "resident, reads kept": {
+      "ms_per_minibatch": 27.43766295333292
+    },
+    "resident, no reads": {
+      "ms_per_minibatch": 20.89780058000012
+    },
+    "host gather on a thread, pinned, no reads": {
+      "ms_per_minibatch": 447.0165695799998
+    },
+    "eager, resident, no reads, 128 slots": {
+      "ms_per_minibatch": 35.387863426666776
+    },
+    "eager, resident, no reads, 16 slots (a bound)": {
+      "ms_per_minibatch": 35.23955299333314
+    },
+    "D_profile": {
+      "wall_s_20_minibatches": 1.3782822419999547,
+      "device_busy_s_20_minibatches": 0.8383373829999962,
+      "table": "--------------------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                                            Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n--------------------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                                        aten::mm         8.86%      68.190ms        13.36%     102.773ms      36.969us     115.773ms        28.63%     115.773ms      41.645us          2780  \n                      ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_nn         0.00%       0.000us         0.00%       0.000us       0.000us      44.585ms        11.03%      44.585ms      57.160us           780  \n                                                                     aten::addmm         2.21%      16.988ms         3.53%      27.133ms      36.666us      36.195ms         8.95%      36.195ms      48.912us           740  \n                                                       Optimizer.step#AdamW.step         0.00%       0.000us         0.00%       0.000us       0.000us      29.633ms         7.33%      29.633ms       1.482ms            20  \n                                                             aten::_fused_adamw_         0.26%       1.966ms         0.33%       2.540ms     127.000us      26.849ms         6.64%      26.849ms       1.342ms            20  \nvoid at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native:...         0.00%       0.000us         0.00%       0.000us       0.000us      26.849ms         6.64%      26.849ms     268.489us           100  \nvoid cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128_3...         0.00%       0.000us         0.00%       0.000us       0.000us      26.484ms         6.55%      26.484ms      57.699us           459  \n                 ampere_bf16_s1688gemm_bf16_128x128_ldg8_relu_f2f_stages_32x1_tn         0.00%       0.000us         0.00%       0.000us       0.000us      22.508ms         5.57%      22.508ms      75.027us           300  \n                                                 aten::_flash_attention_backward         0.28%       2.180ms         1.38%      10.593ms     176.542us      19.049ms         4.71%      19.049ms     317.475us            60  \n                                             aten::_efficient_attention_backward         0.59%       4.555ms         1.98%      15.223ms     126.859us      16.205ms         4.01%      16.205ms     135.039us           120  \nfmha_cutlassB_bf16_aligned_64x64_k64_sm80(PyTorchMemEffAttention::AttentionBa...         0.00%       0.000us         0.00%       0.000us       0.000us      16.205ms         4.01%      16.205ms     135.039us           120  \n                               triton_poi_fused_add_fill_mul_sigmoid_silu_sub_90         0.13%     984.365us         0.24%       1.880ms      31.332us      14.069ms         3.48%      14.069ms     234.476us            60  \n                               triton_poi_fused_add_fill_mul_sigmoid_silu_sub_90         0.00%       0.000us         0.00%       0.000us       0.000us      14.069ms         3.48%      14.069ms     234.476us            60  \nvoid pytorch_flash::flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<pytorch_flas...         0.00%       0.000us         0.00%       0.000us       0.000us      13.501ms         3.34%      13.501ms     225.024us            60  \n                             ampere_bf16_s1688gemm_bf16_128x128_ldg8_relu_f2f_tn         0.00%       0.000us         0.00%       0.000us       0.000us      12.311ms         3.04%      12.311ms      68.392us           180  \n                               triton_poi_fused_add_fill_mul_sigmoid_silu_sub_39         0.11%     830.700us         0.17%       1.323ms      22.052us      11.515ms         2.85%      11.515ms     191.908us            60  \n                               triton_poi_fused_add_fill_mul_sigmoid_silu_sub_39         0.00%       0.000us         0.00%       0.000us       0.000us      11.515ms         2.85%      11.515ms     191.908us            60  \n                      ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_tn         0.00%       0.000us         0.00%       0.000us       0.000us      10.562ms         2.61%      10.562ms      59.007us           179  \n                                              aten::_efficient_attention_forward         0.19%       1.439ms         0.55%       4.196ms      34.966us       9.102ms         2.25%       9.102ms      75.848us           120  \nfmha_cutlassF_bf16_aligned_64x64_rf_sm80(PyTorchMemEffAttention::AttentionKer...         0.00%       0.000us         0.00%       0.000us       0.000us       9.102ms         2.25%       9.102ms      75.848us           120  \n                                                    triton_poi_fused_mul_silu_50         0.10%     735.013us         0.16%       1.203ms      20.048us       8.044ms         1.99%       8.044ms     134.068us            60  \n                                                    triton_poi_fused_mul_silu_50         0.00%       0.000us         0.00%       0.000us       0.000us       8.044ms         1.99%       8.044ms     134.068us            60  \n                      ampere_bf16_s16816gemm_bf16_64x128_ldg8_f2f_stages_64x3_nt         0.00%       0.000us         0.00%       0.000us       0.000us       7.708ms         1.91%       7.708ms      32.117us           240  \n                                                    triton_poi_fused_mul_silu_44         0.07%     510.878us         0.10%     773.219us      19.826us       7.613ms         1.88%       7.613ms     195.207us            39  \n                                                    triton_poi_fused_mul_silu_44         0.00%       0.000us         0.00%       0.000us       0.000us       7.613ms         1.88%       7.613ms     195.207us            39  \n                triton_per_fused__to_copy_add_native_layer_norm_backward_view_94         0.15%       1.131ms         0.23%       1.789ms      29.825us       7.331ms         1.81%       7.331ms     122.187us            60  \n                triton_per_fused__to_copy_add_native_layer_norm_backward_view_94         0.00%       0.000us         0.00%       0.000us       0.000us       7.331ms         1.81%       7.331ms     122.187us            60  \nvoid cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_3...         0.00%       0.000us         0.00%       0.000us       0.000us       5.621ms         1.39%       5.621ms     156.127us            36  \n                                                  aten::_flash_attention_forward         0.12%     952.869us         0.38%       2.889ms      48.156us       5.589ms         1.38%       5.589ms      93.157us            60  \nvoid pytorch_flash::flash_fwd_kernel<pytorch_flash::Flash_fwd_kernel_traits<6...         0.00%       0.000us         0.00%       0.000us       0.000us       5.589ms         1.38%       5.589ms      93.157us            60  \n--------------------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 769.404ms\nSelf CUDA time total: 404.330ms\n"
+    }
+  },
+  "F_critic_update": {
+    "update: first (compiles)": {
+      "seconds": 187.82451701299988,
+      "ms_per_minibatch": 131.99193043780735
+    },
+    "update: today": {
+      "seconds": 23.235502117999886,
+      "ms_per_minibatch": 16.328532760365345
+    },
+    "upload_s": 0.4162509120001232,
+    "upload_bytes": 5252304384,
+    "resident, no reads": {
+      "ms_per_minibatch": 11.587043188333535
+    }
+  },
+  "C_preplay": {
+    "make_starts_s": 7.777501799999982,
+    "rows_all_agents": {
+      "bury": 65536,
+      "declare": 30161
+    },
+    "bury_rows_agent0": 7920,
+    "bury: today (fp32, reads)": {
+      "seconds": 1.7856123280000702
+    },
+    "bury: fp32, no reads": {
+      "seconds": 1.7645925020001414,
+      "minibatches": 32
+    },
+    "bury: bf16, no reads": {
+      "seconds": 0.9203192719999151,
+      "minibatches": 32
+    },
+    "bury: fp32, no reads, compiled: first call s": 29.517721141000038,
+    "bury: fp32, no reads, compiled": {
+      "seconds": 1.394790626000031,
+      "minibatches": 28
+    },
+    "bury: tf32, no reads, compiled: first call s": 25.649700318999976,
+    "bury: tf32, no reads, compiled": {
+      "seconds": 1.0765284379999684,
+      "minibatches": 28
+    },
+    "bury: bf16, no reads, compiled: first call s": 32.96095738600002,
+    "bury: bf16, no reads, compiled": {
+      "seconds": 0.6369640460000028,
+      "minibatches": 28
+    },
+    "declare_rows_agent0": 3752,
+    "declare: today (fp32, reads)": {
+      "seconds": 0.333175601999983
+    },
+    "declare: fp32, no reads": {
+      "seconds": 0.3404221420000795,
+      "minibatches": 32
+    },
+    "declare: bf16, no reads": {
+      "seconds": 0.40304551999997784,
+      "minibatches": 32
+    },
+    "declare: fp32, no reads, compiled: first call s": 19.009133991999988,
+    "declare: fp32, no reads, compiled": {
+      "seconds": 0.2310139829999116,
+      "minibatches": 28
+    },
+    "declare: tf32, no reads, compiled: first call s": 15.70686310400015,
+    "declare: tf32, no reads, compiled": {
+      "seconds": 0.25289146399995843,
+      "minibatches": 28
+    },
+    "declare: bf16, no reads, compiled: first call s": 21.90846119899993,
+    "declare: bf16, no reads, compiled": {
+      "seconds": 0.26637045400002535,
+      "minibatches": 28
+    }
+  }
+}
