@@ -31,6 +31,16 @@ shape. ``flat-wide`` is the flat design at the card critic's width and
 depth, so a difference between ``cards`` and ``flat`` can be told apart
 into structure and size. ``cards`` is ``CardCritic`` at v6's shape.
 
+For a population's shared critic, which can read no one agent's
+history encoding: ``cards-raw-<d>`` is ``model.shared_critic``, reading
+the raw history tokens in its own attention. Against it, reading the
+trained checkpoint's encoding (``cards-<d>``) is an unequal comparison
+for a population whose agents start from nothing, so ``cards-rand-<d>``
+reads a randomly initialised actor's encoding -- the same design,
+untrained -- and ``cards-pre-<d>`` gives the shared critic a small
+causal history encoder of its own (``PreEncodedCritic``), trained with
+it. Every arm is also paired against the raw-history arm when it runs.
+
 This is a small-data measurement -- seven rounds is about 28 PPO steps
 of critic data, where a run fits thousands -- so it answers how
 efficiently each design learns and how well it generalises from a
@@ -47,12 +57,14 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from ..nn.arch import bury_net_from, declare_net_from
 from ..nn.model import (
     ActorCritic,
     CardCritic,
     Critic,
+    HistoryEncoder,
     ModelConfig,
     load_model,
     shared_critic,
@@ -65,10 +77,36 @@ from .parallel import RolloutPool
 from .ppo import explained_variance
 from .starts import PrePlayConfig, critic_values, make_starts
 
-__all__ = ["ARMS", "collect_dataset", "run"]
+__all__ = ["ARMS", "PreEncodedCritic", "collect_dataset", "run"]
 
 ARMS = ("v5", "flat", "flat-wide", "cards")
 _TRICK = slice(5, 9)  # the trick-in-progress planes, one per relative seat
+
+
+class PreEncodedCritic(nn.Module):
+    """A population's shared critic with a history encoder of its own.
+
+    ``model.shared_critic`` reads the raw history tokens directly in the
+    card critic's attention, beside the card tokens. This runs them first
+    through a causal ``HistoryEncoder`` -- the actor's design, at the
+    critic's width and ``layers`` deep -- trained with the critic. It
+    belongs to the critic, so a population of any size can share it.
+    Called as the shared critic is.
+    """
+
+    def __init__(self, cfg: ModelConfig, agents: int, layers: int = 2) -> None:
+        super().__init__()
+        d = cfg.critic_d
+        self.agents = int(agents)
+        self.encoder = HistoryEncoder(replace(
+            cfg, d_model=d, n_heads=max(1, d // 64), d_ff=4 * d, n_layers_history=layers))
+        self.critic = CardCritic(cfg, history_in=d, agents=agents)
+
+    def forward(self, history: torch.Tensor, history_len: torch.Tensor,
+                privileged: torch.Tensor, detach: bool = False, **kw: Any) -> torch.Tensor:
+        enc, _keep = self.encoder(history, history_len)
+        # Never detached: the encoder learns through the critic.
+        return self.critic(enc, history_len, privileged, detach=False, **kw)
 
 
 def _arm_config(arm: str, actor_cfg: ModelConfig) -> ModelConfig:
@@ -78,6 +116,8 @@ def _arm_config(arm: str, actor_cfg: ModelConfig) -> ModelConfig:
     per 64 of width, feed-forward ``4 * d``. ``cards-raw-<d>`` is the same
     as a population's shared critic builds it (``model.shared_critic``):
     reading the raw history rather than the actor's encoding.
+    ``cards-rand-<d>`` reads an untrained actor's encoding, and
+    ``cards-pre-<d>`` is ``PreEncodedCritic`` (see the module docstring).
     """
     if arm.startswith("cards-"):
         d = int(arm.rsplit("-", 1)[1])
@@ -215,6 +255,15 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
     net = ActorCritic(actor_cfg)
     load_model(net, checkpoint_blob["model"])
     net = net.to(device).eval()
+    # The checkpoint's actor design, never trained: what a population's
+    # agents' encoders are at the start. Its own seed, the global RNG
+    # left as it was, so the collected data match earlier runs'.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed + 3)
+        untrained = ActorCritic(actor_cfg).to(device).eval()
+
+    def encoder_for(arm: str) -> Any:
+        return untrained.actor if arm.startswith("cards-rand-") else net.actor
     if data is None:
         data = collect_dataset(checkpoint_blob, net, rounds, hands, device, seed,
                                workers=workers, pool=pool)
@@ -238,8 +287,8 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
     preds: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
 
     def score(arm: str, critic: Any, epoch: int, seconds: float) -> dict[str, float]:
-        p_held = _values(critic, net.actor, gpu, held, device)
-        p_fit = _values(critic, net.actor, gpu, fit_probe, device)
+        p_held = _values(critic, encoder_for(arm), gpu, held, device)
+        p_fit = _values(critic, encoder_for(arm), gpu, fit_probe, device)
         if getattr(critic, "agents", 0):
             p_start = critic_values(
                 None, held_starts, device,
@@ -279,6 +328,8 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
         cfg = _arm_config(arm, actor_cfg)
         if arm.startswith("cards-raw-"):
             critic = shared_critic(cfg, agents=1).to(device)
+        elif arm.startswith("cards-pre-"):
+            critic = PreEncodedCritic(cfg, agents=1).to(device)
         else:
             critic = (CardCritic(cfg) if cfg.critic_kind == "cards" else Critic(cfg)).to(device)
         params = sum(p.numel() for p in critic.parameters())
@@ -295,7 +346,7 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
                 i = torch.from_numpy(perm[s : s + batch]).to(device)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                    v = _forward(critic, net.actor, gpu, i)
+                    v = _forward(critic, encoder_for(arm), gpu, i)
                 loss = F.mse_loss(v.float(), gpu["ret"][i])
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -306,18 +357,27 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
             passes.append(score(arm, critic, epoch, time.perf_counter() - t0))
         results["arms"][arm] = {"params": params, "config": asdict(cfg), "passes": passes}
 
-    # Paired on the same held-out hands: every arm against the flat critic
-    # it would replace, pass for pass.
-    if "flat" in preds:
+    # Paired on the same held-out hands, pass for pass: every arm against
+    # the flat critic it would replace, and against the raw-history
+    # shared critic where that ran.
+    def paired_against(base: str) -> dict[str, list]:
+        got: dict[str, list] = {}
         for arm in preds:
-            if arm == "flat":
+            if arm == base:
                 continue
             out = []
-            for epoch in sorted(preds["flat"]):
+            for epoch in sorted(preds[base]):
                 mine = preds[arm].get(epoch, preds[arm].get(0))
-                base_held, base_start = preds["flat"][epoch]
+                base_held, base_start = preds[base][epoch]
                 d_held = _paired_diff(mine[0], base_held, actual_held, held_hand, rng)
                 d_start = _paired_diff(mine[1], base_start, start_actual, start_hand, rng)
                 out.append({"epoch": epoch, "held": d_held, "start": d_start})
-            results["paired"][arm] = out
+            got[arm] = out
+        return got
+
+    if "flat" in preds:
+        results["paired"] = paired_against("flat")
+    for base in preds:
+        if base.startswith("cards-raw-"):
+            results[f"paired_vs_{base}"] = paired_against(base)
     return results

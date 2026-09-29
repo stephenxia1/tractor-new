@@ -298,6 +298,40 @@ def test_the_critic_bakeoff_runs_end_to_end() -> None:
     assert len(out["paired"]["cards"]) == 1
 
 
+
+def test_the_shared_critic_arms_run_and_pair_against_raw_history() -> None:
+    """The untrained-encoder and pre-encoder arms beside the raw-history
+    shared critic; every arm paired against it."""
+    from ..train.critic_bakeoff import PreEncodedCritic, run
+
+    small = ModelConfig(d_model=32, n_layers_history=1, n_layers_query=1, n_heads=2,
+                        d_ff=64, critic_d=16, critic_layers=1, critic_heads=2,
+                        critic_d_ff=32, belief_d=16, scalar_d=8, head_d=16,
+                        max_candidates=16)
+    torch.manual_seed(5)
+    net = ActorCritic(small)
+    blob = {"model": net.state_dict(), "model_config": asdict(small),
+            "declare": {"model": DeclareNet().state_dict()},
+            "bury": {"model": BuryNet().state_dict()}}
+    arms = ("flat", "cards-16", "cards-raw-16", "cards-rand-16", "cards-pre-16")
+    out = run(blob, torch.device("cpu"), rounds=2, hands=4, epochs=1, workers=2, pool=4,
+              arms=arms)
+    assert set(out["arms"]) == set(arms)
+    for arm, got in out["arms"].items():
+        last = got["passes"][-1]
+        assert np.isfinite(last["ev_held"]) and np.isfinite(last["ev_start"]), arm
+    assert set(out["paired_vs_cards-raw-16"]) == set(arms) - {"cards-raw-16"}
+    # The pre-encoder is trained through the critic: it has gradients.
+    cfg = replace(small, critic_kind="cards", ffn="swiglu")
+    critic = PreEncodedCritic(cfg, agents=1)
+    hist = torch.randn(3, small.max_history, 37)
+    length = torch.tensor([5, 0, 12])
+    v = critic(hist, length, torch.rand(3, 5, 54), context=torch.rand(3, 37),
+               cards=torch.rand(3, 54, 30), seat_agents=torch.zeros(3, 4, dtype=torch.int64))
+    v.sum().backward()
+    assert critic.encoder.in_proj.weight.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("kind", ["flat", "cards"])
 def test_static_shapes_compute_what_the_trimmed_path_does(kind: str) -> None:
     """``static_shapes`` runs on the width handed in, with no host read;
