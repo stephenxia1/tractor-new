@@ -1072,6 +1072,47 @@ decision counts:
 
 ---
 
+### Why pop8 diverged (2026-09-29)
+
+`pop8` (H100; compiled rollout and update, CUDA graphs) was healthy for
+35 steps -- approx_kl ~0.006 -- and then each agent in turn ran away:
+agent 0 at step 36, the last at 83; approx_kl to ~1e8, half an agent's
+rows at the log-ratio clamp, gradients 1e17 before clipping, logits from
+~30 to ~1e4 in a few steps (`evals/2026-09-29/`: the run's metrics,
+`diag-pop8.json`, `logit-scan-diag-r1.json`). Nothing preceded it in the
+auxiliary losses; each agent's entropy had been falling, and it broke
+somewhere between 1.0 and 1.4.
+
+Runs from scratch, same seed, 70-90 warm-up steps each, isolated it:
+
+| run | rollout | update | first agent broken | play step |
+| --- | --- | --- | --- | --- |
+| R1 | compiled | compiled, CUDA graphs | step 35 (six by 44) | ~42 s |
+| R3 | eager | compiled, CUDA graphs | step 30 (seven by 51) | -- |
+| R2 | eager | eager, host | none by 90 (one spike, recovered) | ~73 s |
+| R4 | compiled | eager, host | none by 60 | ~67 s |
+| R5 | compiled | fixed shapes, CUDA graphs, **not compiled** | none by 40+ | ~51 s |
+
+- **`torch.compile` of the update is the cause.** The compiled rollout
+  is not (R4), nor the fixed shapes, the device rows or the CUDA graphs
+  (R5; graphs matched compiled-without-graphs exactly in the diagnostic).
+  On healthy networks every path agrees with eager to bf16 noise; what
+  the compiled training graph does differently shows only as logits grow.
+- **The recipe has a milder version of it.** The all-eager run's agent 7
+  spiked to approx_kl 0.27 at step 64 (entropy 1.07) and recovered. A KL
+  guard on the update (stop an agent's update past a threshold) would
+  keep such a spike from compounding; not added, the user's call.
+- Once an agent's logits are ~1e4, bf16 rounding makes every path's
+  log-probabilities disagree by tens of nats (up to 64), so a broken
+  agent never recovers: the precision is the amplifier, not the cause.
+- **Not an extreme reward.** Kitty multipliers can make a row's reward
+  ~4.8 (a normal trick's is at most ~0.25), but advantages are normalised
+  per minibatch and clipped, the returns' own value loss is flat through
+  the onset, agents broke one at a time rather than a table at once, and
+  the eager runs see the same rewards without breaking.
+
+`pop8b` runs R5's configuration.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

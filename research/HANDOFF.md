@@ -363,9 +363,28 @@ nothing.
      --length-buckets 4 --checkpoint-every 50 --keep-last 6
    ```
 
-   **Launched 2026-09-29** (the user's call): `pop8` on an H100, the
-   command above with `--steps 1500`, app `tractor-train-pop8`, W&B run
-   `pop8`. It should end inside the 24-hour limit with `final.pt`.
+   **`pop8` failed; do not resume it.** Launched 2026-09-29 with
+   `--compile --cuda-graphs`. Every agent diverged in turn from step 36
+   (approx_kl 0.006 -> 1e8, logits ~30 -> ~1e4), and the run died at step
+   300 when its idle rollout workers timed out during the first pre-play
+   phase (fixed, `96ad51a`). The cause is `torch.compile` of the update:
+   README § *Why pop8 diverged*.
+
+   **`pop8b` is the run** (relaunched 2026-09-29, the user's call): the
+   same recipe without compiling the update --
+
+   ```bash
+   TRACTOR_TRAIN_APP=tractor-train-pop8b modal run --detach modal_train.py::launch \
+     --gpu h100 --name pop8b --arch v6 --rollout-workers 16 --rollout-overlap --pool 4096 \
+     --fixed-shapes --cuda-graphs --rollout-forwards compiled \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 1300 \
+     --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
+     --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
+     --length-buckets 4 --checkpoint-every 50 --keep-last 6
+   ```
+
+   ~51 s a play step, so 1300 steps end inside the 24-hour limit. Do
+   not add `--compile` back without KL guarding; see the README.
 
    **Training longer.** Resume with a larger absolute `--steps` and the
    same flags; the step, the schedule's place and every optimiser come
