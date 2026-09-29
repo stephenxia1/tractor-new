@@ -982,14 +982,40 @@ raw-history arm on the same held-out hands:
   random weights.
 - **The critic's own encoder, trained end to end, did not help here.**
   It sat at the mean for two passes and was still climbing at the
-  fourth. The likely culprit is the shared gradient-norm clip (0.5): the
-  new encoder's gradients dominated the norm early, leaving the critic's
-  own steps tiny, where the frozen-encoder arms have no such
-  competition. Unverified, and it is also a quarter of the random
-  encoder's width.
+  fourth. (Not the gradient clip, as first guessed -- see below.)
 - This is the small-data regime (about 28 PPO steps of critic data). A
   population's shared critic fits eight times the rows every step, which
   may narrow the raw arm's gap on its own.
+
+**The critic's own encoder, again** (`--arms cards-raw-128,cards-rand-128,
+cards-pre-128,cards-pre128x2-sep-128,cards-pre384x3-sep-128 --epochs 6`;
+`evals/2026-09-28/critic-bakeoff-pre-sep.json`). `cards-pre<W>x<L>-sep`
+is an encoder `W` wide and `L` deep whose gradients are clipped apart
+from the critic's; every pre-encoder arm logs both gradient norms.
+
+| arm | parameters | best held-out EV | pass 6 | against raw, pass 4 |
+| --- | --- | --- | --- | --- |
+| raw history | 1.13M | 0.304 | 0.304 | -- |
+| untrained encoder, frozen | 1.17M | 0.352 (pass 4) | 0.277 | +0.059 [+0.031, +0.090] |
+| own encoder 128x2, one clip | 1.69M | 0.057 (pass 6) | 0.057 | −0.289 |
+| own encoder 128x2, clipped apart | 1.69M | 0.353 (pass 6) | 0.353 | +0.054 [+0.022, +0.084] |
+| **own encoder 384x3, clipped apart** | 8.34M | **0.367 (pass 3)** | 0.293 | **+0.070 [+0.042, +0.097]** |
+
+- **The clip was not the problem.** The narrow encoder's gradient norms
+  before clipping were 4e-5 falling to 2e-7, the critic's ~0.014 --
+  both far under the 0.5 bound, so neither clip ever acted. The 128x2
+  arm starts collapsed -- the critic predicting the mean, EV 0.004 --
+  and escapes at a pass that differs from run to run (the third before,
+  the sixth and the second here; clipped together or apart made no
+  difference, since the clip never bit). Why it collapses is not known.
+- **At the actor's width it does not collapse,** and it learns fastest:
+  0.328 after one pass, 0.367 after three, level with the frozen random
+  encoder and 0.07 above raw history, then over-fits the seven rounds
+  (0.293 by pass 6, as the frozen encoder does). It is 7M parameters
+  of encoder in front of a 1.2M critic.
+- Over-fitting a fixed set of seven rounds is this measurement's limit,
+  not a run's: a run's critic sees new rows every step. The best-pass
+  numbers are the comparable ones.
 
 ---
 
