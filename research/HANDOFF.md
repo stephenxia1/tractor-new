@@ -324,19 +324,24 @@ nothing.
    rollout's forwards compiled (both under `--compile`), the burial
    update in bf16; a pre-play step ~18 s where it was ~26 s.
 
+   **Then the shared critic got its own history encoder** (the user's
+   call, 2026-09-29; README § *What reading raw history costs the shared
+   critic*): ~80 s a play step on the L40S, ~44 s on the H100 with CUDA
+   graphs, where they were ~63 and ~36.
+
    **The proposed run** (the warm-up length and step count are proposals,
    not the user's decisions yet). A Modal function stops at 24 hours. At
-   ~63 s a step, 300 warm-up steps are ~5.3 h and a 200-step block ~3.5 h
-   plus ~30 min of pre-play, so a first launch fits about 1100 steps
-   (~21.5 h with the compiling; hands shorten as the agents learn, so
+   ~80 s a step, 300 warm-up steps are ~6.5 h and a 200-step block ~4.4 h
+   plus ~30 min of pre-play, so a first launch fits about 900 steps
+   (~21.7 h with the compiling; hands shorten as the agents learn, so
    likely less). Resume with `--resume /vol/pop8/checkpoints/final.pt`,
    the same flags and a larger absolute `--steps` (confirm the first line
-   reads `[1101/...]`):
+   reads `[901/...]`):
 
    ```bash
    modal run --detach modal_train.py::launch --gpu l40s --name pop8 --arch v6 \
      --rollout-workers 10 --rollout-overlap --pool 4096 --compile \
-     --population 8 --reshuffle-every 10 --hands 4096 --steps 1100 \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 900 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
      --length-buckets 4 --checkpoint-every 50 --keep-last 6
@@ -344,15 +349,15 @@ nothing.
 
    **Or on an H100** (the user's call -- about 1.65x faster a step for
    about 1.2x the GPU cost an hour-for-hour; README § *The update as a
-   CUDA graph*; `pop8v6e-h100-smoke`): ~37 s a play step and ~14 s a
-   pre-play step, so a first launch fits about 1900 steps (~22.8 h).
+   CUDA graph*; `pop8v6f-h100-smoke`): ~44 s a play step and ~15 s a
+   pre-play step, so a first launch fits about 1500 steps (~21.4 h).
    `--cuda-graphs` is what makes the H100 pay; 16 workers need the
-   H100 function's 20 CPUs. Resume as above (`[1901/...]`):
+   H100 function's 20 CPUs. Resume as above (`[1501/...]`):
 
    ```bash
    modal run --detach modal_train.py::launch --gpu h100 --name pop8 --arch v6 \
      --rollout-workers 16 --rollout-overlap --pool 4096 --compile --cuda-graphs \
-     --population 8 --reshuffle-every 10 --hands 4096 --steps 1900 \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 1500 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
      --length-buckets 4 --checkpoint-every 50 --keep-last 6

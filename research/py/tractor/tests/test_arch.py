@@ -111,6 +111,12 @@ def test_v6_sizes() -> None:
     assert n(net.critic) == 1_173_121
     assert n(DeclareNet(DeclareConfig(**ARCHES["v6"]["declare_model"]))) == 5_005_324
     assert n(BuryNet(BuryNetConfig(**ARCHES["v6"]["bury_model"]))) == 3_621_634
+    # A population's shared critic, with its own history encoder.
+    from ..nn.model import shared_critic
+
+    shared = shared_critic(ModelConfig(**ARCHES["v6"]["model"]), 8)
+    assert n(shared.encoder) == 7_161_984
+    assert n(shared) == 8_336_641
 
 
 def test_swiglu_needs_the_card_critic_and_a_residual_declaration_net() -> None:
@@ -363,11 +369,14 @@ def test_static_shapes_compute_what_the_trimmed_path_does(kind: str) -> None:
             torch.testing.assert_close(v2, value, rtol=1e-5, atol=1e-5)
 
 
-def test_the_shared_critic_under_static_shapes() -> None:
+@pytest.mark.parametrize("encoded", [False, True])
+def test_the_shared_critic_under_static_shapes(encoded: bool) -> None:
     from ..nn.model import shared_critic, static_shapes
 
     torch.manual_seed(3)
-    critic = shared_critic(SMALL_V6, 8).eval()
+    cfg = replace(SMALL_V6, critic_history_d=32, critic_history_layers=1) if encoded else SMALL_V6
+    critic = shared_critic(cfg, 8).eval()
+    assert (critic.encoder is not None) == encoded
     obs, priv = dummy_batch(SMALL_V6, batch=5, history_len=30, seed=6)
     obs = obs._replace(history_len=torch.tensor([0, 30, 7, 12, 29]))
     seats = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7], [7, 6, 5, 4], [1, 3, 5, 7], [2, 2, 2, 2]])
@@ -381,3 +390,35 @@ def test_the_shared_critic_under_static_shapes() -> None:
         with static_shapes():
             static = value(obs.history[:, :32])
     torch.testing.assert_close(static, eager, rtol=1e-5, atol=1e-5)
+
+
+def test_the_shared_critic_trains_its_own_history_encoder() -> None:
+    """Its encoder learns through the critic, reads only real history, and
+    a play start -- no history at all -- still values."""
+    from ..nn.model import shared_critic
+
+    torch.manual_seed(4)
+    cfg = replace(SMALL_V6, critic_history_d=32, critic_history_layers=1)
+    critic = shared_critic(cfg, 8)
+    obs, priv = dummy_batch(cfg, batch=4, history_len=20, seed=2)
+    seats = torch.zeros(4, 4, dtype=torch.int64)
+
+    def value(o):
+        return critic(o.history, o.history_len, priv, context=o.context, cards=o.cards,
+                      trick=o.planes[:, 5:9], seat_agents=seats)
+
+    value(obs).sum().backward()
+    assert critic.encoder.in_proj.weight.grad.abs().sum() > 0
+    # Padded history cannot move a value: scramble it past each length.
+    critic.eval()
+    with torch.no_grad():
+        want = value(obs)
+        noisy = obs.history.clone()
+        for i, k in enumerate(obs.history_len.tolist()):
+            noisy[i, k:] = torch.randn_like(noisy[i, k:]) * 5
+        torch.testing.assert_close(value(obs._replace(history=noisy)), want,
+                                   rtol=1e-5, atol=1e-5)
+        empty = critic(torch.zeros(4, 1, obs.history.shape[-1]),
+                       torch.zeros(4, dtype=torch.int64), priv, context=obs.context,
+                       cards=obs.cards, seat_agents=seats)
+    assert torch.isfinite(empty).all()

@@ -754,3 +754,37 @@ def test_device_rows_refill_in_place() -> None:
     assert torch.equal(obs.history, want.history) and torch.equal(sc["ret"], want_sc["ret"])
     rows.load(RolloutBuffer(800, SMALL))
     assert rows.generation == generation + 1 and rows.capacity == 800
+
+
+def test_a_shared_critic_with_its_own_encoder_collects_and_trains() -> None:
+    """The rollout values rows the same through the static path, and a
+    fixed-shape fit on the device rows moves the encoder too."""
+    from ..train.buffer import DeviceRows
+    from ..train.critic_learner import CriticLearner, CriticTrainConfig
+    from ..train.gae import compute_gae
+
+    cfg = replace(SMALL, critic_kind="cards", ffn="swiglu", critic_history_d=16,
+                  critic_history_layers=1)
+    got = []
+    for forwards in ("eager", "static"):
+        nets = _actors()
+        torch.manual_seed(12)
+        critic = _jitter(shared_critic(cfg, AGENTS), 3)
+        buf = RolloutBuffer(600, SMALL)
+        seat_of = hand_agents(_table(4), 6)
+        collect(nets, np.random.default_rng(21), buf, n_hands=6, device="cpu", pool=6,
+                cfg=ACTOR_ONLY, agents=seat_of, critic=critic, forwards=forwards)
+        got.append(buf)
+    eager, static = got
+    n = len(eager)
+    assert np.array_equal(eager.action[:n], static.action[:n])
+    np.testing.assert_allclose(static.value[:n], eager.value[:n], rtol=1e-4, atol=1e-5)
+
+    compute_gae(eager, gamma=1.0, lam=0.95)
+    before = [p.detach().clone() for p in critic.encoder.parameters()]
+    learner = CriticLearner(critic, CriticTrainConfig(minibatch=32, fixed_shapes=True,
+                                                      bf16=False))
+    seats = relative_seat_agents(seat_of[eager.episode[:n]], eager.seat[:n])
+    st = learner.update(eager, seats, device_rows=DeviceRows(eager, "cpu"))
+    assert np.isfinite(st["critic/value_loss"])
+    assert any(not torch.equal(p, q) for p, q in zip(critic.encoder.parameters(), before))

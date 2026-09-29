@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator, NamedTuple, Sequence
 
 import numpy as np
@@ -176,6 +176,12 @@ class ModelConfig:
     # is an actor alone, for a population whose agents share one critic
     # (``CardCritic`` with ``agents`` set, held outside the agents).
     critic_kind: str = "flat"
+    # A population's shared critic reads the raw history (it can read no
+    # one agent's encoding). With ``critic_history_layers`` > 0 it first
+    # runs it through a causal ``HistoryEncoder`` of its own, this wide
+    # and this deep, trained with it (``CardCritic``). 0 reads it raw.
+    critic_history_d: int = 0
+    critic_history_layers: int = 0
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads:
@@ -190,6 +196,10 @@ class ModelConfig:
             raise ValueError(
                 f"critic_kind must be 'flat', 'cards' or 'none', not {self.critic_kind!r}"
             )
+        if self.critic_history_layers < 0 or (
+            self.critic_history_layers and self.critic_history_d < 1
+        ):
+            raise ValueError("the critic's history encoder needs a width and a depth")
         if self.critic_kind == "flat" and self.ffn != "gelu":
             # The flat critic's privileged MLP adds the context into its
             # first layer by index; it is the legacy design and stays GELU.
@@ -1309,6 +1319,15 @@ class CardCritic(nn.Module):
     instead (``history_in = HISTORY_DIM``), and four more tokens say
     which agent sits in each seat, relative to the seat being valued:
     the value of a position depends on who is playing it.
+
+    **Its own history encoder** (shared, ``cfg.critic_history_layers`` >
+    0): the raw tokens first pass through a causal ``HistoryEncoder`` --
+    the actor's design, ``critic_history_d`` wide -- trained with the
+    critic. Raw tokens are each projected on their own; encoded, each is
+    mixed with the plays before it. On the bake-off data (2026-09-29,
+    README) a 384-wide, 3-layer one took held-out explained variance from
+    0.304 to 0.367, near the 0.383 of a critic reading v5's trained
+    actor's encoding.
     """
 
     def __init__(self, cfg: ModelConfig, history_in: int | None = None,
@@ -1317,6 +1336,11 @@ class CardCritic(nn.Module):
         self.cfg = cfg
         self.agents = int(agents)
         self.history_in = int(history_in or cfg.d_model)
+        encoded = bool(self.agents and cfg.critic_history_layers)
+        if encoded:
+            if self.history_in != HISTORY_DIM:
+                raise ValueError("the critic's history encoder reads raw history tokens")
+            self.history_in = cfg.critic_history_d
         cd = cfg.critic_d
         self.card_in = nn.Linear(CARD_CRITIC_IN, cd)
         self.card_embed = nn.Parameter(torch.zeros(NUM_TYPES, cd))
@@ -1340,6 +1364,14 @@ class CardCritic(nn.Module):
             for p in (self.agent_embed, self.seat_embed):
                 nn.init.normal_(p, std=0.02)
         _scale_residual_outputs(self.blocks)
+        # Built last: it initialises itself, and the ``apply`` above would
+        # undo its residual scaling.
+        self.encoder: HistoryEncoder | None = None
+        if encoded:
+            w = cfg.critic_history_d
+            self.encoder = HistoryEncoder(replace(
+                cfg, d_model=w, n_heads=max(1, w // 64), d_ff=4 * w,
+                n_layers_history=cfg.critic_history_layers))
 
     def forward(
         self,
@@ -1365,6 +1397,9 @@ class CardCritic(nn.Module):
             raise ValueError("a shared critic needs the agent in each seat")
         if detach:
             history_enc = history_enc.detach()
+        if self.encoder is not None:
+            # Trained with the critic: its output is never detached.
+            history_enc, _keep = self.encoder(history_enc, history_len)
         b = privileged.shape[0]
         cd = self.cfg.critic_d
 
@@ -1405,7 +1440,9 @@ class CardCritic(nn.Module):
 
 def shared_critic(cfg: ModelConfig, agents: int) -> CardCritic:
     """The one critic a population of ``agents`` shares: ``CardCritic`` at
-    ``cfg``'s critic widths, reading raw history and the seats' agents."""
+    ``cfg``'s critic widths, reading raw history -- through its own
+    encoder when ``cfg.critic_history_layers`` says -- and the seats'
+    agents."""
     return CardCritic(cfg, history_in=HISTORY_DIM, agents=agents)
 
 

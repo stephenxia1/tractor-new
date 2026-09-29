@@ -1017,6 +1017,27 @@ from the critic's; every pre-encoder arm logs both gradient norms.
   not a run's: a run's critic sees new rows every step. The best-pass
   numbers are the comparable ones.
 
+**Adopted** (the user's call, 2026-09-29): v6's shared critic runs the
+raw history through its own causal encoder, 384 wide and 3 layers deep,
+trained with it (`ModelConfig.critic_history_d` / `critic_history_layers`,
+`CardCritic`; 0 layers reads it raw as before). 8.34M parameters, 7.16M
+of them the encoder. What it costs a step (`pop8v6f-smoke`,
+`pop8v6f-h100-smoke`, the flags of `pop8v6d` / `pop8v6e`):
+
+| per play step | L40S, raw | L40S, encoder | H100 captured, raw | H100 captured, encoder |
+| --- | --- | --- | --- | --- |
+| collect (its critic forward) | 21.3 s (4.2) | 26.0 s (7.7) | 13.6 s (1.3) | 16.1 s (2.4) |
+| actor updates | 29.1 s | 28.3 s | 13.2 s | 12.9 s |
+| shared critic update | 9.5 s | 22.7 s | 4.8 s | 10.5 s |
+| **step** | **~63 s** | **~80 s** | **~36 s** | **~44 s** |
+| pre-play step | ~18 s | ~19 s | ~14 s | ~15 s |
+
+About a quarter more a step: the critic's update more than doubles, its
+rollout forward nearly doubles, and nothing else moves. Compiling the
+encoder adds ~3-6 minutes to a launch. Peak GPU memory is unchanged
+(16.1 / 16.7 GiB). At the v5-bury lineage's 4150 play steps: ~102 h on
+the L40S, ~60 h on the H100.
+
 ---
 
 ## Next steps

@@ -15,6 +15,10 @@ that predates saved configs rebuilds as ``v5``.
   (4.51M) was the first choice; the user asked for less, and the width
   bake-off found 128 as good (held-out explained variance 0.383 against
   0.363 at 256, both far above the flat critic's 0.161);
+* a population's shared critic runs the raw history through a causal
+  encoder of its own, 384 wide and 3 layers deep, trained with it
+  (2026-09-29): held-out explained variance 0.304 -> 0.367 in the
+  bake-off; 1.13M -> 8.34M;
 * declaration: a residual MLP, 3 blocks of width 512; 0.27M -> 5.0M;
 * burial: 4 layers of width 256, value head 512; 0.42M -> 3.6M.
 
@@ -43,6 +47,10 @@ ARCHES: dict[str, dict[str, dict[str, Any]]] = {
             "critic_layers": 4,
             "critic_heads": 2,
             "critic_d_ff": 512,
+            # The shared critic's own history encoder (2026-09-29, the
+            # user's call after the bake-off): the actor's width and depth.
+            "critic_history_d": 384,
+            "critic_history_layers": 3,
         },
         "declare_model": {"width": 512, "depth": 3, "residual": True, "ffn": "swiglu"},
         "bury_model": {"d": 256, "layers": 4, "heads": 4, "value_width": 512, "ffn": "swiglu"},
