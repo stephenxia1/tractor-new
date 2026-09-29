@@ -313,7 +313,8 @@ def test_the_shared_critic_arms_run_and_pair_against_raw_history() -> None:
     blob = {"model": net.state_dict(), "model_config": asdict(small),
             "declare": {"model": DeclareNet().state_dict()},
             "bury": {"model": BuryNet().state_dict()}}
-    arms = ("flat", "cards-16", "cards-raw-16", "cards-rand-16", "cards-pre-16")
+    arms = ("flat", "cards-16", "cards-raw-16", "cards-rand-16", "cards-pre-16",
+            "cards-pre32x1-sep-16")
     out = run(blob, torch.device("cpu"), rounds=2, hands=4, epochs=1, workers=2, pool=4,
               arms=arms)
     assert set(out["arms"]) == set(arms)
@@ -321,6 +322,14 @@ def test_the_shared_critic_arms_run_and_pair_against_raw_history() -> None:
         last = got["passes"][-1]
         assert np.isfinite(last["ev_held"]) and np.isfinite(last["ev_start"]), arm
     assert set(out["paired_vs_cards-raw-16"]) == set(arms) - {"cards-raw-16"}
+    # The pre-encoder arms report both halves' gradient norms, and the
+    # shaped arm built what its name says.
+    for arm in ("cards-pre-16", "cards-pre32x1-sep-16"):
+        last = out["arms"][arm]["passes"][-1]
+        assert last["grad_norm_encoder"] > 0 and last["grad_norm_critic"] > 0
+    from ..train.critic_bakeoff import _pre_spec
+    assert _pre_spec("cards-pre-128", 128) == (128, 2, False)
+    assert _pre_spec("cards-pre384x3-sep-128", 128) == (384, 3, True)
     # The pre-encoder is trained through the critic: it has gradients.
     cfg = replace(small, critic_kind="cards", ffn="swiglu")
     critic = PreEncodedCritic(cfg, agents=1)

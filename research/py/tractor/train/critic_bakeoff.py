@@ -88,15 +88,16 @@ class PreEncodedCritic(nn.Module):
 
     ``model.shared_critic`` reads the raw history tokens directly in the
     card critic's attention, beside the card tokens. This runs them first
-    through a causal ``HistoryEncoder`` -- the actor's design, at the
-    critic's width and ``layers`` deep -- trained with the critic. It
-    belongs to the critic, so a population of any size can share it.
-    Called as the shared critic is.
+    through a causal ``HistoryEncoder`` -- the actor's design, ``width``
+    wide (the critic's by default) and ``layers`` deep -- trained with the
+    critic. It belongs to the critic, so a population of any size can
+    share it. Called as the shared critic is.
     """
 
-    def __init__(self, cfg: ModelConfig, agents: int, layers: int = 2) -> None:
+    def __init__(self, cfg: ModelConfig, agents: int, layers: int = 2,
+                 width: int | None = None) -> None:
         super().__init__()
-        d = cfg.critic_d
+        d = int(width or cfg.critic_d)
         self.agents = int(agents)
         self.encoder = HistoryEncoder(replace(
             cfg, d_model=d, n_heads=max(1, d // 64), d_ff=4 * d, n_layers_history=layers))
@@ -107,6 +108,24 @@ class PreEncodedCritic(nn.Module):
         enc, _keep = self.encoder(history, history_len)
         # Never detached: the encoder learns through the critic.
         return self.critic(enc, history_len, privileged, detach=False, **kw)
+
+
+def _pre_spec(arm: str, d: int) -> tuple[int, int, bool]:
+    """``cards-pre[<W>x<L>][-sep]-<d>`` -> (encoder width, layers, clip apart).
+
+    ``cards-pre-128`` is the first form: the critic's width, two layers,
+    one gradient-norm clip over encoder and critic together. ``-sep``
+    clips the two apart, so a large encoder gradient cannot shrink the
+    critic's step."""
+    tokens = arm.split("-")[1:-1]
+    shape = tokens[0][len("pre"):]
+    width, layers = (int(x) for x in shape.split("x")) if shape else (d, 2)
+    return width, layers, "sep" in tokens[1:]
+
+
+def _norm(params: list) -> torch.Tensor:
+    grads = [p.grad for p in params if p.grad is not None]
+    return torch.linalg.vector_norm(torch.stack([g.norm() for g in grads]))
 
 
 def _arm_config(arm: str, actor_cfg: ModelConfig) -> ModelConfig:
@@ -328,13 +347,17 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
         cfg = _arm_config(arm, actor_cfg)
         if arm.startswith("cards-raw-"):
             critic = shared_critic(cfg, agents=1).to(device)
-        elif arm.startswith("cards-pre-"):
-            critic = PreEncodedCritic(cfg, agents=1).to(device)
+        elif arm.startswith("cards-pre"):
+            width, layers, apart = _pre_spec(arm, cfg.critic_d)
+            critic = PreEncodedCritic(cfg, agents=1, layers=layers, width=width).to(device)
         else:
             critic = (CardCritic(cfg) if cfg.critic_kind == "cards" else Critic(cfg)).to(device)
         params = sum(p.numel() for p in critic.parameters())
         opt = torch.optim.AdamW(critic.parameters(), lr=lr, weight_decay=0.0)
         order_rng = np.random.default_rng(seed + 2)  # same order for every arm
+        pre = isinstance(critic, PreEncodedCritic)
+        groups = ((list(critic.encoder.parameters()), list(critic.critic.parameters()))
+                  if pre else ())
         passes = []
         for epoch in range(1, epochs + 1):
             critic.train()
@@ -342,6 +365,10 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             perm = order_rng.permutation(fit)
+            # Pre-clip gradient norms of encoder and critic, summed over
+            # the pass (the pre-encoder arms only).
+            norm_sum = torch.zeros(2, device=device)
+            steps = 0
             for s in range(0, len(perm), batch):
                 i = torch.from_numpy(perm[s : s + batch]).to(device)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
@@ -350,11 +377,24 @@ def run(checkpoint_blob: dict, device: torch.device, rounds: int = 8, hands: int
                 loss = F.mse_loss(v.float(), gpu["ret"][i])
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+                if pre:
+                    norm_sum += torch.stack([_norm(g) for g in groups])
+                    steps += 1
+                if pre and apart:
+                    for g in groups:
+                        torch.nn.utils.clip_grad_norm_(g, 0.5)
+                else:
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
                 opt.step()
             if device.type == "cuda":
                 torch.cuda.synchronize()
-            passes.append(score(arm, critic, epoch, time.perf_counter() - t0))
+            row = score(arm, critic, epoch, time.perf_counter() - t0)
+            if pre:
+                enc_n, crit_n = (norm_sum / max(steps, 1)).tolist()
+                row["grad_norm_encoder"], row["grad_norm_critic"] = enc_n, crit_n
+                print(f"  {arm}: mean gradient norm before clipping -- encoder {enc_n:.3g}, "
+                      f"critic {crit_n:.3g}", flush=True)
+            passes.append(row)
         results["arms"][arm] = {"params": params, "config": asdict(cfg), "passes": passes}
 
     # Paired on the same held-out hands, pass for pass: every arm against
