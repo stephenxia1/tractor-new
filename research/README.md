@@ -953,6 +953,44 @@ the agents learn, so these are high:
 About 1.65x faster for about 1.2x the GPU cost, before CPUs and memory
 (the H100 container asks for 20 CPUs to the L40S's 12).
 
+### What reading raw history costs the shared critic (2026-09-29)
+
+The shared critic reads the raw history tokens, and on the bake-off
+data that cost it ~0.08 of held-out explained variance against a critic
+reading v5's trained actor's encoding -- a comparison unfair to a
+population whose agents start from nothing. Two more arms, on the same
+data and seed as before (`train/critic_bakeoff.py`; `modal run
+modal_train.py::critic_bakeoff --arms flat,cards-128,cards-raw-128,cards-rand-128,cards-pre-128`;
+`evals/2026-09-28/critic-bakeoff-shared-arms.json`), paired against the
+raw-history arm on the same held-out hands:
+
+| arm, width 128 | held-out EV, pass 4 | against raw history, pass 4 |
+| --- | --- | --- |
+| flat | 0.161 | −0.145 [−0.186, −0.102] |
+| raw history (`model.shared_critic`) | 0.306 | -- |
+| **an untrained actor's encoding, frozen** | **0.358** (0.365 at pass 3) | **+0.052 [+0.024, +0.081]** |
+| v5's trained actor's encoding | 0.383 | +0.077 [+0.052, +0.103] |
+| its own two-layer encoder, trained with it | 0.300 (0.004 for two passes) | −0.006 [−0.028, +0.015] |
+
+(The first three repeat the earlier runs to within 0.01.)
+
+- **Most of the gap is not what v5 learned.** A randomly initialised
+  history encoder of the actor's design (384 wide, 3 causal layers),
+  frozen, recovers about two thirds of it. Raw history tokens, each
+  projected on its own, are harder for the critic to use than tokens
+  that have each been mixed with the plays before them -- even by
+  random weights.
+- **The critic's own encoder, trained end to end, did not help here.**
+  It sat at the mean for two passes and was still climbing at the
+  fourth. The likely culprit is the shared gradient-norm clip (0.5): the
+  new encoder's gradients dominated the norm early, leaving the critic's
+  own steps tiny, where the frozen-encoder arms have no such
+  competition. Unverified, and it is also a quarter of the random
+  encoder's width.
+- This is the small-data regime (about 28 PPO steps of critic data). A
+  population's shared critic fits eight times the rows every step, which
+  may narrow the raw arm's gap on its own.
+
 ---
 
 ## Next steps
