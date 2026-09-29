@@ -1,0 +1,363 @@
+{
+  "checkpoint": "/vol/pop8/checkpoints/step_0000050.pt",
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "step": 50,
+  "seating": [
+    [
+      7,
+      4,
+      6,
+      1
+    ],
+    [
+      3,
+      5,
+      2,
+      0
+    ]
+  ],
+  "rollout_compiled": {
+    "agents": {
+      "0": {
+        "rows": 39879,
+        "nonfinite": 0,
+        "mean_abs": 3.9206508933270734,
+        "p99_abs": 64.0,
+        "max_abs": 65.79176330566406,
+        "frac_over_0.5": 0.12352365906868276,
+        "frac_over_5": 0.060307429975676424
+      },
+      "1": {
+        "rows": 44947,
+        "nonfinite": 0,
+        "mean_abs": 14.159143261944813,
+        "p99_abs": 64.92977142333984,
+        "max_abs": 66.70805358886719,
+        "frac_over_0.5": 0.48690680134380493,
+        "frac_over_5": 0.2176341023872561
+      },
+      "2": {
+        "rows": 39879,
+        "nonfinite": 0,
+        "mean_abs": 0.005007904374044399,
+        "p99_abs": 0.032714862823486346,
+        "max_abs": 0.08899760246276855,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "3": {
+        "rows": 39879,
+        "nonfinite": 0,
+        "mean_abs": 0.004974217198163391,
+        "p99_abs": 0.03080863237380983,
+        "max_abs": 0.11076474189758301,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "4": {
+        "rows": 44947,
+        "nonfinite": 0,
+        "mean_abs": 1.4716256295218124,
+        "p99_abs": 63.59453201293945,
+        "max_abs": 64.69314575195312,
+        "frac_over_0.5": 0.1938950319264912,
+        "frac_over_5": 0.018466193516808685
+      },
+      "5": {
+        "rows": 39879,
+        "nonfinite": 0,
+        "mean_abs": 0.0072772833605234495,
+        "p99_abs": 0.04845932483673105,
+        "max_abs": 0.13808512687683105,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "6": {
+        "rows": 44947,
+        "nonfinite": 0,
+        "mean_abs": 0.3501786225910438,
+        "p99_abs": 1.9459102153778076,
+        "max_abs": 3.332204580307007,
+        "frac_over_0.5": 0.2728101986784435,
+        "frac_over_5": 0.0
+      },
+      "7": {
+        "rows": 44947,
+        "nonfinite": 0,
+        "mean_abs": 4.270446831606821,
+        "p99_abs": 15.384762134552004,
+        "max_abs": 32.028594970703125,
+        "frac_over_0.5": 0.40681246801788773,
+        "frac_over_5": 0.28088637728880683
+      }
+    },
+    "by_width": {
+      "16": {
+        "rows": 69632,
+        "over_0.5": 16767
+      },
+      "32": {
+        "rows": 65536,
+        "over_0.5": 13747
+      },
+      "48": {
+        "rows": 65518,
+        "over_0.5": 12953
+      },
+      "64": {
+        "rows": 64621,
+        "over_0.5": 12047
+      },
+      "80": {
+        "rows": 53561,
+        "over_0.5": 8596
+      },
+      "96": {
+        "rows": 19989,
+        "over_0.5": 1963
+      },
+      "112": {
+        "rows": 447,
+        "over_0.5": 0
+      }
+    }
+  },
+  "rollout_static": {
+    "agents": {
+      "0": {
+        "rows": 40113,
+        "nonfinite": 0,
+        "mean_abs": 0.019394796573925257,
+        "p99_abs": 0.0,
+        "max_abs": 63.81767654418945,
+        "frac_over_0.5": 0.0006481689227931095,
+        "frac_over_5": 0.0002991548874429736
+      },
+      "1": {
+        "rows": 46347,
+        "nonfinite": 0,
+        "mean_abs": 0.0155812985694331,
+        "p99_abs": 0.0,
+        "max_abs": 63.96721267700195,
+        "frac_over_0.5": 0.0006041383476816191,
+        "frac_over_5": 0.00023734006516063608
+      },
+      "2": {
+        "rows": 40113,
+        "nonfinite": 0,
+        "mean_abs": 2.2206217985197944e-05,
+        "p99_abs": 0.0,
+        "max_abs": 0.04184722900390625,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "3": {
+        "rows": 40113,
+        "nonfinite": 0,
+        "mean_abs": 1.811490334413272e-05,
+        "p99_abs": 0.0,
+        "max_abs": 0.02447509765625,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "4": {
+        "rows": 46347,
+        "nonfinite": 0,
+        "mean_abs": 0.009773900969955921,
+        "p99_abs": 0.0,
+        "max_abs": 63.84585189819336,
+        "frac_over_0.5": 0.000366798282520983,
+        "frac_over_5": 0.00015103458692040478
+      },
+      "5": {
+        "rows": 40113,
+        "nonfinite": 0,
+        "mean_abs": 2.403337800527462e-05,
+        "p99_abs": 0.0,
+        "max_abs": 0.04648184776306152,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "6": {
+        "rows": 46347,
+        "nonfinite": 0,
+        "mean_abs": 0.0,
+        "p99_abs": 0.0,
+        "max_abs": 0.0,
+        "frac_over_0.5": 0.0,
+        "frac_over_5": 0.0
+      },
+      "7": {
+        "rows": 46347,
+        "nonfinite": 0,
+        "mean_abs": 0.0007367316662157938,
+        "p99_abs": 0.0,
+        "max_abs": 18.39789390563965,
+        "frac_over_0.5": 4.3152739120115646e-05,
+        "frac_over_5": 4.3152739120115646e-05
+      }
+    },
+    "by_width": {
+      "16": {
+        "rows": 69632,
+        "over_0.5": 4
+      },
+      "32": {
+        "rows": 65536,
+        "over_0.5": 3
+      },
+      "48": {
+        "rows": 65522,
+        "over_0.5": 2
+      },
+      "64": {
+        "rows": 64663,
+        "over_0.5": 4
+      },
+      "80": {
+        "rows": 55508,
+        "over_0.5": 20
+      },
+      "96": {
+        "rows": 24385,
+        "over_0.5": 40
+      },
+      "112": {
+        "rows": 594,
+        "over_0.5": 0
+      }
+    }
+  },
+  "update": {
+    "0": {
+      "compiled+graphs+device": [
+        {
+          "approx_kl": 429718948.1025641,
+          "ratio_clamped": 37167.0,
+          "clip_fraction": 1.0,
+          "grad_norm": 1.1002223069840251e+18,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.5348451076409755
+        },
+        {
+          "approx_kl": 429192664.61538464,
+          "ratio_clamped": 35517.0,
+          "clip_fraction": 1.0,
+          "grad_norm": 2.0631382785139233e+18,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.5116440210586939
+        }
+      ],
+      "compiled+device": [
+        {
+          "approx_kl": 429718948.1025641,
+          "ratio_clamped": 37167.0,
+          "clip_fraction": 1.0,
+          "grad_norm": 1.1002223069840251e+18,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.5348451076409755
+        },
+        {
+          "approx_kl": 429192664.61538464,
+          "ratio_clamped": 35517.0,
+          "clip_fraction": 1.0,
+          "grad_norm": 2.0631382785139233e+18,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.5116440210586939
+        }
+      ],
+      "eager host": [
+        {
+          "approx_kl": 5.474130696975267,
+          "ratio_clamped": 11191.0,
+          "clip_fraction": 0.5580428685897436,
+          "grad_norm": 5.137554107568203,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.0137873526949148
+        },
+        {
+          "approx_kl": 8.19373295857356,
+          "ratio_clamped": 16821.0,
+          "clip_fraction": 0.6963141025641025,
+          "grad_norm": 5.714471384500846,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 0.716549615160777
+        }
+      ],
+      "compiled+graphs+device: max weight gap to eager": 0.06631684303283691,
+      "compiled+device: max weight gap to eager": 0.06631684303283691,
+      "eager host: max weight gap to eager": 0.0
+    },
+    "2": {
+      "compiled+graphs+device": [
+        {
+          "approx_kl": 0.0062551773511446435,
+          "ratio_clamped": 0.0,
+          "clip_fraction": 0.06472856570512821,
+          "grad_norm": 1.1465246738531651,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.213767320681841
+        },
+        {
+          "approx_kl": 0.00850228774241912,
+          "ratio_clamped": 0.0,
+          "clip_fraction": 0.07284154647435898,
+          "grad_norm": 0.9525950505183294,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.2116827353453026
+        }
+      ],
+      "compiled+device": [
+        {
+          "approx_kl": 0.0062551773511446435,
+          "ratio_clamped": 0.0,
+          "clip_fraction": 0.06472856570512821,
+          "grad_norm": 1.1465246738531651,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.213767320681841
+        },
+        {
+          "approx_kl": 0.00850228774241912,
+          "ratio_clamped": 0.0,
+          "clip_fraction": 0.07284154647435898,
+          "grad_norm": 0.9525950505183294,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.2116827353453026
+        }
+      ],
+      "eager host": [
+        {
+          "approx_kl": 0.006373166662412517,
+          "ratio_clamped": 0.0,
+          "clip_fraction": 0.06638120993589744,
+          "grad_norm": 1.085556574547902,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.2143751780192058
+        },
+        {
+          "approx_kl": 0.0075624743252634425,
+          "ratio_clamped": 0.0,
+          "clip_fraction": 0.07662259615384616,
+          "grad_norm": 0.8332769410350384,
+          "nonfinite_minibatches": 0.0,
+          "n_minibatches": 156.0,
+          "entropy": 1.2144794431634438
+        }
+      ],
+      "compiled+graphs+device: max weight gap to eager": 0.07567201554775238,
+      "compiled+device: max weight gap to eager": 0.07567201554775238,
+      "eager host: max weight gap to eager": 0.0
+    }
+  }
+}

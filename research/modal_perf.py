@@ -2211,3 +2211,205 @@ def gpu_tests(files: str = "tractor/tests/test_cuda_graphs.py", args: str = "") 
                                 + args.split())
     print(res["output"])
     print("returncode", res["returncode"])
+
+
+# --- why pop8 diverged ------------------------------------------------------
+
+
+def _diag_pop8(checkpoint: str, hands: int, workers: int, out_path: str | None) -> dict:
+    """pop8 went bad at step 36, one agent at a time (approx_kl 0.006 ->
+    1e8, half the rows at the log-ratio clamp). From one of its
+    checkpoints, with its own config, seating and optimiser states:
+
+    1. The rollout. A round collected exactly as the run did (compiled
+       forwards, the pool, overlap), then every stored action's
+       log-probability recomputed by each agent's plain eager network.
+       An update starts with the behaviour policy's own weights, so the
+       two must agree; a mismatch here is the smoking gun. Again with
+       the uncompiled rollout as the control. Per agent, and per history
+       width bucket.
+    2. The update. On the control round, agents 0 (broken) and 2
+       (healthy), each updated twice from identical copies three ways:
+       compiled + CUDA graphs + device rows (the run's), compiled +
+       device rows, and eager on the host. approx_kl, clamped ratios,
+       gradient norms, and how far the weights end up apart.
+    """
+    import copy
+    import json
+    import os
+    import time
+    import traceback
+
+    import numpy as np
+    import torch
+
+    import tractor.nn.model as M
+    from tractor.sim.bury import BuryConfig
+    from tractor.train.buffer import DeviceRows, RolloutBuffer
+    from tractor.train.declare_loop import DeclareTrainConfig
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import (
+        PopulationConfig, agent_model_config, build_agents, build_critic, hand_agents,
+        load_agents, load_critic, seating,
+    )
+    from tractor.train.ppo import PPOConfig, PPOLearner
+    from tractor.train.starts import PrePlayConfig
+
+    dev = torch.device("cuda")
+    out: dict = {"checkpoint": checkpoint, "gpu": torch.cuda.get_device_name(0)}
+
+    def save() -> None:
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2, default=float)
+            volume.commit()
+
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = PopulationConfig(**blob["config"])
+    declare_cfg = DeclareTrainConfig(**{
+        **cfg.declare,
+        "pre": PrePlayConfig(random_burial_frac=0.0, bury=BuryConfig(), burial="policy"),
+    })
+    agents = build_agents(cfg, dev, declare_cfg)
+    critic = build_critic(cfg, dev)
+    load_critic(critic, blob)
+    step = load_agents(agents, blob)
+    saved_opt = [copy.deepcopy(s["optimizer"]) for s in blob["agents"]]
+    del blob
+    mcfg = agent_model_config(cfg)
+    nets = [a.net for a in agents]
+    for net in nets:
+        net.eval()
+    shared = critic.critic
+    table = seating(cfg.seed, step // cfg.reshuffle_every, cfg.agents)
+    seat_of = hand_agents(table, hands)
+    out.update({"step": step, "seating": table.tolist()})
+    print(f"step {step}, seating {table.tolist()}", flush=True)
+
+    def recompute(buf, owner):
+        n = len(buf)
+        res = {}
+        widths = np.array([M.history_bucket(int(x)) for x in buf.history_len[:n]])
+        by_width = {}
+        for a in range(cfg.agents):
+            rows = np.nonzero(owner == a)[0]
+            d = np.empty(len(rows))
+            for lo in range(0, len(rows), 1024):
+                idx = rows[lo: lo + 1024]
+                obs, _p, sc = buf.as_torch(idx, dev)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    lp = nets[a].actor(obs).log_probs.float()
+                act = sc["action"].to(dev).long()[:, None]
+                d[lo: lo + len(idx)] = (lp.gather(1, act).squeeze(1).cpu().numpy()
+                                        - buf.logp[idx])
+            ad = np.abs(d)
+            fin = np.isfinite(d)
+            res[a] = {"rows": int(len(rows)), "nonfinite": int((~fin).sum()),
+                      "mean_abs": float(ad[fin].mean()) if fin.any() else float("nan"),
+                      "p99_abs": float(np.percentile(ad[fin], 99)) if fin.any() else float("nan"),
+                      "max_abs": float(ad[fin].max()) if fin.any() else float("nan"),
+                      "frac_over_0.5": float((ad > 0.5).mean()), "frac_over_5": float((ad > 5).mean())}
+            for w in np.unique(widths[rows]):
+                m = widths[rows] == w
+                bw = by_width.setdefault(int(w), {"rows": 0, "over_0.5": 0})
+                bw["rows"] += int(m.sum())
+                bw["over_0.5"] += int((ad[m] > 0.5).sum())
+            print(f"  agent {a}: rows {len(rows)}  mean|d| {res[a]['mean_abs']:.4f}  "
+                  f"p99 {res[a]['p99_abs']:.3f}  max {res[a]['max_abs']:.2f}  "
+                  f">0.5 {res[a]['frac_over_0.5']:.4f}  >5 {res[a]['frac_over_5']:.4f}  "
+                  f"nonfinite {res[a]['nonfinite']}", flush=True)
+        return res, by_width
+
+    rng = np.random.default_rng(0)
+    buffers = {}
+    for forwards in ("compiled", "static"):
+        print(f"== rollout, forwards={forwards}", flush=True)
+        try:
+            buf = RolloutBuffer(hands * 100, mcfg)
+            with RolloutPool(cfg=mcfg, workers=workers, hands_per_round=hands) as pool:
+                for _rep in range(2):  # the first compiles
+                    t0 = time.perf_counter()
+                    buf, _st = pool.collect(
+                        nets, rng, buf, n_hands=hands, device=dev, pool=4096, amp=True,
+                        level_weight=0.0, agents=seat_of, critic=shared, overlap=True,
+                        forwards=forwards)
+                    print(f"  collected {len(buf)} rows in {time.perf_counter() - t0:.0f}s",
+                          flush=True)
+            n = len(buf)
+            owner = seat_of[buf.episode[:n], buf.seat[:n]]
+            res, by_width = recompute(buf, owner)
+            out[f"rollout_{forwards}"] = {"agents": res, "by_width": by_width}
+            buffers[forwards] = (buf, owner)
+        except Exception:  # noqa: BLE001
+            out[f"rollout_{forwards}"] = {"error": traceback.format_exc()[-3000:]}
+            print(out[f"rollout_{forwards}"]["error"][-1500:], flush=True)
+        save()
+
+    # -- the update ------------------------------------------------------------
+    if "static" in buffers:
+        buf, owner = buffers["static"]
+        compute_gae(buf, gamma=cfg.gamma, lam=cfg.lam)
+        rows_dev = DeviceRows(buf, dev)
+        base = PPOConfig(**cfg.ppo)
+        variants = {
+            "compiled+graphs+device": (replace_cfg(base, compile=True, cuda_graphs=True), True),
+            "compiled+device": (replace_cfg(base, compile=True, cuda_graphs=False), True),
+            "eager host": (replace_cfg(base, compile=False, fixed_shapes=True,
+                                       cuda_graphs=False), False),
+        }
+        for a in (0, 2):
+            rows = np.nonzero(owner == a)[0]
+            finals = {}
+            for name, (pcfg, on_device) in variants.items():
+                try:
+                    net = copy.deepcopy(nets[a]).train()
+                    learner = PPOLearner(net, pcfg, dev)
+                    learner.opt.load_state_dict(saved_opt[a])
+                    got = []
+                    for u in range(2):
+                        torch.manual_seed(100 + u)
+                        m = learner.update(buf, rows=rows,
+                                           device_rows=rows_dev if on_device else None)
+                        got.append({k: m[k] for k in ("approx_kl", "ratio_clamped",
+                                                      "clip_fraction", "grad_norm",
+                                                      "nonfinite_minibatches",
+                                                      "n_minibatches", "entropy")})
+                        print(f"  agent {a} {name:24} update {u}: kl {m['approx_kl']:.4g} "
+                              f"clamped {m['ratio_clamped']:.0f} clip {m['clip_fraction']:.3f} "
+                              f"gn {m['grad_norm']:.3g} nonfinite {m['nonfinite_minibatches']:.0f}",
+                              flush=True)
+                    finals[name] = [p.detach().float() for p in net.parameters()]
+                    out.setdefault("update", {}).setdefault(str(a), {})[name] = got
+                except Exception:  # noqa: BLE001
+                    out.setdefault("update", {}).setdefault(str(a), {})[name] = {
+                        "error": traceback.format_exc()[-3000:]}
+                    print(traceback.format_exc()[-1500:], flush=True)
+            ref = finals.get("eager host")
+            if ref is not None:
+                for name, ps in finals.items():
+                    gap = max(float((p - q).abs().max()) for p, q in zip(ps, ref))
+                    out["update"][str(a)][f"{name}: max weight gap to eager"] = gap
+                    print(f"  agent {a} {name:24} max weight gap to eager {gap:.3g}", flush=True)
+            save()
+    return out
+
+
+def replace_cfg(cfg, **kw):
+    from dataclasses import replace
+
+    return replace(cfg, **kw)
+
+
+@app.function(image=image, gpu="H100", volumes={VOLUME: volume}, timeout=3 * 3600,
+              cpu=20.0, memory=98304)
+def diag_pop8_h100(checkpoint: str, hands: int, workers: int) -> dict:
+    return _diag_pop8(checkpoint, hands, workers, f"{VOLUME}/bench/diag-pop8.json")
+
+
+@app.local_entrypoint()
+def diag_pop8(checkpoint: str = "/vol/pop8/checkpoints/step_0000050.pt", hands: int = 4096,
+              workers: int = 16) -> None:
+    call = diag_pop8_h100.spawn(checkpoint, hands, workers)
+    print(f"spawned {call.object_id}; result -> /vol/bench/diag-pop8.json")
