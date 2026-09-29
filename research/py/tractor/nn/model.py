@@ -418,6 +418,27 @@ class _SelfAttention(nn.Module):
         mask = (cols <= rows).view(1, 1, n_new, end)
         return self.proj(_sdpa(q, keys, vals, self.n_heads, mask))
 
+    def forward_rows(
+        self, x: Tensor, k_store: Tensor, v_store: Tensor, slot: Tensor,
+        write: Tensor, pos: Tensor, width: int,
+    ) -> Tensor:
+        """``forward_cached`` with each row at its own place in its own slot.
+
+        ``x`` [B, N, d] holds row ``b``'s tokens at positions ``pos[b]``;
+        their keys and values go to ``k_store[slot[b], write[b]]`` (padding
+        entries to a scratch position), and each query attends over its
+        slot's keys ``0 .. pos`` -- the causal mask, per row.
+        """
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        rows = slot[:, None].expand_as(write)
+        k_store[rows, write] = k.to(k_store.dtype)
+        v_store[rows, write] = v.to(v_store.dtype)
+        keys = k_store[slot, :width].to(q.dtype)
+        vals = v_store[slot, :width].to(q.dtype)
+        cols = torch.arange(width, device=x.device)
+        mask = (cols[None, None, :] <= pos[:, :, None]).unsqueeze(1)
+        return self.proj(_sdpa(q, keys, vals, self.n_heads, mask))
+
 
 class _CrossAttention(nn.Module):
     """Queries from the decision tokens, keys and values from history.
@@ -537,6 +558,13 @@ class _CausalBlock(nn.Module):
         self, x: Tensor, k_cache: Tensor, v_cache: Tensor, start: int
     ) -> Tensor:
         x = x + self.attn.forward_cached(self.norm1(x), k_cache, v_cache, start)
+        return x + self.ff(self.norm2(x))
+
+    def forward_rows(
+        self, x: Tensor, k_store: Tensor, v_store: Tensor, slot: Tensor,
+        write: Tensor, pos: Tensor, width: int,
+    ) -> Tensor:
+        x = x + self.attn.forward_rows(self.norm1(x), k_store, v_store, slot, write, pos, width)
         return x + self.ff(self.norm2(x))
 
 
@@ -818,6 +846,82 @@ class HistoryEncoder(nn.Module):
         cache.tokens[:, start:end] = tokens
         cache.length = end
         return cache.encoded[:, :end]
+
+
+class HistoryStore:
+    """Encoded history for many (hand, seat) slots, each at its own length.
+
+    The rollout's counterpart of ``HistoryCache``. Within a hand a seat's
+    history only grows, and the encoder is causal, so the encoding of the
+    first ``t`` tokens never changes once they are final: a seat's next
+    decision needs only its new tokens encoded -- about four, one trick,
+    where the whole history is ~44 on average. One slot per (hand, seat):
+    history tokens are seat-relative, so the four seats' differ.
+
+    Final is the catch (``HistoryEncoder.advance``): the trick-won flag of
+    a play is written when its trick closes, so the tokens of the trick
+    open when a slot was last encoded may have changed. A trick has four
+    plays and a seat's own play was not yet in its history, so at most the
+    last three cached tokens can move; ``advance`` re-encodes from there.
+
+    Rows of one call belong to different slots at different lengths, and
+    are encoded together: every row's new tokens padded to the longest
+    run, padding written to a scratch position past the last. Nothing is
+    read back to the host -- each slot's cached length is kept here, on
+    the host, from the lengths the caller passes.
+    """
+
+    def __init__(self, encoder: "HistoryEncoder", slots: int, device: torch.device | str,
+                 dtype: torch.dtype = torch.float32) -> None:
+        cfg = encoder.cfg
+        n, d, layers = cfg.max_history, cfg.d_model, len(encoder.blocks)
+        self.encoder = encoder
+        self.scratch = n
+        # Zeroed once, so a key never written is finite: a masked key's
+        # weight is zero, but zero times NaN is not.
+        self.keys = torch.zeros(layers, slots, n + 1, d, device=device, dtype=dtype)
+        self.values = torch.zeros_like(self.keys)
+        self.encoded = torch.zeros(slots, n + 1, d, device=device, dtype=dtype)
+        self.length = np.zeros(slots, dtype=np.int64)
+
+    def reset(self) -> None:
+        """Every slot empty: new hands."""
+        self.length[:] = 0
+
+    @torch.no_grad()
+    def advance(self, slot: np.ndarray, history: Tensor, length: np.ndarray,
+                provisional: int = 3) -> Tensor:
+        """Encode row ``b``'s ``history[b, :length[b]]`` into ``slot[b]``.
+
+        -> [B, W, d], ``W = history.shape[1]``: what ``HistoryEncoder``
+        would give for positions below each row's length (beyond them,
+        whatever the slot last held; the readers mask them).
+        """
+        enc = self.encoder
+        slot = np.asarray(slot, dtype=np.int64)
+        length = np.asarray(length, dtype=np.int64)
+        width = history.shape[1]
+        if len(length) and int(length.max()) > min(width, self.scratch):
+            raise ValueError("a history longer than the tokens handed in, or than the store")
+        start = np.maximum(np.minimum(self.length[slot], length) - provisional, 0)
+        fresh = length - start
+        run = int(fresh.max()) if len(fresh) else 0
+        dev = history.device
+        slot_t = torch.from_numpy(slot).to(dev)
+        if run > 0:
+            steps = np.arange(run)
+            valid = steps[None, :] < fresh[:, None]
+            pos_np = np.where(valid, start[:, None] + steps[None, :], 0)
+            pos = torch.from_numpy(pos_np).to(dev)
+            write = torch.from_numpy(np.where(valid, pos_np, self.scratch)).to(dev)
+            tokens = history.gather(1, pos[..., None].expand(-1, -1, history.shape[-1]))
+            x = enc.in_proj(tokens) + enc.pos[pos]
+            for i, block in enumerate(enc.blocks):
+                x = block.forward_rows(x, self.keys[i], self.values[i], slot_t, write, pos, width)
+            rows = slot_t[:, None].expand_as(write)
+            self.encoded[rows, write] = enc.norm(x).to(self.encoded.dtype)
+        self.length[slot] = length
+        return self.encoded[slot_t, :width]
 
 
 # --- 2. query block -------------------------------------------------------
@@ -1137,8 +1241,13 @@ class TractorNet(nn.Module):
         self.scorer = CandidateScorer(self.cfg)
         self.heads = AuxHeads(self.cfg)
 
-    def forward(self, obs: ObsBatch) -> ActorOutput:
-        history_enc, history_keep = self.history(obs.history, obs.history_len)
+    def forward(self, obs: ObsBatch, history_enc: Tensor | None = None) -> ActorOutput:
+        """``history_enc``, when given, is this net's encoding of
+        ``obs.history`` (a ``HistoryStore``'s), as wide as it."""
+        if history_enc is None:
+            history_enc, history_keep = self.history(obs.history, obs.history_len)
+        else:
+            history_keep = _length_mask(obs.history_len, history_enc.shape[1])
         summary = self.query(obs, history_enc, history_keep)
         logits, log_probs = self.scorer(summary, obs)
         value, outcome_logits, belief_logits, belief_log_probs = self.heads(
@@ -1383,9 +1492,11 @@ class CardCritic(nn.Module):
         cards: Tensor | None = None,
         trick: Tensor | None = None,
         seat_agents: Tensor | None = None,
+        encoded: bool = False,
     ) -> Tensor:
         """-> [B]. ``history_enc`` is the actor's encoding, or for a shared
-        critic the raw history tokens; ``privileged`` float[B, 5, 54] raw
+        critic the raw history tokens -- or, with ``encoded``, its own
+        encoder's encoding of them already (a ``HistoryStore``'s); ``privileged`` float[B, 5, 54] raw
         counts; ``context`` float[B, CONTEXT_DIM]; ``cards`` float[B, 54,
         >= D_STATIC] whose first ``D_STATIC`` columns are the static block;
         ``trick`` float[B, 4, 54] raw counts, or ``None`` for no trick in
@@ -1397,7 +1508,7 @@ class CardCritic(nn.Module):
             raise ValueError("a shared critic needs the agent in each seat")
         if detach:
             history_enc = history_enc.detach()
-        if self.encoder is not None:
+        if self.encoder is not None and not encoded:
             # Trained with the critic: its output is never detached.
             history_enc, _keep = self.encoder(history_enc, history_len)
         b = privileged.shape[0]
@@ -1473,11 +1584,13 @@ class ActorCritic(nn.Module):
         )
 
     def forward(
-        self, obs: ObsBatch, privileged: Tensor, detach_critic: bool = True
+        self, obs: ObsBatch, privileged: Tensor, detach_critic: bool = True,
+        history_enc: Tensor | None = None,
     ) -> tuple[ActorOutput, Tensor | None]:
         """-> ``(ActorOutput, value)``; ``value`` is ``None`` for an actor
-        whose critic is held elsewhere (``critic_kind="none"``)."""
-        out = self.actor(obs)
+        whose critic is held elsewhere (``critic_kind="none"``).
+        ``history_enc`` as in ``TractorNet.forward``."""
+        out = self.actor(obs, history_enc)
         if self.critic is None:
             return out, None
         value = self.critic(
@@ -1981,6 +2094,7 @@ __all__ = [
     "QueryEncoder",
     "TractorNet",
     "analytic_flops",
+    "HistoryStore",
     "batch_observations",
     "batch_privileged",
     "count_parameters",

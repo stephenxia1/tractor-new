@@ -104,6 +104,9 @@ class TrainConfig:
     # through ``torch.compile``, dynamic shapes; 101.8 -> 62.7 ms a round
     # on an L40S at pool 4096, after about four minutes of compiling).
     rollout_forwards: str = "eager"
+    # Encode each (hand, seat)'s history a trick at a time in the rollout
+    # (``rollout.RolloutCaches``) instead of whole at every decision.
+    history_cache: bool = False
 
     # Reward anneal, described in the module docstring. Both zero:
     # the reward is trick points and the terminal level term is off.
@@ -545,6 +548,7 @@ def train(
                         spans=spans,
                         starts=starts,
                         chunks=cfg.forward_chunks, forwards=cfg.rollout_forwards,
+                        history_cache=cfg.history_cache,
                         overlap=cfg.rollout_overlap,
                     )
                 else:
@@ -562,6 +566,7 @@ def train(
                         spans=spans,
                         starts=starts,
                         chunks=cfg.forward_chunks, forwards=cfg.rollout_forwards,
+                        history_cache=cfg.history_cache,
                     )
 
             with spans.span("gae"):
