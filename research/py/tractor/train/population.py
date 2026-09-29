@@ -447,7 +447,11 @@ def train_population(
     shared = None if critic is None else critic.critic
     start = 0
     phases_done = 0
-    if resume is not None and Path(resume).exists():
+    if resume is not None:
+        if not Path(resume).exists():
+            # Not a fresh start in its place: a mistyped path would train
+            # a new population over the old one's name.
+            raise FileNotFoundError(f"no checkpoint to resume at {resume}")
         blob = torch.load(Path(resume), map_location="cpu", weights_only=False)
         # The critic first: a shared-critic checkpoint's agents have no
         # critics, and loading them into agents that do would fail on
@@ -456,6 +460,9 @@ def train_population(
         start = load_agents(agents, blob)
         phases_done = 0 if cfg.restart_schedule else int(blob.get("phases_done", 0))
         del blob
+        # A stream of its own from the step it resumes at: seeded as the
+        # fresh run was, it would deal the hands the run began with again.
+        rng = np.random.default_rng([cfg.seed, start])
 
     play_pre = PrePlayConfig(
         random_burial_frac=cfg.random_burial_frac, bury=bury_cfg, burial=burial

@@ -1038,8 +1038,10 @@ encoder adds ~3-6 minutes to a launch. Peak GPU memory is unchanged
 (16.1 / 16.7 GiB). At the v5-bury lineage's 4150 play steps: ~102 h on
 the L40S, ~60 h on the H100.
 
-**The history, encoded a trick at a time** (`--history-cache`;
-`model.HistoryStore`, `rollout.RolloutCaches`). Within a hand a seat's
+**The history, encoded a trick at a time -- tried and removed** (the
+user's call on these numbers; built in `d7eea4b`, reverted in `47c7385`,
+where `model.HistoryStore` and `rollout.RolloutCaches` can be restored
+from). Within a hand a seat's
 history only grows and the encoder is causal, so each decision needs
 only the plays since the seat's last -- about four, where the history
 averages ~44 -- plus the open trick's last three cached tokens again,
@@ -1066,7 +1068,7 @@ decision counts:
   actors' forward got slower.
 - Compiling the store's encoding (dynamic shapes, as the rollout's
   forwards are) is what would turn the actors' half into a gain; not
-  done.
+  done. Not worth 20 GB and a code path for ~5% on one card.
 
 ---
 

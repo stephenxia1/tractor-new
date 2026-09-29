@@ -126,6 +126,16 @@ def _train(steps: int, hands: int, name: str, gpu_label: str,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = f"{VOLUME}/{name}/checkpoints"
     os.makedirs(ckpt, exist_ok=True)
+    if resume == "latest":
+        # The newest checkpoint of this run: final.pt after a run that
+        # finished, the last step_*.pt after one the 24-hour limit cut off.
+        import pathlib
+
+        found = sorted(pathlib.Path(ckpt).glob("*.pt"), key=lambda p: p.stat().st_mtime)
+        if not found:
+            raise FileNotFoundError(f"--resume latest: no checkpoint in {ckpt}")
+        resume = str(found[-1])
+        print(f"resuming from {resume}", flush=True)
 
     # `agents` in the overrides means a population (train/population.py).
     Config, fit = (

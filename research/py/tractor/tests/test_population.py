@@ -502,6 +502,12 @@ def test_a_shared_critic_population_trains_saves_and_resumes() -> None:
         # Resuming restores the shared critic too.
         train_population(replace(cfg, total_steps=3, checkpoint_dir=tmp + "/b"),
                          resume=Path(tmp) / "final.pt")
+        # A path that is not there is an error, not a fresh start over the
+        # run's name.
+        with pytest.raises(FileNotFoundError):
+            train_population(replace(cfg, total_steps=3, checkpoint_dir=tmp + "/d"),
+                             resume=Path(tmp) / "no-such.pt")
+        assert not (Path(tmp) / "d" / "final.pt").exists()
         # A run with its own critics refuses a shared-critic checkpoint.
         with pytest.raises(ValueError, match="shared critic"):
             train_population(replace(cfg, total_steps=3, shared_critic=False,
