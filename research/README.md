@@ -815,8 +815,10 @@ candidate, in one L40S container (`modal run modal_perf.py::opt_bench2`;
   from pageable memory -- every such upload a stream sync -- and read
   about fifteen numbers back. With the round on the device and the
   reads gone, the profile shows 20.2 ms of device time in a 20.9 ms
-  minibatch: ~60% matmuls, 12% attention, 10% SwiGLU's elementwise
-  kernels, 7% the fused AdamW. What is left is arithmetic.
+  minibatch: 38% matmuls, 12% attention, 7% the fused AdamW, 12% the
+  largest fused elementwise and norm kernels, and ~31% smaller kernels
+  below the profile's cut. The device is busy the whole time, and most
+  of that time is memory traffic rather than matmul arithmetic.
 - **The padded move slots are free.** 128 slots, a median of 4 filled
   (mean 11), but every round and 89% of minibatches hold a list over
   32, so trimming to a batch's longest saves nothing -- and at 16 slots
