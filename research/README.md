@@ -1038,6 +1038,36 @@ encoder adds ~3-6 minutes to a launch. Peak GPU memory is unchanged
 (16.1 / 16.7 GiB). At the v5-bury lineage's 4150 play steps: ~102 h on
 the L40S, ~60 h on the H100.
 
+**The history, encoded a trick at a time** (`--history-cache`;
+`model.HistoryStore`, `rollout.RolloutCaches`). Within a hand a seat's
+history only grows and the encoder is causal, so each decision needs
+only the plays since the seat's last -- about four, where the history
+averages ~44 -- plus the open trick's last three cached tokens again,
+whose trick-won flag is written when the trick closes (resuming without
+them measurably goes stale; the tests hold both). One store per agent's
+encoder over the (hand, seat) slots it plays, and one for the shared
+critic's; about 20 GB of GPU at 4096 hands. Measured against the same
+flags without it (`pop8v6g-smoke`, `pop8v6g-h100-smoke`), at equal
+decision counts:
+
+| parent, per play step | L40S | L40S, cached | H100 | H100, cached |
+| --- | --- | --- | --- | --- |
+| actors' forward | 10.6 s | 9.9 s | 6.4 s | 7.1 s |
+| critic's forward | 7.9 s | 4.9 s | 2.4 s | 2.0 s |
+| collect | 26.3 s | 22.1 s | 15.8 s | 15.3 s |
+| peak GPU memory | 16 GiB | ~36 GiB | 16 GiB | 36 GiB |
+
+- **About 4 s a step on the L40S** (~80 -> ~76 s), nearly all of it the
+  critic's forward. Its updates were a further ~2 s faster in that run,
+  but the cache does not touch them: that is container variation.
+- **Nothing on the H100.** The store's incremental encoding runs
+  uncompiled -- some sixty small launches per agent per round -- and on
+  the faster card that host time costs what the arithmetic saves; the
+  actors' forward got slower.
+- Compiling the store's encoding (dynamic shapes, as the rollout's
+  forwards are) is what would turn the actors' half into a gain; not
+  done.
+
 ---
 
 ## Next steps
