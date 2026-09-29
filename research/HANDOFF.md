@@ -419,8 +419,11 @@ nothing.
    TRACTOR_EVAL_APP=tractor-eval-pop8b modal run --detach modal_eval.py::population \
      --checkpoint /vol/pop8b/checkpoints/final.pt --out runs/pop8b-final.jsonl
    # a milestone the same way: --checkpoint /vol/pop8b/milestones/step_0001000.pt
-   # (step 150: evals/2026-09-29/pop8b-150-random.jsonl, --pre-play random,
-   # since declaring and burial train only from step 300)
+   # (step 150: evals/2026-09-29/pop8b-150-random.jsonl, --pre-play random
+   # --gpu, since declaring and burial train only from step 300; best agent
+   # -3.8 points over the ladder, worst -18.0, where v5 final is +10.5 on
+   # the same deals. --gpu because 32-core CPU containers sat unscheduled
+   # for 20 minutes on 2026-09-29.)
    # --pre-play random for play alone; pair the best agents against
    # evals/2026-09-24/v5-final-{policy,random}.jsonl with tab_evals.py --paired
    ```

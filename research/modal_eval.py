@@ -179,12 +179,15 @@ def _label(path: str) -> str:
 
 
 def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
-             path: str, pre_play: str, search: dict | None) -> dict | None:
+             path: str, pre_play: str, search: dict | None,
+             gpu: bool = False) -> dict | None:
     """Every (checkpoint, bot) pair, measured or read back. -> the results,
     or None while some pair is still unmeasured."""
     # Search, and the burial climb of --pre-play agent, are batched
-    # forwards that a CPU thread runs at ~100 ms a row.
-    fn = play_gpu if (search or pre_play.startswith("agent")) else play
+    # forwards that a CPU thread runs at ~100 ms a row. `gpu` sends the
+    # rest there too: 32-core CPU containers are sometimes not to be had
+    # (Modal queues them "waiting to be scheduled on a CPU worker").
+    fn = play_gpu if (gpu or search or pre_play.startswith("agent")) else play
     pairs = [(c, b) for c in ckpts for b in names]
 
     # Each pair is appended the moment it lands, and a rerun with the
@@ -308,7 +311,7 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
           seed: int = 20260923, workers: int = 32, out: str = "",
           pre_play: str = "random", search_worlds: int = 0,
           search_top: int = 3, search_extra_tricks: int = 0,
-          search_confident: float = 0.9) -> None:
+          search_confident: float = 0.9, gpu: bool = False) -> None:
     # `--search-worlds 0` is the plain policy, on CPU as before.
     search = None
     if search_worlds > 0:
@@ -318,7 +321,8 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
     ckpts = [c.strip() for c in checkpoints.split(",") if c.strip()]
     names = [b.strip() for b in bots.split(",") if b.strip()]
     path = out or f"eval-smart-{seed}.jsonl"
-    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, search)
+    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, search,
+                       gpu)
     if results is None:
         return
     _report(ckpts, names, results, paired=True)
@@ -328,7 +332,8 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
 @app.local_entrypoint()
 def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
                deals: int = 770, seed: int = 20260923, workers: int = 32,
-               out: str = "", pre_play: str = "agent-policy") -> None:
+               out: str = "", pre_play: str = "agent-policy",
+               gpu: bool = False) -> None:
     """Every agent of a population checkpoint against the whole ladder.
 
         modal run modal_eval.py::population --checkpoint /vol/pop8/checkpoints/final.pt
@@ -344,7 +349,8 @@ def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
     ckpts = [f"{checkpoint}#{k}" for k in range(agents)]
     names = [b.strip() for b in bots.split(",") if b.strip()]
     path = out or f"eval-{_label(checkpoint).replace('/', '-')}-{seed}.jsonl"
-    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, None)
+    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, None,
+                       gpu)
     if results is None:
         return
     ranked = _report(ckpts, names, results, paired=False)

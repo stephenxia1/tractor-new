@@ -1,0 +1,166 @@
+{
+  "checkpoint": "/vol/pop8b/milestones/step_0000150.pt",
+  "deals": 770,
+  "seed": 20260923,
+  "pre_play": "random",
+  "bots": [
+    "smart",
+    "smart-v18",
+    "smart-v28",
+    "smart-v34"
+  ],
+  "ranked": [
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#2",
+      "win": 0.47045454545454546,
+      "win_ci": [
+        0.4579902368927881,
+        0.4829188540163028
+      ],
+      "levels": -0.09496753246753246,
+      "levels_half": 0.019754822144223826,
+      "points": -3.754058441558442,
+      "points_half": 0.7718850474588387,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#4",
+      "win": 0.4597402597402597,
+      "win_ci": [
+        0.4472946750033313,
+        0.47218584447718814
+      ],
+      "levels": -0.11883116883116883,
+      "levels_half": 0.01975428568456245,
+      "points": -4.694805194805195,
+      "points_half": 0.7961361729321254,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#1",
+      "win": 0.4551948051948052,
+      "win_ci": [
+        0.4427589114263445,
+        0.4676306989632659
+      ],
+      "levels": -0.2206168831168831,
+      "levels_half": 0.021540424623230095,
+      "points": -8.794642857142858,
+      "points_half": 0.8595814859340292,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#7",
+      "win": 0.4349025974025974,
+      "win_ci": [
+        0.4225227471569646,
+        0.4472824476482302
+      ],
+      "levels": -0.22954545454545455,
+      "levels_half": 0.021039090416037458,
+      "points": -9.003246753246753,
+      "points_half": 0.8129547503577216,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#3",
+      "win": 0.4290584415584416,
+      "win_ci": [
+        0.4166986317336326,
+        0.4414182513832506
+      ],
+      "levels": -0.22435064935064936,
+      "levels_half": 0.02013712537708564,
+      "points": -9.242694805194805,
+      "points_half": 0.8417497112229443,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#5",
+      "win": 0.42175324675324677,
+      "win_ci": [
+        0.409420961726037,
+        0.43408553178045656
+      ],
+      "levels": -0.2917207792207792,
+      "levels_half": 0.021747498352015716,
+      "points": -11.65340909090909,
+      "points_half": 0.8608973904919279,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#0",
+      "win": 0.3952922077922078,
+      "win_ci": [
+        0.38308293930714143,
+        0.4075014762772742
+      ],
+      "levels": -0.35714285714285715,
+      "levels_half": 0.019558312871742044,
+      "points": -14.560876623376624,
+      "points_half": 0.7582220938197985,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8b/milestones/step_0000150.pt#6",
+      "win": 0.37207792207792206,
+      "win_ci": [
+        0.36000735810456763,
+        0.3841484860512765
+      ],
+      "levels": -0.4409090909090909,
+      "levels_half": 0.020330387540041576,
+      "points": -18.04707792207792,
+      "points_half": 0.8146637579444446,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    }
+  ]
+}
