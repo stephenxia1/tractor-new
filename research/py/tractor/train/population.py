@@ -339,6 +339,7 @@ def build_critic(cfg: PopulationConfig, device: torch.device) -> CriticLearner |
         lr=ppo_cfg.lr, minibatch=ppo_cfg.minibatch, epochs=ppo_cfg.epochs,
         length_buckets=ppo_cfg.length_buckets, max_grad_norm=ppo_cfg.max_grad_norm,
         bf16=ppo_cfg.bf16, compile=ppo_cfg.compile, fixed_shapes=ppo_cfg.fixed_shapes,
+        cuda_graphs=ppo_cfg.cuda_graphs,
     ), device)
 
 
@@ -481,6 +482,9 @@ def train_population(
     last: dict = {}
 
     try:
+        # Kept across steps and refilled in place: a captured update
+        # (``PPOConfig.cuda_graphs``) reads its rows at fixed addresses.
+        device_rows: DeviceRows | None = None
         for step in range(start, cfg.total_steps):
             step_started = time.perf_counter()
             spans = Spans(enabled=True, device=device)
@@ -534,7 +538,11 @@ def train_population(
             on_device = None
             if cfg.device_rows and agents[0].learner.on_device_ok:
                 with spans.span("upload"):
-                    on_device = DeviceRows(buffer, device)
+                    if device_rows is None:
+                        device_rows = DeviceRows(buffer, device)
+                    else:
+                        device_rows.load(buffer)
+                on_device = device_rows
             per_agent: list[dict[str, float]] = []
             with spans.span("update"):
                 for k, agent in enumerate(agents):

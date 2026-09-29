@@ -342,6 +342,22 @@ nothing.
      --length-buckets 4 --checkpoint-every 50 --keep-last 6
    ```
 
+   **Or on an H100** (the user's call -- about 1.65x faster a step for
+   about 1.2x the GPU cost an hour-for-hour; README § *The update as a
+   CUDA graph*; `pop8v6e-h100-smoke`): ~37 s a play step and ~14 s a
+   pre-play step, so a first launch fits about 1900 steps (~22.8 h).
+   `--cuda-graphs` is what makes the H100 pay; 16 workers need the
+   H100 function's 20 CPUs. Resume as above (`[1901/...]`):
+
+   ```bash
+   modal run --detach modal_train.py::launch --gpu h100 --name pop8 --arch v6 \
+     --rollout-workers 16 --rollout-overlap --pool 4096 --compile --cuda-graphs \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 1900 \
+     --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
+     --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
+     --length-buckets 4 --checkpoint-every 50 --keep-last 6
+   ```
+
    **Evaluating it.** Rank the eight cheaply, then measure the best
    properly against v5 final on the same seed:
 

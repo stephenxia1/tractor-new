@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from ..nn.features import PLANE_TRICK
 from ..nn.model import history_bucket, static_shapes
 from ..sim.state import NUM_SEATS
+from .graphs import StepGraphs
 from .ppo import _bf16_supported, _minibatches, explained_variance
 
 __all__ = ["CriticTrainConfig", "CriticLearner"]
@@ -46,6 +47,9 @@ class CriticTrainConfig:
     # Measured on an L40S, 12.8 -> 8.6 ms a 256-row step.
     compile: bool = False
     fixed_shapes: bool = False
+    # As ``PPOConfig.cuda_graphs``: each step on the device rows captured
+    # as a CUDA graph. Measured on an H100, 8.5 -> 3.3 ms a minibatch.
+    cuda_graphs: bool = False
 
 
 class CriticLearner:
@@ -67,6 +71,15 @@ class CriticLearner:
             self.opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=0.0, fused=True)
         except (RuntimeError, ValueError, TypeError):
             self.opt = torch.optim.AdamW(params, lr=self.cfg.lr, weight_decay=0.0)
+        self._graphs = (
+            StepGraphs(self.opt, int(self.cfg.minibatch), self.device)
+            if self.cfg.cuda_graphs and self.device.type == "cuda" else None
+        )
+        # Kept at fixed addresses across updates for a captured step: the
+        # metric sums, and the seat agents of every row of the device rows.
+        self._acc: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._agents: torch.Tensor | None = None
+        self._agents_for: tuple = ()
 
     def _batch(self, buffer: Any, idx: np.ndarray, seat_agents: torch.Tensor):
         dev = self.device
@@ -165,16 +178,55 @@ class CriticLearner:
         """``update`` drawing every minibatch from ``rows`` on the device,
         with nothing read back until the end: a non-finite step is refused
         by the fused optimiser's ``found_inf`` rather than by a read.
-        Measured on an L40S (v6, 4096 hands): 16.3 -> 11.6 ms a minibatch."""
+        Measured on an L40S (v6, 4096 hands): 16.3 -> 11.6 ms a minibatch.
+        ``cfg.cuda_graphs`` captures each step (``train.graphs``)."""
         cfg = self.cfg
         dev = self.device
         n = len(buffer)
         size = int(cfg.minibatch)
         lengths = np.asarray(buffer.history_len)
         t = rows.t
-        sums = torch.zeros(4, device=dev)  # loss x rows, norm x rows, rows, refused
-        zero = torch.zeros((), device=dev)
+        if self._acc is None:
+            # loss x rows, norm x rows, rows, refused
+            self._acc = (torch.zeros(4, device=dev), torch.zeros((), device=dev))
+        sums, zero = self._acc
+        sums.zero_()
+        # The seat agents as a device-rows field: capacity long, refilled.
+        owner = (id(rows), rows.generation)
+        if self._agents_for != owner:
+            self._agents = torch.zeros((rows.capacity, agents.shape[1]),
+                                       dtype=agents.dtype, device=dev)
+            self._agents_for = owner
+        seat_agents = self._agents
+        seat_agents[:n].copy_(agents)
         ragged = 0
+
+        def body(pos: torch.Tensor, width: int, k: int = size) -> None:
+            """One step on rows ``pos``, nothing read back."""
+            inputs = dict(
+                history_enc=t["history"][pos, :width].float(),
+                history_len=t["history_len"][pos],
+                privileged=t["privileged"][pos].float(),
+                context=t["context"][pos].float(),
+                cards=t["cards"][pos].float(),
+                trick=t["planes"][pos, PLANE_TRICK : PLANE_TRICK + NUM_SEATS].float(),
+                seat_agents=seat_agents[pos],
+            )
+            with static_shapes():
+                loss = self._step(inputs, t["ret"][pos].float())
+            loss.backward()
+            norm = torch.nn.utils.clip_grad_norm_(
+                self.critic.parameters(), cfg.max_grad_norm)
+            ok = torch.isfinite(loss) & torch.isfinite(norm)
+            self.opt.found_inf = (~ok).to(torch.float32)
+            self.opt.step()
+            okf = ok.to(torch.float32)
+            sums.add_(torch.stack((
+                torch.where(ok, loss.detach().float() * k, zero),
+                torch.where(ok, norm.detach().float() * k, zero),
+                okf * k, 1.0 - okf,
+            )))
+
         self.critic.train()
         try:
             for _ in range(max(1, int(cfg.epochs))):
@@ -194,30 +246,11 @@ class CriticLearner:
                     pos = flat[lo : lo + k]
                     lo += k
                     width = history_bucket(int(lengths[idx].max()))
-                    inputs = dict(
-                        history_enc=t["history"][pos, :width].float(),
-                        history_len=t["history_len"][pos],
-                        privileged=t["privileged"][pos].float(),
-                        context=t["context"][pos].float(),
-                        cards=t["cards"][pos].float(),
-                        trick=t["planes"][pos, PLANE_TRICK : PLANE_TRICK + NUM_SEATS].float(),
-                        seat_agents=agents[pos],
-                    )
-                    with static_shapes():
-                        loss = self._step(inputs, t["ret"][pos].float())
-                    self.opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    norm = torch.nn.utils.clip_grad_norm_(
-                        self.critic.parameters(), cfg.max_grad_norm)
-                    ok = torch.isfinite(loss) & torch.isfinite(norm)
-                    self.opt.found_inf = (~ok).to(torch.float32)
-                    self.opt.step()
-                    okf = ok.to(torch.float32)
-                    sums += torch.stack((
-                        torch.where(ok, loss.detach().float() * k, zero),
-                        torch.where(ok, norm.detach().float() * k, zero),
-                        okf * k, 1.0 - okf,
-                    ))
+                    if self._graphs is not None and k == self._graphs.size:
+                        self._graphs.step(body, pos, width, rows)
+                    else:
+                        self.opt.zero_grad(set_to_none=True)
+                        body(pos, width, k)
         finally:
             if hasattr(self.opt, "found_inf"):
                 del self.opt.found_inf

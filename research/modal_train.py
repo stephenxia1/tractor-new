@@ -192,6 +192,20 @@ def train_l40s(steps: int, hands: int, name: str, wandb_on: bool,
     return _train(steps, hands, name, "L40S", wandb_on, resume, overrides)
 
 
+@app.function(image=image, gpu="H100", volumes={VOLUME: volume},
+              secrets=WANDB, timeout=86400, cpu=20.0, memory=98304)
+def train_h100(steps: int, hands: int, name: str, wandb_on: bool,
+               resume: str, overrides: dict) -> dict:
+    """An H100 with the CPUs for 16 rollout workers.
+
+    Measured against the L40S (``modal_perf.py::hw_bench``,
+    ``::graph_bench``): the updates here are bound by the host launching
+    kernels, so it pays only with ``--cuda-graphs``; 16 workers are the
+    best of 10/16/24/30 on either card.
+    """
+    return _train(steps, hands, name, "H100", wandb_on, resume, overrides)
+
+
 @app.function(image=image, gpu="A10G", volumes={VOLUME: volume},
               secrets=WANDB, timeout=3600, cpu=8.0, memory=32768)
 def train_smoke() -> dict:
@@ -226,7 +240,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            restart_schedule: bool = False, population: int = 0,
            reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
            forward_chunks: int = 1, rollout_overlap: bool = False,
-           compile: bool = False) -> None:
+           compile: bool = False, cuda_graphs: bool = False) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -283,7 +297,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     from tractor.nn.arch import ARCHES
 
     fn = {"a10g": train_a10g, "a100": train_a100,
-          "l40s": train_l40s}[gpu.lower()]
+          "l40s": train_l40s, "h100": train_h100}[gpu.lower()]
     extra = dict(ARCHES[arch])
     if population:
         if eval_every:
@@ -328,7 +342,10 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
                     # The update through torch.compile on fixed shapes
                     # (PPOConfig.compile): a third off an update, ~4 min
                     # of compiling at the start.
-                    "compile": compile},
+                    "compile": compile,
+                    # Each update step, actors' and critic's, replayed as a
+                    # CUDA graph (PPOConfig.cuda_graphs); with --compile.
+                    "cuda_graphs": cuda_graphs},
             # A hand writes at most 100 rows, and a round that cannot
             # fit every hand silently collects fewer of them.
             "buffer_capacity": buffer_capacity or hands * 100,
@@ -364,7 +381,7 @@ def main(steps: int = 1000, hands: int = 64, name: str = "run",
     import json
 
     fn = {"a10g": train_a10g, "a100": train_a100,
-          "l40s": train_l40s}[gpu.lower()]
+          "l40s": train_l40s, "h100": train_h100}[gpu.lower()]
     overrides = {
         "eval_every": eval_every,
         "eval_deals": eval_deals,

@@ -78,6 +78,7 @@ from ..nn.model import (
     static_shapes,
 )
 from .gae import num_rows
+from .graphs import StepGraphs
 from .rollout import MAX_LEVEL_GAIN
 
 __all__ = [
@@ -243,6 +244,13 @@ class PPOConfig:
     # ``model.history_bucket`` widths, run in ``model.static_shapes``.
     # What ``compile`` needs; on its own it saves ~4% eager.
     fixed_shapes: bool = False
+    # Each training step captured as a CUDA graph, one per history width
+    # (``train.graphs``), on the round kept on the device -- ``update``
+    # with ``device_rows``, which a population passes. Replaying a step
+    # removes the host's launching of its ~1000 kernels: measured on an
+    # H100, v6, 16.4 -> 9.4 ms a minibatch, weights bit-identical. CUDA
+    # only; ignored elsewhere.
+    cuda_graphs: bool = False
 
 
 # --- loss pieces ----------------------------------------------------------
@@ -525,11 +533,19 @@ class PPOLearner:
         # the x-axis for the telemetry rows this learner logs.
         self.steps = 0
         self.updates = 0
+        self._graphs = (
+            StepGraphs(self.opt, int(cfg.minibatch), self.device)
+            if cfg.cuda_graphs and self.device.type == "cuda" else None
+        )
+        # The device path's metric sums, kept across updates: a captured
+        # step adds into them at a fixed address.
+        self._acc: tuple[Tensor, Tensor, Tensor] | None = None
 
     # -- one minibatch -----------------------------------------------------
 
     def losses(
-        self, obs: ObsBatch, privileged: Tensor, batch: dict[str, Tensor]
+        self, obs: ObsBatch, privileged: Tensor, batch: dict[str, Tensor],
+        check: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Total loss and its parts for one minibatch.
 
@@ -577,7 +593,9 @@ class PPOLearner:
         level = batch["reward_level"].to(self.device, torch.float32).reshape(-1)
         done = batch["done"].to(self.device, torch.bool).reshape(-1)
 
-        if cfg.check_actions and not torch.compiler.is_compiling():
+        # ``check`` is False where the caller has checked every row already
+        # (``_update_on_device``): the check reads back to the host.
+        if check and cfg.check_actions and not torch.compiler.is_compiling():
             legal = obs.candidate_mask.gather(1, action)
             if not bool(legal.all()):
                 bad = int((~legal).sum())
@@ -907,13 +925,41 @@ class PPOLearner:
                 )
 
         keys = _LOSS_KEYS + ("grad_norm",)
-        sums = torch.zeros(len(keys), device=dev)
-        # Rows stepped, minibatches stepped, refused, outcome rows,
-        # clamped ratios.
-        counts = torch.zeros(5, device=dev)
-        zero = torch.zeros((), device=dev)
+        if self._acc is None:
+            # Row-weighted sums; then rows stepped, minibatches stepped,
+            # refused, outcome rows, clamped ratios.
+            self._acc = (torch.zeros(len(keys), device=dev),
+                         torch.zeros(5, device=dev), torch.zeros((), device=dev))
+        sums, counts, zero = self._acc
+        sums.zero_()
+        counts.zero_()
         skipped_ragged = 0
         epochs_run = 0
+
+        def body(pos: Tensor, width: int, k: int = size) -> None:
+            """One step on rows ``pos``, nothing read back: what
+            ``StepGraphs`` captures, and run as it is otherwise."""
+            obs, privileged, batch = rows.rows(pos, width)
+            with static_shapes():
+                loss, parts = self._losses(obs, privileged, batch, check=False)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.net.parameters(), cfg.max_grad_norm
+            )
+            ok = torch.isfinite(loss) & torch.isfinite(grad_norm)
+            self.opt.found_inf = (~ok).to(torch.float32)
+            self.opt.step()
+            values = torch.stack(
+                [parts[key].detach().float() for key in _LOSS_KEYS]
+                + [grad_norm.detach().float()]
+            )
+            sums.add_(torch.where(ok, values * k, zero))
+            okf = ok.to(torch.float32)
+            counts.add_(torch.stack((
+                okf * k, okf, 1.0 - okf,
+                torch.where(ok, parts["outcome_rows"].float(), zero),
+                torch.where(ok, parts["ratio_clamped"].float(), zero),
+            )))
 
         self.net.train()
         try:
@@ -936,28 +982,11 @@ class PPOLearner:
                     pos = flat[lo : lo + k]
                     lo += k
                     width = history_bucket(int(lengths[idx].max()))
-                    obs, privileged, batch = rows.rows(pos, width)
-                    with static_shapes():
-                        loss, parts = self._losses(obs, privileged, batch)
-                    self.opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.net.parameters(), cfg.max_grad_norm
-                    )
-                    ok = torch.isfinite(loss) & torch.isfinite(grad_norm)
-                    self.opt.found_inf = (~ok).to(torch.float32)
-                    self.opt.step()
-                    values = torch.stack(
-                        [parts[key].detach().float() for key in _LOSS_KEYS]
-                        + [grad_norm.detach().float()]
-                    )
-                    sums += torch.where(ok, values * k, zero)
-                    okf = ok.to(torch.float32)
-                    counts += torch.stack((
-                        okf * k, okf, 1.0 - okf,
-                        torch.where(ok, parts["outcome_rows"].float(), zero),
-                        torch.where(ok, parts["ratio_clamped"].float(), zero),
-                    ))
+                    if self._graphs is not None and k == self._graphs.size:
+                        self._graphs.step(body, pos, width, rows)
+                    else:
+                        self.opt.zero_grad(set_to_none=True)
+                        body(pos, width, k)
         finally:
             # A later host-path step must not inherit the last verdict.
             if hasattr(self.opt, "found_inf"):

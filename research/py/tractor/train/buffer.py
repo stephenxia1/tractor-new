@@ -207,6 +207,12 @@ class DeviceRows:
     Row ``i`` here is row ``i`` of the buffer. Fields keep their stored
     dtypes and are promoted per minibatch, exactly as ``as_torch``
     promotes them.
+
+    The tensors are the buffer's capacity long and ``load`` refills them
+    in place, so one of these kept across steps keeps its addresses --
+    what a captured training step (``train.graphs``) reads its rows
+    through. ``generation`` moves on only when a larger buffer forces a
+    new allocation.
     """
 
     def __init__(
@@ -215,12 +221,31 @@ class DeviceRows:
         device: torch.device | str,
         fields: tuple[str, ...] | None = None,
     ) -> None:
-        n = len(buffer)
-        self.n = n
         self.device = torch.device(device)
-        names = fields if fields is not None else buffer.fields
-        # A contiguous prefix of each array: no gather, one copy apiece.
-        self.t = {f: torch.from_numpy(buffer.array(f)[:n]).to(self.device) for f in names}
+        self.names = tuple(fields if fields is not None else buffer.fields)
+        self.t: dict[str, Tensor] = {}
+        self.capacity = 0
+        self.generation = 0
+        self.n = 0
+        self.load(buffer)
+
+    def load(self, buffer: "RolloutBuffer") -> "DeviceRows":
+        """Copy in ``buffer``'s filled rows -- a contiguous prefix of each
+        array, so no gather and one copy apiece."""
+        n = len(buffer)
+        if buffer.capacity > self.capacity:
+            self.t = {}
+            for f in self.names:
+                array = buffer.array(f)
+                self.t[f] = torch.empty(
+                    array.shape, dtype=torch.from_numpy(array[:0]).dtype, device=self.device
+                )
+            self.capacity = buffer.capacity
+            self.generation += 1
+        for f, dst in self.t.items():
+            dst[:n].copy_(torch.from_numpy(buffer.array(f)[:n]))
+        self.n = n
+        return self
 
     def rows(
         self, pos: Tensor, width: int | None = None

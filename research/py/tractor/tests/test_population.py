@@ -731,3 +731,26 @@ def test_an_unknown_forwards_mode_is_refused() -> None:
     with pytest.raises(ValueError, match="forwards"):
         collect(_nets(1)[0], np.random.default_rng(0), RolloutBuffer(100, SMALL), n_hands=1,
                 device="cpu", cfg=SMALL, forwards="fast")
+
+
+def test_device_rows_refill_in_place() -> None:
+    """Kept across steps, the rows keep their addresses -- what a captured
+    update reads them through -- until a larger buffer forces new ones."""
+    from ..train.buffer import DeviceRows
+
+    _n, _c, _s, buf = _round()
+    rows = DeviceRows(buf, "cpu")
+    ptr, generation = rows.t["history"].data_ptr(), rows.generation
+    nets, critic = _actors(), _shared()
+    other = RolloutBuffer(400, SMALL)
+    collect(nets, np.random.default_rng(99), other, n_hands=3, device="cpu", cfg=ACTOR_ONLY,
+            pool=3, agents=hand_agents(_table(2), 3), critic=critic)
+    rows.load(other)
+    assert rows.t["history"].data_ptr() == ptr and rows.generation == generation
+    assert rows.n == len(other)
+    idx = np.arange(len(other))
+    obs, _p, sc = rows.rows(torch.from_numpy(idx))
+    want, _wp, want_sc = other.as_torch(idx, "cpu")
+    assert torch.equal(obs.history, want.history) and torch.equal(sc["ret"], want_sc["ret"])
+    rows.load(RolloutBuffer(800, SMALL))
+    assert rows.generation == generation + 1 and rows.capacity == 800

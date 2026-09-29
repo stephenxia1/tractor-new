@@ -885,12 +885,73 @@ SXM and, as the control, an L40S, 32 CPUs each; the code the run uses;
   the device's: the critic's is *slower* on the H100, and the H100
   host's copies were ~15% slower too (the parent's gather 3.8 against
   3.3 s), so the updates are bound by the host launching their kernels
-  -- ~17 ms an actor minibatch, ~8 ms a critic one there. On the L40S the
-  actor update is the device's (20.2 of 20.9 ms) but the critic's, 6.6
-  ms a minibatch for a 1.2M-parameter network, is the host's as well.
-  Removing that host time (capturing a whole training step as a CUDA
-  graph) is what would let a faster GPU pay; the H100 at ~2x the price
-  an hour does not, as things stand.
+  -- ~17 ms an actor minibatch, ~8 ms a critic one there. (On the L40S
+  both updates are the device's: the capture below, which removes the
+  host's time, moved them 2% and 6%.) Removing that host time is what
+  would let the faster GPU pay; the H100 at ~2x the price an hour does
+  not, as things stand.
+
+### The update as a CUDA graph, and a 35 s step on an H100 (2026-09-28)
+
+`train/graphs.py`: each update step -- the minibatch's gather from the
+device rows, the forward and loss, the backward, the clip, the fused
+AdamW's step (made `capturable`) with its on-device refusal of a
+non-finite step, the metric sums -- captured as one CUDA graph per
+history width after two uncaptured steps of that width, and replayed.
+The graphs are dropped when anything they read by address may have
+moved (the device rows, the optimiser state, the learning rate), and a
+learner's graphs share one memory pool, which is safe because nothing
+in it outlives a replay. `--cuda-graphs` (`PPOConfig.cuda_graphs`, and
+the critic's through it); `DeviceRows` now persists across steps,
+refilled in place, so the graphs keep their addresses.
+
+Per minibatch (`modal run modal_perf.py::graph_bench`;
+`evals/2026-09-28/graph-{l40s,h100}.json`):
+
+| | L40S | L40S, captured | H100 | H100, captured |
+| --- | --- | --- | --- | --- |
+| actor | 20.7 ms | 20.3 ms | 16.4 ms | **9.4 ms** |
+| shared critic | 6.45 ms | 6.05 ms | 8.46 ms | **3.27 ms** |
+
+The capture changes nothing it should not (`::graph_lockstep`,
+`graph-lockstep-l40s.json`: three copies stepped together on the same
+minibatches, the weight gap after every step). The actor's captured
+weights equal the uncaptured ones exactly at every one of 352 steps.
+The critic's stay as close to an uncaptured run as a second uncaptured
+run does -- 9.9e-5 against 1.6e-4 after the first replay, 0.070 against
+0.080 after 704 steps -- because its attention backward accumulates in
+a different order each run, captured or not. `tests/test_cuda_graphs.py`
+(GPU only; `modal run modal_perf.py::gpu_tests`) holds the captured
+update to the uncaptured one, eager and compiled, through a refused
+NaN step, an optimiser reload and new device rows.
+
+**The smoke run** (`pop8v6e-h100-smoke`: H100, 20 CPUs, 16 workers,
+`--compile --cuda-graphs`, otherwise the flags of `pop8v6d-smoke`):
+
+| per step | L40S, 10 workers (`pop8v6d`) | H100, 16 workers, captured (`pop8v6e`) |
+| --- | --- | --- |
+| collect | 20.7 s | 13.6–14.1 s |
+| actor updates | 27.6 s | 12.5–13.2 s |
+| shared critic update | 9.3 s | 4.6–4.9 s |
+| **play step** | **~63 s** | **~35–37 s** |
+| pre-play step | ~18 s | ~13–15 s |
+
+The first step compiles and captures (608 s), and the first play step
+after a pre-play block compiles and captures newly seen widths (134 s).
+16.6 GiB of GPU, 27.4 GiB of host memory.
+
+**What a run costs in time.** At the v5-bury lineage's 4150 play steps,
+on pop8's schedule (300 warm-up, then 100 pre-play steps before each
+200 play), from these untrained-agent step times -- hands shorten as
+the agents learn, so these are high:
+
+| | play step | pre-play step | 4150 steps | GPU hours at list price |
+| --- | --- | --- | --- | --- |
+| L40S, 10 workers | ~63.7 s | ~17.5 s | ~83 h | ~83 × $1.95 |
+| H100, 16 workers, captured | ~37 s | ~14 s | ~50 h | ~50 × $3.95 |
+
+About 1.65x faster for about 1.2x the GPU cost, before CPUs and memory
+(the H100 container asks for 20 CPUs to the L40S's 12).
 
 ---
 
