@@ -548,14 +548,17 @@ def test_the_overlapped_rollout_keeps_every_invariant_round_after_round() -> Non
             _check_rows_belong_to_their_seats(nets, buf, seat_of)
 
 
-def test_the_overlapped_rollout_with_the_shared_critic() -> None:
+@pytest.mark.parametrize("forwards", ["eager", "static"])
+def test_the_overlapped_rollout_with_the_shared_critic(forwards: str) -> None:
     nets, critic = _actors(), _shared()
     hands = 8
     seat_of = hand_agents(_table(8), hands)
     buf, stats = collect_parallel(nets, np.random.default_rng(9), None, n_hands=hands,
                                   device="cpu", cfg=ACTOR_ONLY, pool=6, workers=2,
-                                  agents=seat_of, critic=critic, overlap=True)
+                                  agents=seat_of, critic=critic, overlap=True,
+                                  forwards=forwards)
     _check_round(buf, stats, hands)
+    # Every value recomputed by the eager critic: the static path agrees.
     _check_shared_values(critic, buf, seat_of)
 
 
@@ -597,3 +600,134 @@ def test_a_population_trains_on_fixed_shapes() -> None:
         out = train_population(cfg)
         row = out["final"]
         assert np.isfinite(row["ppo/policy_loss"]) and np.isfinite(row["critic/value_loss"])
+
+
+# --- the round on the device -----------------------------------------------------
+
+
+def _round(hands: int = 4):
+    from ..train.gae import compute_gae
+
+    nets, critic = _actors(), _shared()
+    seat_of = hand_agents(_table(9), hands)
+    buf = RolloutBuffer(400, SMALL)
+    collect(nets, np.random.default_rng(3), buf, n_hands=hands, device="cpu", cfg=ACTOR_ONLY,
+            pool=4, agents=seat_of, critic=critic)
+    compute_gae(buf, gamma=1.0, lam=0.95)
+    return nets, critic, seat_of, buf
+
+
+def test_device_rows_are_the_buffers_rows() -> None:
+    from ..train.buffer import DeviceRows
+
+    _n, _c, _s, buf = _round()
+    rows = DeviceRows(buf, "cpu")
+    idx = np.array([5, 0, 17, 3])
+    obs, priv, sc = rows.rows(torch.from_numpy(idx), width=16)
+    want, want_priv, want_sc = buf.as_torch(idx, "cpu")
+    for name in obs._fields:
+        got, exp = getattr(obs, name), getattr(want, name)
+        if name == "history":
+            exp = exp[:, :16]
+        assert got.dtype == exp.dtype and torch.equal(got, exp), name
+    assert torch.equal(priv, want_priv)
+    assert sc.keys() == want_sc.keys()
+    assert all(torch.equal(sc[k], want_sc[k]) for k in sc)
+
+
+def test_the_update_on_the_device_is_the_update_on_the_host() -> None:
+    import copy
+
+    from ..train.buffer import DeviceRows
+    from ..train.ppo import PPOConfig, PPOLearner
+
+    nets, _c, _s, buf = _round()
+    cfg = PPOConfig(minibatch=32, length_buckets=4, epochs=2, fixed_shapes=True, bf16=False)
+    a, b = copy.deepcopy(nets[0]), copy.deepcopy(nets[0])
+    host, dev = PPOLearner(a, cfg, "cpu"), PPOLearner(b, cfg, "cpu")
+    assert dev.on_device_ok
+    torch.manual_seed(11)
+    m_host = host.update(buf, rows=np.arange(0, len(buf), 2))
+    torch.manual_seed(11)
+    m_dev = dev.update(buf, rows=np.arange(0, len(buf), 2), device_rows=DeviceRows(buf, "cpu"))
+    # The same minibatches in the same order, so the same weights.
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=1e-5, atol=1e-6)
+    assert m_host.keys() == m_dev.keys()
+    for key, v in m_host.items():
+        np.testing.assert_allclose(m_dev[key], v, rtol=1e-4, atol=1e-6, err_msg=key)
+    assert host.steps == dev.steps > 0
+    assert not hasattr(dev.opt, "found_inf")
+
+
+def test_a_nonfinite_step_is_refused_on_the_device_as_on_the_host() -> None:
+    from ..train.buffer import DeviceRows
+    from ..train.ppo import PPOConfig, PPOLearner
+
+    nets, _c, _s, buf = _round()
+    buf.ret[: len(buf)] = np.nan  # the actor's own value head then has a NaN loss
+    net = nets[0]
+    learner = PPOLearner(net, PPOConfig(minibatch=32, length_buckets=4, epochs=1,
+                                        fixed_shapes=True, bf16=False), "cpu")
+    before = [p.detach().clone() for p in net.parameters()]
+    m = learner.update(buf, device_rows=DeviceRows(buf, "cpu"))
+    assert m["n_minibatches"] == 0 and m["nonfinite_minibatches"] > 0
+    assert np.isnan(m["policy_loss"])
+    assert all(torch.equal(p, q) for p, q in zip(net.parameters(), before))
+    # Not a step taken and undone: the optimiser never counted one.
+    assert learner.steps == 0
+    assert all(float(st["step"]) == 0.0 for st in learner.opt.state.values())
+
+
+def test_the_critic_fits_the_same_on_the_device() -> None:
+    import copy
+
+    from ..train.buffer import DeviceRows
+    from ..train.critic_learner import CriticLearner, CriticTrainConfig
+
+    _n, critic, seat_of, buf = _round()
+    n = len(buf)
+    seats = relative_seat_agents(seat_of[buf.episode[:n]], buf.seat[:n])
+    a, b = copy.deepcopy(critic), copy.deepcopy(critic)
+    cfg = CriticTrainConfig(minibatch=32, fixed_shapes=True, bf16=False)
+    host, dev = CriticLearner(a, cfg), CriticLearner(b, cfg)
+    assert dev.on_device_ok
+    torch.manual_seed(5)
+    got_host = host.update(buf, seats)
+    torch.manual_seed(5)
+    got_dev = dev.update(buf, seats, device_rows=DeviceRows(buf, "cpu"))
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=1e-5, atol=1e-6)
+    for key, v in got_host.items():
+        np.testing.assert_allclose(got_dev[key], v, rtol=1e-4, atol=1e-6, err_msg=key)
+
+
+@pytest.mark.parametrize("population", [True, False])
+def test_static_forwards_collect_the_same_round(population: bool) -> None:
+    """Histories cut on the host to their width bucket, the model trusting
+    the width (what the compiled rollout runs): the same actions, and the
+    same log-probabilities and values to float rounding."""
+    got = []
+    for forwards in ("eager", "static"):
+        if population:
+            nets, critic = _actors(), _shared()
+            kw = dict(cfg=ACTOR_ONLY, agents=hand_agents(_table(4), 6), critic=critic)
+        else:
+            torch.manual_seed(7)
+            nets, kw = ActorCritic(SMALL).eval(), dict(cfg=SMALL)
+        buf = RolloutBuffer(600, SMALL)
+        collect(nets, np.random.default_rng(21), buf, n_hands=6, device="cpu", pool=6,
+                forwards=forwards, **kw)
+        got.append(buf)
+    eager, static = got
+    n = len(eager)
+    assert n == len(static) and n > 0
+    assert np.array_equal(eager.action[:n], static.action[:n])
+    np.testing.assert_allclose(static.logp[:n], eager.logp[:n], rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(static.value[:n], eager.value[:n], rtol=1e-4, atol=1e-5)
+
+
+def test_an_unknown_forwards_mode_is_refused() -> None:
+    with pytest.raises(ValueError, match="forwards"):
+        collect(_nets(1)[0], np.random.default_rng(0), RolloutBuffer(100, SMALL), n_hands=1,
+                device="cpu", cfg=SMALL, forwards="fast")

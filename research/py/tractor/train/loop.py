@@ -99,6 +99,11 @@ class TrainConfig:
     # Two halves per rollout worker taking turns with the parent's forward
     # (``RolloutPool.collect(overlap=)``). Parallel rollout only.
     rollout_overlap: bool = False
+    # The rollout's forwards (``rollout.routed_step``): "eager", "static"
+    # (host-trimmed widths, ``model.static_shapes``) or "compiled" (those
+    # through ``torch.compile``, dynamic shapes; 101.8 -> 62.7 ms a round
+    # on an L40S at pool 4096, after about four minutes of compiling).
+    rollout_forwards: str = "eager"
 
     # Reward anneal, described in the module docstring. Both zero:
     # the reward is trick points and the terminal level term is off.
@@ -539,7 +544,7 @@ def train(
                         amp=learner.amp,
                         spans=spans,
                         starts=starts,
-                        chunks=cfg.forward_chunks,
+                        chunks=cfg.forward_chunks, forwards=cfg.rollout_forwards,
                         overlap=cfg.rollout_overlap,
                     )
                 else:
@@ -556,7 +561,7 @@ def train(
                         amp=learner.amp,
                         spans=spans,
                         starts=starts,
-                        chunks=cfg.forward_chunks,
+                        chunks=cfg.forward_chunks, forwards=cfg.rollout_forwards,
                     )
 
             with spans.span("gae"):

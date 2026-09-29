@@ -67,7 +67,7 @@ from ..nn.model import (
 from ..sim.bury import BuryConfig
 from ..sim.state import NUM_SEATS
 from ..telemetry import Spans, memory_snapshot
-from .buffer import RolloutBuffer
+from .buffer import DeviceRows, RolloutBuffer
 from .bury_loop import BuryLearner
 from .critic_learner import CriticLearner, CriticTrainConfig
 from .declare_loop import DeclareLearner, DeclareTrainConfig
@@ -105,6 +105,11 @@ class PopulationConfig(TrainConfig):
     # all rows, told which agent sits in each seat, reading raw history.
     # The agents are then actors alone. False gives each agent its own.
     shared_critic: bool = True
+    # With fixed-shape updates (``ppo.compile`` or ``ppo.fixed_shapes``),
+    # copy each round to the device once and let every learner draw its
+    # minibatches there (``buffer.DeviceRows``): about 10 GiB at 4096
+    # hands, which an L40S holds.
+    device_rows: bool = True
 
 
 # Salts that keep the play and pre-play seating streams apart.
@@ -513,6 +518,7 @@ def train_population(
                     temperature=cfg.temperature, level_weight=level_weight,
                     pool=cfg.pool, amp=amp, spans=spans, starts=starts,
                     agents=seat_of, chunks=cfg.forward_chunks, critic=shared,
+                    forwards=cfg.rollout_forwards,
                 )
                 if rollout_pool is not None:
                     buffer, stats = rollout_pool.collect(
@@ -525,17 +531,23 @@ def train_population(
 
             n = len(buffer)
             owner = seat_of[buffer.episode[:n], buffer.seat[:n]]
+            on_device = None
+            if cfg.device_rows and agents[0].learner.on_device_ok:
+                with spans.span("upload"):
+                    on_device = DeviceRows(buffer, device)
             per_agent: list[dict[str, float]] = []
             with spans.span("update"):
                 for k, agent in enumerate(agents):
                     rows = np.nonzero(owner == k)[0]
                     agent.net.train()
-                    per_agent.append(agent.learner.update(buffer, rows=rows))
+                    per_agent.append(agent.learner.update(
+                        buffer, rows=rows, device_rows=on_device))
             critic_stats: dict[str, float] = {}
             if critic is not None:
                 with spans.span("critic_update"):
                     critic_stats = critic.update(buffer, relative_seat_agents(
-                        seat_of[buffer.episode[:n]], buffer.seat[:n]))
+                        seat_of[buffer.episode[:n]], buffer.seat[:n]), device_rows=on_device)
+            del on_device
 
             now = time.perf_counter()
             elapsed = now - started

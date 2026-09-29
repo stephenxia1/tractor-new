@@ -318,20 +318,25 @@ nothing.
    user's calls, 2026-09-28): one critic for all eight agents, the
    rollout overlapped, the update compiled. A step is ~80 s where it was
    ~135 s (README § *A shared critic, and a step that costs 80 s*;
-   `pop8v6c-smoke`).
+   `pop8v6c-smoke`). **Then ~63 s** (same day, README § *Keeping the
+   round on the GPU, and a 63 s step*; `pop8v6d-smoke`): the round kept
+   on the GPU for the updates with no read-backs a minibatch, the
+   rollout's forwards compiled (both under `--compile`), the burial
+   update in bf16; a pre-play step ~18 s where it was ~26 s.
 
    **The proposed run** (the warm-up length and step count are proposals,
    not the user's decisions yet). A Modal function stops at 24 hours. At
-   ~80 s a step, 300 warm-up steps are ~6.7 h and a 200-step block ~4.5 h
-   plus ~45 min of pre-play, so a first launch fits about 900 steps.
-   Resume with `--resume /vol/pop8/checkpoints/final.pt`, the same flags
-   and a larger absolute `--steps` (confirm the first line reads
-   `[901/...]`):
+   ~63 s a step, 300 warm-up steps are ~5.3 h and a 200-step block ~3.5 h
+   plus ~30 min of pre-play, so a first launch fits about 1100 steps
+   (~21.5 h with the compiling; hands shorten as the agents learn, so
+   likely less). Resume with `--resume /vol/pop8/checkpoints/final.pt`,
+   the same flags and a larger absolute `--steps` (confirm the first line
+   reads `[1101/...]`):
 
    ```bash
    modal run --detach modal_train.py::launch --gpu l40s --name pop8 --arch v6 \
      --rollout-workers 10 --rollout-overlap --pool 4096 --compile \
-     --population 8 --reshuffle-every 10 --hands 4096 --steps 900 \
+     --population 8 --reshuffle-every 10 --hands 4096 --steps 1100 \
      --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 \
      --declare-hands 8192 --bury-policy --random-burial-frac 0.2 \
      --length-buckets 4 --checkpoint-every 50 --keep-last 6

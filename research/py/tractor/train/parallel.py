@@ -303,6 +303,7 @@ class RolloutPool:
         chunks: int = 1,
         critic: Any = None,
         overlap: bool = False,
+        forwards: str = "eager",
     ) -> tuple[RolloutBuffer, dict[str, float]]:
         """One round. -> ``(buffer, stats)``, same keys as ``collect``.
 
@@ -352,7 +353,7 @@ class RolloutPool:
 
         started_at = time.perf_counter()
         totals = dict.fromkeys(_STAT_KEYS, 0)
-        forwards = 0
+        n_forwards = 0
         batch_total = 0
         buf = self._shared.buffer
 
@@ -453,7 +454,7 @@ class RolloutPool:
                     slots, chosen_logp, values = routed_step(
                         nets, owner, gather, temperature, greedy, rng, spans,
                         lengths=buf.history_len[rows], chunks=chunks,
-                        critic=critic,
+                        critic=critic, forwards=forwards,
                         seat_agents=(
                             None if critic is None
                             else relative_seat_agents(seating[hand_idx], seats)
@@ -463,7 +464,7 @@ class RolloutPool:
                         buf.action[rows] = slots
                         buf.logp[rows] = chosen_logp
                         buf.value[rows] = values
-                    forwards += 1
+                    n_forwards += 1
                     batch_total += int(rows.size)
                     with _span(spans, "release"):
                         for w in pending:
@@ -506,8 +507,8 @@ class RolloutPool:
             "forced_fraction": totals["forced"] / max(decisions, 1),
             "truncated": totals["truncated"],
             "unenumerated": totals["unenumerated"],
-            "forwards": forwards,
-            "mean_batch": batch_total / max(forwards, 1),
+            "forwards": n_forwards,
+            "mean_batch": batch_total / max(n_forwards, 1),
             "seconds": elapsed,
             "workers": float(workers),
             "rows": float(rows_written),
@@ -565,6 +566,7 @@ def collect_parallel(
     chunks: int = 1,
     critic: Any = None,
     overlap: bool = False,
+    forwards: str = "eager",
 ) -> tuple[RolloutBuffer, dict[str, float]]:
     """One round through a throwaway pool.
 
@@ -583,4 +585,5 @@ def collect_parallel(
             temperature=temperature, greedy=greedy,
             level_weight=level_weight, pool=pool, amp=amp, spans=spans,
             agents=agents, chunks=chunks, critic=critic, overlap=overlap,
+            forwards=forwards,
         )

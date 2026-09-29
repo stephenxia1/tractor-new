@@ -683,7 +683,8 @@ class PPOLearner:
     # -- one update --------------------------------------------------------
 
     def update(
-        self, buffer: PPOBuffer, rows: np.ndarray | None = None
+        self, buffer: PPOBuffer, rows: np.ndarray | None = None,
+        device_rows: Any = None,
     ) -> dict[str, float]:
         """``cfg.epochs`` shuffled passes over the buffer. -> metrics.
 
@@ -698,6 +699,12 @@ class PPOLearner:
         on. Which rows belong together is the caller's business: this
         method shuffles whatever it is given and makes no attempt to
         keep a hand or a seat intact.
+
+        ``device_rows``, the buffer's rows already on the device
+        (``buffer.DeviceRows``), moves the update there: see
+        ``_update_on_device``. It is taken when the shapes are fixed, the
+        optimiser is fused and ``target_kl`` is off, and ignored
+        otherwise.
         """
         cfg = self.cfg
         n = num_rows(buffer)
@@ -722,6 +729,8 @@ class PPOLearner:
         ev = explained_variance(
             np.asarray(buffer.value)[selected], np.asarray(buffer.ret)[selected]
         )
+        if device_rows is not None and self.on_device_ok:
+            return self._update_on_device(buffer, selected, ev, device_rows)
 
         size = max(1, int(cfg.minibatch))
         totals = {key: 0.0 for key in _LOSS_KEYS}
@@ -804,6 +813,20 @@ class PPOLearner:
             if early_stop:
                 break
 
+        metrics = self._finish(
+            totals, rows_seen, ev, n_minibatches, epochs_run, early_stop, m,
+            skipped_ragged, nonfinite, outcome_rows, ratio_clamped,
+        )
+        if self.run is not None:
+            self.run.log({f"ppo/{k}": v for k, v in metrics.items()}, step=self.steps)
+        return metrics
+
+    def _finish(
+        self, totals: dict[str, float], rows_seen: int, ev: float,
+        n_minibatches: int, epochs_run: int, early_stop: bool, m: int,
+        skipped_ragged: int, nonfinite: int, outcome_rows: int, ratio_clamped: int,
+    ) -> dict[str, float]:
+        """The metrics of one update from its row-weighted sums."""
         self.updates += 1
         denominator = float(max(rows_seen, 1))
         metrics = {key: totals[key] / denominator for key in _LOSS_KEYS}
@@ -836,6 +859,121 @@ class PPOLearner:
                 metrics[key] = float("nan")
             metrics["grad_norm"] = float("nan")
 
+        return metrics
+
+    @property
+    def on_device_ok(self) -> bool:
+        """Whether ``update`` can run on ``DeviceRows`` without a read a
+        minibatch: fixed shapes (the model then reads no length back),
+        no ``target_kl`` (which reads the KL to decide), and a fused
+        optimiser, which can skip a step on the device."""
+        fused = bool(self.opt.param_groups[0].get("fused"))
+        return self.fixed and self.cfg.target_kl is None and fused
+
+    def _update_on_device(
+        self, buffer: PPOBuffer, selected: np.ndarray, ev: float, rows: Any
+    ) -> dict[str, float]:
+        """``update`` with every minibatch drawn on the device and nothing
+        read back until the end.
+
+        The host path reads about fifteen numbers a minibatch -- the two
+        finiteness checks, the legal-action check, the losses for the
+        metrics -- and each read waits for the device to drain. Here:
+
+        * the legal-action check runs once, over every selected row;
+        * a non-finite loss or gradient still refuses the step, on the
+          device: the fused optimiser's ``found_inf`` skips it whole --
+          weights, moments and step count untouched -- as the host path
+          does by not calling ``step``;
+        * the metrics are summed on the device, over the minibatches
+          that stepped, and read once.
+
+        Measured on an L40S (v6, one agent's 45k rows, compiled): 30.5 ms
+        a minibatch on the host path, 20.9 ms here, which the kernel
+        profile shows is the device's own time.
+        """
+        cfg = self.cfg
+        dev = self.device
+        size = max(1, int(cfg.minibatch))
+        m = int(selected.size)
+        lengths = np.asarray(buffer.history_len)
+        if cfg.check_actions:
+            sel = torch.from_numpy(selected).to(dev)
+            legal = rows.t["candidate_mask"][sel, rows.t["action"][sel]]
+            if not bool(legal.all()):
+                raise ValueError(
+                    f"{int((~legal).sum())} stored action(s) index an illegal candidate "
+                    "slot; the rollout and the learner disagree about the move list"
+                )
+
+        keys = _LOSS_KEYS + ("grad_norm",)
+        sums = torch.zeros(len(keys), device=dev)
+        # Rows stepped, minibatches stepped, refused, outcome rows,
+        # clamped ratios.
+        counts = torch.zeros(5, device=dev)
+        zero = torch.zeros((), device=dev)
+        skipped_ragged = 0
+        epochs_run = 0
+
+        self.net.train()
+        try:
+            for epoch in range(max(0, int(cfg.epochs))):
+                order = selected[torch.randperm(m).numpy()]
+                batches = []
+                for idx in _minibatches(order, buffer, size, int(cfg.length_buckets)):
+                    if len(idx) != size and m >= size:
+                        skipped_ragged += len(idx)
+                        continue
+                    batches.append(idx)
+                epochs_run = epoch + 1
+                if not batches:
+                    continue
+                # One upload of the epoch's indices; each minibatch is a view.
+                flat = torch.from_numpy(np.concatenate(batches)).to(dev)
+                lo = 0
+                for idx in batches:
+                    k = len(idx)
+                    pos = flat[lo : lo + k]
+                    lo += k
+                    width = history_bucket(int(lengths[idx].max()))
+                    obs, privileged, batch = rows.rows(pos, width)
+                    with static_shapes():
+                        loss, parts = self._losses(obs, privileged, batch)
+                    self.opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.net.parameters(), cfg.max_grad_norm
+                    )
+                    ok = torch.isfinite(loss) & torch.isfinite(grad_norm)
+                    self.opt.found_inf = (~ok).to(torch.float32)
+                    self.opt.step()
+                    values = torch.stack(
+                        [parts[key].detach().float() for key in _LOSS_KEYS]
+                        + [grad_norm.detach().float()]
+                    )
+                    sums += torch.where(ok, values * k, zero)
+                    okf = ok.to(torch.float32)
+                    counts += torch.stack((
+                        okf * k, okf, 1.0 - okf,
+                        torch.where(ok, parts["outcome_rows"].float(), zero),
+                        torch.where(ok, parts["ratio_clamped"].float(), zero),
+                    ))
+        finally:
+            # A later host-path step must not inherit the last verdict.
+            if hasattr(self.opt, "found_inf"):
+                del self.opt.found_inf
+
+        got = torch.cat((sums, counts)).tolist()
+        totals = dict(zip(keys, got[: len(keys)]))
+        rows_seen, n_steps, refused, outcome_rows, ratio_clamped = (
+            int(round(x)) for x in got[len(keys):]
+        )
+        self.steps += n_steps
+        metrics = self._finish(
+            totals, rows_seen, ev, n_steps, epochs_run, False, m,
+            skipped_ragged, refused, outcome_rows, ratio_clamped,
+        )
         if self.run is not None:
             self.run.log({f"ppo/{k}": v for k, v in metrics.items()}, step=self.steps)
         return metrics
+

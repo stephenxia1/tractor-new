@@ -58,6 +58,7 @@ from ..rules.cards import NUM_TYPES
 __all__ = [
     "OBS_FIELDS",
     "SCALAR_FIELDS",
+    "DeviceRows",
     "RolloutBuffer",
     "obs_batch_from_arrays",
 ]
@@ -190,6 +191,54 @@ def obs_batch_from_arrays(
             for name, tensor in zip(ObsBatch._fields, batch)
         )
     )
+
+
+class DeviceRows:
+    """A buffer's filled rows, copied to the device once.
+
+    A learner that takes its minibatches from here indexes on the device
+    instead of gathering each one on the host and uploading it -- an
+    upload from pageable memory is a stream sync, so the GPU waited on
+    every gather. Measured on an L40S (v6, 4096 hands): the whole round,
+    ~10 GiB, uploads in about a second, and with the per-minibatch reads
+    gone too an actor's minibatch fell from 30.5 to 20.9 ms and the
+    shared critic's from 16.3 to 11.6 ms.
+
+    Row ``i`` here is row ``i`` of the buffer. Fields keep their stored
+    dtypes and are promoted per minibatch, exactly as ``as_torch``
+    promotes them.
+    """
+
+    def __init__(
+        self,
+        buffer: "RolloutBuffer",
+        device: torch.device | str,
+        fields: tuple[str, ...] | None = None,
+    ) -> None:
+        n = len(buffer)
+        self.n = n
+        self.device = torch.device(device)
+        names = fields if fields is not None else buffer.fields
+        # A contiguous prefix of each array: no gather, one copy apiece.
+        self.t = {f: torch.from_numpy(buffer.array(f)[:n]).to(self.device) for f in names}
+
+    def rows(
+        self, pos: Tensor, width: int | None = None
+    ) -> tuple[ObsBatch, Tensor, dict[str, Tensor]]:
+        """``as_torch`` for the rows ``pos`` (int64, on the device), with the
+        history cut to its first ``width`` tokens when one is given."""
+        t = self.t
+        history = t["history"][pos] if width is None else t["history"][pos, :width]
+        obs = ObsBatch(
+            *(
+                history.float() if name == "history"
+                else t[name][pos] if name in _OBS_NON_FLOAT
+                else t[name][pos].float()
+                for name in ObsBatch._fields
+            )
+        )
+        scalars = {name: t[name][pos] for name in SCALAR_FIELDS}
+        return obs, t["privileged"][pos].float(), scalars
 
 
 class RolloutBuffer:

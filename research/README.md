@@ -789,6 +789,80 @@ Compiling costs ~5–6 minutes spread over the first steps of a launch
 (and once more when a history width first appears). The pre-play step
 is still ~26 s, most of it the burial network's PPO update, uncompiled.
 
+### Keeping the round on the GPU, and a 63 s step (2026-09-28)
+
+A second round of measurements, each the code the run used against a
+candidate, in one L40S container (`modal run modal_perf.py::opt_bench2`;
+`evals/2026-09-28/opt2-v6.json`; v6, eight agents, 4096 hands):
+
+| | today | candidate |
+| --- | --- | --- |
+| collection, 10 → 20 rollout workers | 30.8 s | 30.8 s: the parent is the bound, busy 28.2 s of it |
+| the parent's round, ~1140 rows | 101.8 ms | 100.1 ms, one gather and one read-back a round |
+| | | 164.6 ms, the eight agents stacked into one `vmap` forward |
+| | | **62.7 ms, compiled with dynamic shapes** |
+| actor update, a 256-row minibatch | 30.5 ms | 27.4 ms, the rows already on the device |
+| | | **20.9 ms, and nothing read back a minibatch** |
+| | | 447 ms, gathered on a thread into pinned memory |
+| shared critic update, a minibatch | 16.3 ms | **11.6 ms, rows on the device, nothing read back** |
+| burial update, one agent's rows | 1.79 s | **0.92 s in bf16**; 0.64 s bf16 and compiled |
+| declaration update, one agent's rows | 0.33 s | 0.23 s compiled -- 2.6 s a step in all, left alone |
+
+- **The rollout's forward was the parent's cost**, not its gathers or
+  its syncs: batching those saved 2%. Compiling the forwards saved 37%.
+  Under `vmap` the attention kernel falls back and the stack is slower.
+- **The update was waiting on the host.** Each minibatch was gathered
+  from pageable memory -- every such upload a stream sync -- and read
+  about fifteen numbers back. With the round on the device and the
+  reads gone, the profile shows 20.2 ms of device time in a 20.9 ms
+  minibatch: ~60% matmuls, 12% attention, 10% SwiGLU's elementwise
+  kernels, 7% the fused AdamW. What is left is arithmetic.
+- **The padded move slots are free.** 128 slots, a median of 4 filled
+  (mean 11), but every round and 89% of minibatches hold a list over
+  32, so trimming to a batch's longest saves nothing -- and at 16 slots
+  an eager minibatch costs what it does at 128 (35.2 against 35.4 ms).
+
+**What went in:**
+
+- `buffer.DeviceRows`: the round copied to the device once a step
+  (~10 GiB at 4096 hands, 1.2 s), every learner's minibatches indexed
+  there. `PPOLearner` and `CriticLearner` then run `_update_on_device`:
+  the legal-action check once per update; a non-finite loss or gradient
+  refused on the device by the fused AdamW's `found_inf` -- weights,
+  moments and step count untouched, as the host path's not stepping;
+  the metrics summed on the device and read once. Taken with fixed
+  shapes (`--compile`), a fused optimiser and no `target_kl`
+  (`PopulationConfig.device_rows`, on by default). The tests hold it to
+  the host path's weights and metrics, and to refusing a NaN step.
+- `rollout.routed_step(forwards=)`: `"static"` cuts each forward's
+  history on the host to its width bucket; `"compiled"` runs those
+  through `torch.compile(dynamic=True)`, one graph for every batch size,
+  width and agent. `--compile` turns it on (`TrainConfig.rollout_forwards`).
+  Tested: the static path collects the same actions, log-probabilities
+  and values as eager, serially and through the pool.
+- `BuryTrainConfig.bf16`, on by default and on CUDA only: the burial
+  update's forward under bf16 autocast, as the play network's and the
+  critic's already were. Its picks are still sampled in float32.
+
+**The smoke run** (`pop8v6d-smoke`, the flags of `pop8v6c-smoke`):
+
+| per step | `pop8v6c` | `pop8v6d` |
+| --- | --- | --- |
+| collect | 24.2 s | 20.7 s (the parent's forward 9.3 s) |
+| actor updates | 37.4 s | 27.6 s |
+| shared critic update | 13.8 s | 9.3 s |
+| the round's upload | -- | 1.2 s |
+| **step** | **~80 s** | **~63 s** |
+| pre-play step | ~26 s | ~18 s |
+
+The first step compiles (493 s), the second is still compiling the
+rollout (105 s), and the first play step after a pre-play block compiled
+newly seen widths (update 57.8 s, critic 24.7 s). The GPU peaked at
+15.5 GB. What remains is the parent's own work -- busy 18.5 s of the
+20.7 s collection: the compiled forward 9.3 s, the critic 4.2 s, the
+gather 3.5 s -- and arithmetic in the updates, which only changing what
+is computed (model size, minibatches a step) would move.
+
 ---
 
 ## Next steps

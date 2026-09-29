@@ -300,6 +300,9 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     # Two halves per rollout worker taking turns with the forward; pair it
     # with a doubled --pool so each forward stays as wide.
     extra["rollout_overlap"] = rollout_overlap
+    # --compile compiles the rollout's forwards too (dynamic shapes): a
+    # round 101.8 -> 62.7 ms on an L40S, ~4 min of compiling up front.
+    extra["rollout_forwards"] = "compiled" if compile else "eager"
     call = fn.spawn(
         steps,
         hands,

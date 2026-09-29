@@ -40,6 +40,12 @@ class BuryTrainConfig:
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+    # The forward under bfloat16 autocast on CUDA, as the play network's
+    # and the shared critic's learners run; the losses stay float32.
+    # Measured on an L40S (v6, one agent's 7920 rows, 4 epochs): 1.79 s
+    # in float32, 0.92 s here -- about 7 s of a population's pre-play
+    # step. Off on the CPU, where bfloat16 matmuls are emulated.
+    bf16: bool = True
 
 
 class BuryLearner:
@@ -50,6 +56,7 @@ class BuryLearner:
         self.cfg = cfg or BuryTrainConfig()
         self.device = torch.device(device)
         self.opt = torch.optim.AdamW(net.parameters(), lr=self.cfg.lr)
+        self.amp = bool(self.cfg.bf16) and self.device.type == "cuda"
 
     def update(self, rows: BuryRows, returns: np.ndarray) -> dict[str, float]:
         """One PPO update. ``returns[i]`` is row ``i``'s return."""
@@ -73,7 +80,11 @@ class BuryLearner:
             order = torch.randperm(n, device=dev)
             for lo in range(0, n, cfg.minibatch):
                 idx = order[lo : lo + cfg.minibatch]
-                _logits, logp_all, v = self.net(cards[idx], ctx[idx], mask[idx], priv[idx])
+                with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                    enabled=self.amp):
+                    _logits, logp_all, v = self.net(cards[idx], ctx[idx], mask[idx], priv[idx])
+                logp_all = logp_all.float()
+                v = v.float()
                 logp = logp_all.gather(1, action[idx, None]).squeeze(1)
                 ratio = torch.exp(logp - old_logp[idx])
                 a = adv[idx]

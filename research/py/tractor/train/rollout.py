@@ -97,8 +97,10 @@ from ..nn.model import (
     MASK_LOGIT,
     ModelConfig,
     ObsBatch,
+    history_bucket,
     privileged_view,
     relative_seat_agents,
+    static_shapes,
 )
 from ..rules.cards import NUM_TYPES
 from ..sim.actions import MoveSet
@@ -244,6 +246,43 @@ def _evaluate(net: Any, obs: Any, privileged: torch.Tensor) -> tuple[Any, Any]:
     return out, out.value
 
 
+def _actor_forward(net: Any, obs: Any, privileged: torch.Tensor) -> tuple[Any, Any]:
+    """``(logits, value)``: ``_evaluate``, keeping only what the sampler reads."""
+    out, values = _evaluate(net, obs, privileged)
+    return out.logits, values
+
+
+def _critic_forward(critic: Any, obs: Any, privileged: torch.Tensor,
+                    seat_agents: torch.Tensor) -> torch.Tensor:
+    """A population's shared critic on a batch of rows."""
+    return critic(
+        obs.history, obs.history_len, privileged, context=obs.context,
+        cards=obs.cards, trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_SEATS],
+        seat_agents=seat_agents,
+    )
+
+
+FORWARDS = ("eager", "static", "compiled")
+_COMPILED: dict[str, Any] = {}
+
+
+def _forwards(mode: str) -> tuple[Any, Any]:
+    """The actor and critic forwards for ``routed_step``'s ``forwards``."""
+    if mode not in FORWARDS:
+        raise ValueError(f"forwards must be one of {FORWARDS}, not {mode!r}")
+    if mode != "compiled":
+        return _actor_forward, _critic_forward
+    if not _COMPILED:
+        import torch._dynamo as dynamo
+
+        dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)
+        # Dynamic shapes: every batch size and width in one graph, and
+        # every agent through it (their weights are graph inputs).
+        _COMPILED["actor"] = torch.compile(_actor_forward, dynamic=True)
+        _COMPILED["critic"] = torch.compile(_critic_forward, dynamic=True)
+    return _COMPILED["actor"], _COMPILED["critic"]
+
+
 def _choose(
     logits: torch.Tensor,
     mask: torch.Tensor,
@@ -326,6 +365,7 @@ def routed_step(
     chunks: int = 1,
     critic: Any = None,
     seat_agents: np.ndarray | None = None,
+    forwards: str = "eager",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each row through its owner's network. -> ``(slots, logp, value)``.
 
@@ -346,7 +386,17 @@ def routed_step(
     forward after the actors have acted, reading ``seat_agents[i]``, the
     agent in each seat relative to row ``i``'s. The networks in ``nets``
     are then actors alone.
+
+    ``forwards`` is ``"eager"``, as ever; ``"static"``, each forward's
+    history cut on the host to its width bucket (``model.history_bucket``)
+    and run in ``model.static_shapes``, so the model reads no length
+    back; or ``"compiled"``, those forwards through ``torch.compile`` with
+    dynamic shapes. Measured on an L40S (v6, pool 4096, the shared
+    critic): a 1140-row round 101.8 ms eager, 62.7 ms compiled, after
+    about four minutes of compiling the first rounds of a run.
     """
+    actor_fn, critic_fn = _forwards(forwards)
+    static = forwards != "eager"
     n = len(owner)
     slots = np.empty(n, dtype=np.int64)
     logp = np.empty(n, dtype=np.float32)
@@ -363,10 +413,17 @@ def routed_step(
             with _span(spans, "gather"):
                 obs, privileged = gather(part)
             with _span(spans, "forward"):
-                out, values = _evaluate(nets[int(agent)], obs, privileged)
+                net = nets[int(agent)]
+                if static:
+                    width = history_bucket(_longest(lengths, part, obs))
+                    cut = obs._replace(history=obs.history[:, :width].contiguous())
+                    with static_shapes():
+                        logits, values = actor_fn(net, cut, privileged)
+                else:
+                    logits, values = actor_fn(net, obs, privileged)
             with _span(spans, "sample"):
                 slots[part], logp[part] = _choose(
-                    out.logits, obs.candidate_mask, temperature, greedy, rng
+                    logits, obs.candidate_mask, temperature, greedy, rng
                 )
                 if values is not None:
                     value[part] = values.detach().float().cpu().numpy()
@@ -381,13 +438,24 @@ def routed_step(
         obs = ObsBatch(*(torch.cat(fields) for fields in zip(*(o for _i, o, _p in kept))))
         privileged = torch.cat([p for _i, _o, p in kept])
         with _span(spans, "critic"):
-            v = critic(
-                obs.history, obs.history_len, privileged, context=obs.context,
-                cards=obs.cards, trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_SEATS],
-                seat_agents=torch.from_numpy(seat_agents[order]).to(obs.history.device),
-            )
+            seats = torch.from_numpy(seat_agents[order]).to(obs.history.device)
+            if static:
+                width = history_bucket(_longest(lengths, order, obs))
+                obs = obs._replace(history=obs.history[:, :width].contiguous())
+                with static_shapes():
+                    v = critic_fn(critic, obs, privileged, seats)
+            else:
+                v = critic_fn(critic, obs, privileged, seats)
             value[order] = v.detach().float().cpu().numpy()
     return slots, logp, value
+
+
+def _longest(lengths: np.ndarray | None, rows: np.ndarray, obs: Any) -> int:
+    """The longest history among ``rows``, from the host's copy when the
+    caller passed one (reading the device's would be a sync)."""
+    if lengths is not None:
+        return int(np.asarray(lengths)[rows].max())
+    return int(obs.history_len.max())
 
 
 def _combine(buffer: RolloutBuffer, row: int, level_weight: np.float32) -> None:
@@ -492,6 +560,7 @@ def collect(
     agents: Any = None,
     chunks: int = 1,
     critic: Any = None,
+    forwards: str = "eager",
 ) -> dict[str, float]:
     """Play ``n_hands`` self-play hands into ``buffer``.
 
@@ -576,7 +645,7 @@ def collect(
     forced = 0
     truncated = 0
     unenumerated = 0
-    forwards = 0
+    n_forwards = 0
     batch_total = 0
 
     was_training = [getattr(n, "training", False) for n in nets]
@@ -635,7 +704,7 @@ def collect(
                 slots, chosen_logp, value_np = routed_step(
                     nets, owner, gather, temperature, greedy, rng, spans,
                     lengths=np.array([d.history_len for d in packed]), chunks=chunks,
-                    critic=critic,
+                    critic=critic, forwards=forwards,
                     seat_agents=(
                         None if critic is None
                         else relative_seat_agents(seating[hand_idx], seats)
@@ -684,7 +753,7 @@ def collect(
                             hands_done += 1
                             finished.append(i)
 
-                forwards += 1
+                n_forwards += 1
                 batch_total += len(packed)
                 for i in reversed(finished):
                     active.pop(i)
@@ -701,7 +770,7 @@ def collect(
         "forced_fraction": forced / max(decisions, 1),
         "truncated": truncated,
         "unenumerated": unenumerated,
-        "forwards": forwards,
-        "mean_batch": batch_total / max(forwards, 1),
+        "forwards": n_forwards,
+        "mean_batch": batch_total / max(n_forwards, 1),
         "seconds": elapsed,
     }
