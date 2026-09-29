@@ -2413,3 +2413,122 @@ def diag_pop8(checkpoint: str = "/vol/pop8/checkpoints/step_0000050.pt", hands: 
               workers: int = 16) -> None:
     call = diag_pop8_h100.spawn(checkpoint, hands, workers)
     print(f"spawned {call.object_id}; result -> /vol/bench/diag-pop8.json")
+
+
+# --- the logits' size, checkpoint by checkpoint -----------------------------
+
+
+def _logit_scan(run: str, steps: list, hands: int, out_path: str | None) -> dict:
+    """Does the logits' size grow toward the divergence, and bf16 with it?
+
+    Softmax ignores a constant added to a row's logits, so nothing holds
+    their level down; bf16 rounds a logit to ~0.4% of its size. For each
+    checkpoint of ``run`` and each agent, on one fixed set of positions:
+    the legal logits' absolute size, their spread, and how far the log-
+    probabilities of the rollout's two paths -- bf16 eager and bf16
+    compiled -- sit from float32's.
+    """
+    import json
+    import os
+
+    import numpy as np
+    import torch
+
+    import tractor.nn.model as M
+    from tractor.train.buffer import RolloutBuffer
+    from tractor.train.population import PopulationConfig, agent_model_config, hand_agents, seating
+    from tractor.train.rollout import collect
+
+    dev = torch.device("cuda")
+    out: dict = {"run": run, "rows": {}}
+    first = torch.load(f"{VOLUME}/{run}/checkpoints/step_{steps[0]:07d}.pt", map_location="cpu",
+                       weights_only=False)
+    cfg = PopulationConfig(**first["config"])
+    mcfg = agent_model_config(cfg)
+
+    def nets_of(blob):
+        nets = []
+        for saved in blob["agents"]:
+            net = M.ActorCritic(mcfg)
+            M.load_model(net, saved["model"])
+            nets.append(net.to(dev).eval())
+        return nets
+
+    # One fixed set of positions, played by the first checkpoint's agents.
+    nets = nets_of(first)
+    buf = RolloutBuffer(hands * 100, mcfg)
+    collect(nets, np.random.default_rng(5), buf, n_hands=hands, device=dev, cfg=mcfg, pool=hands,
+            amp=True, agents=hand_agents(seating(cfg.seed, 0, cfg.agents), hands),
+            critic=None if not cfg.shared_critic else _scan_critic(first, cfg, dev))
+    n = len(buf)
+    idx = np.arange(0, n, max(1, n // 6000))[:6000]
+    obs, _p, _s = buf.as_torch(idx, dev)
+    legal = obs.candidate_mask
+    compiled = torch.compile(lambda net, o: net.actor(o).logits, dynamic=True)
+    out["positions"] = int(len(idx))
+
+    for step in steps:
+        blob = first if step == steps[0] else torch.load(
+            f"{VOLUME}/{run}/checkpoints/step_{step:07d}.pt", map_location="cpu", weights_only=False)
+        nets = nets_of(blob)
+        rows = []
+        for a, net in enumerate(nets):
+            with torch.no_grad():
+                z32 = net.actor(obs).logits.float()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    z16 = net.actor(obs).logits.float()
+                    with M.static_shapes():
+                        zc = compiled(net, obs).float()
+            lp32 = torch.log_softmax(z32, -1)
+            likely = legal & (lp32.exp() > 1e-3)
+
+            def err(z):
+                return (torch.log_softmax(z, -1) - lp32).abs()[likely]
+
+            legal32 = z32[legal]
+            spread = (z32.masked_fill(~legal, -1e30).amax(1)
+                      - z32.masked_fill(~legal, 1e30).amin(1))
+            e16, ec = err(z16), err(zc)
+            row = {
+                "agent": a,
+                "mean_abs_logit": float(legal32.abs().mean()),
+                "max_abs_logit": float(legal32.abs().max()),
+                "mean_spread": float(spread[legal.sum(1) > 1].mean()),
+                "bf16_err_p99": float(torch.quantile(e16.float(), 0.99)),
+                "bf16_err_max": float(e16.max()),
+                "compiled_err_p99": float(torch.quantile(ec.float(), 0.99)),
+                "compiled_err_max": float(ec.max()),
+            }
+            rows.append(row)
+            print(f"  step {step:3d} agent {a}: |logit| mean {row['mean_abs_logit']:8.2f} "
+                  f"max {row['max_abs_logit']:9.1f}  spread {row['mean_spread']:7.2f}  "
+                  f"bf16 err p99 {row['bf16_err_p99']:.4f} max {row['bf16_err_max']:.3f}  "
+                  f"compiled err p99 {row['compiled_err_p99']:.4f} max {row['compiled_err_max']:.3f}",
+                  flush=True)
+        out["rows"][str(step)] = rows
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2)
+            volume.commit()
+    return out
+
+
+def _scan_critic(blob, cfg, dev):
+    from tractor.train.population import build_critic, load_critic
+
+    learner = build_critic(cfg, dev)
+    load_critic(learner, blob)
+    return learner.critic.eval()
+
+
+@app.function(image=image, gpu="H100", volumes={VOLUME: volume}, timeout=2 * 3600,
+              cpu=8.0, memory=65536)
+def logit_scan_h100(run: str, steps: list, hands: int) -> dict:
+    return _logit_scan(run, steps, hands, f"{VOLUME}/bench/logit-scan-{run}.json")
+
+
+@app.local_entrypoint()
+def logit_scan(run: str = "diag-r1", steps: str = "10,20,30,40,50", hands: int = 256) -> None:
+    call = logit_scan_h100.spawn(run, [int(s) for s in steps.split(",")], hands)
+    print(f"spawned {call.object_id}; result -> /vol/bench/logit-scan-{run}.json")

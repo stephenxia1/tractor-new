@@ -250,7 +250,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            restart_schedule: bool = False, population: int = 0,
            reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
            forward_chunks: int = 1, rollout_overlap: bool = False,
-           compile: bool = False, cuda_graphs: bool = False) -> None:
+           compile: bool = False, cuda_graphs: bool = False,
+           rollout_forwards: str = "", fixed_shapes: bool = False) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -326,7 +327,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     extra["rollout_overlap"] = rollout_overlap
     # --compile compiles the rollout's forwards too (dynamic shapes): a
     # round 101.8 -> 62.7 ms on an L40S, ~4 min of compiling up front.
-    extra["rollout_forwards"] = "compiled" if compile else "eager"
+    extra["rollout_forwards"] = rollout_forwards or ("compiled" if compile else "eager")
     call = fn.spawn(
         steps,
         hands,
@@ -355,7 +356,10 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
                     "compile": compile,
                     # Each update step, actors' and critic's, replayed as a
                     # CUDA graph (PPOConfig.cuda_graphs); with --compile.
-                    "cuda_graphs": cuda_graphs},
+                    "cuda_graphs": cuda_graphs,
+                    # Fixed minibatch shapes and the device-rows path
+                    # without torch.compile (implied by --compile).
+                    "fixed_shapes": fixed_shapes},
             # A hand writes at most 100 rows, and a round that cannot
             # fit every hand silently collects fewer of them.
             "buffer_capacity": buffer_capacity or hands * 100,
