@@ -50,6 +50,7 @@ that survives a training run disguised as a hyperparameter.
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue
 import time
 from typing import Any
 
@@ -81,10 +82,30 @@ __all__ = ["RolloutPool", "collect_parallel", "DEFAULT_WORKERS"]
 # One core is the parent's, running the network and the sampler.
 DEFAULT_WORKERS = 7
 
-# A worker that cannot reach the parent within this long has been
-# orphaned -- the parent died, or is wedged. Exiting beats blocking
-# forever inside a container billed until its timeout.
+# A worker mid-round that has not been heard from in this long is
+# wedged; the parent gives up on the round rather than blocking forever
+# inside a container billed until its timeout.
 WORKER_TIMEOUT_S = 900.0
+# How often a waiting side looks at whether the other is still alive.
+# An idle worker waits for its next command however long the parent is
+# busy elsewhere -- a population's pre-play phase uses no workers for
+# half an hour -- and exits only if the parent has died. (It used to
+# give up after WORKER_TIMEOUT_S of silence: pop8's workers exited a
+# quarter of an hour into its first pre-play phase, and the next round
+# waited on the dead.)
+POLL_S = 30.0
+
+
+def _command(rep_q: Any, poll_s: float) -> tuple:
+    """The worker's next command from the parent, however long in coming;
+    ``("stop",)`` once the parent has died."""
+    while True:
+        try:
+            return rep_q.get(timeout=poll_s)
+        except queue.Empty:
+            parent = mp.parent_process()
+            if parent is not None and not parent.is_alive():
+                return ("stop",)
 
 _STAT_KEYS = (
     "hands", "decisions", "candidate_total", "forced", "truncated",
@@ -93,7 +114,7 @@ _STAT_KEYS = (
 
 
 def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
-            rep_q: Any) -> None:
+            rep_q: Any, poll_s: float = POLL_S) -> None:
     """Play rounds into rows ``[start, stop)`` until told to stop.
 
     Everything except the forward pass happens here. The parent never
@@ -111,7 +132,7 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
         max_decisions = per_seat * 4
 
         while True:
-            cmd = rep_q.get(timeout=WORKER_TIMEOUT_S)
+            cmd = _command(rep_q, poll_s)
             if cmd[0] == "stop":
                 return
             (_tag, n_hands, episode_base, seed, level_weight, pool, starts,
@@ -210,7 +231,7 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                 pending.append(send(h))
             h = 0
             while True:
-                if rep_q.get(timeout=WORKER_TIMEOUT_S)[0] != "go":
+                if _command(rep_q, poll_s)[0] != "go":
                     return  # the parent is shutting the round down
                 step(h, *pending[h])
                 refill(h)
@@ -219,7 +240,7 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                     # take its go first, so none is left in this queue
                     # to be read as the next round's command.
                     for _ in range(halves - 1):
-                        if rep_q.get(timeout=WORKER_TIMEOUT_S)[0] != "go":
+                        if _command(rep_q, poll_s)[0] != "go":
                             return
                     break
                 pending[h] = send(h)
@@ -244,8 +265,10 @@ class RolloutPool:
         workers: int = DEFAULT_WORKERS,
         hands_per_round: int = 128,
         capacity: int | None = None,
+        poll_s: float = POLL_S,
     ) -> None:
         self.cfg = cfg or ModelConfig()
+        self.poll_s = float(poll_s)
         self.workers = max(1, min(int(workers), int(hands_per_round)))
         self.hands_per_round = int(hands_per_round)
 
@@ -272,7 +295,7 @@ class RolloutPool:
                 proc = ctx.Process(
                     target=_worker,
                     args=(w, self._shared.spec, start, stop, self._req_q,
-                          self._rep_qs[w]),
+                          self._rep_qs[w], self.poll_s),
                     daemon=True,
                 )
                 proc.start()
@@ -280,6 +303,23 @@ class RolloutPool:
         except Exception:
             self.close()
             raise
+
+    def _receive(self) -> tuple:
+        """The next message from any worker. A worker that has died is an
+        error at once, naming it, rather than a quarter-hour's silence;
+        one alive but silent for ``WORKER_TIMEOUT_S`` is wedged."""
+        waited = 0.0
+        while True:
+            try:
+                return self._req_q.get(timeout=self.poll_s)
+            except queue.Empty:
+                dead = [w for w, proc in enumerate(self._procs) if not proc.is_alive()]
+                if dead:
+                    raise RuntimeError(f"rollout worker(s) {dead} have died")
+                waited += self.poll_s
+                if waited >= WORKER_TIMEOUT_S:
+                    raise TimeoutError(
+                        f"no word from the rollout workers in {WORKER_TIMEOUT_S:.0f} s")
 
     # --- one round --------------------------------------------------------
 
@@ -395,7 +435,7 @@ class RolloutPool:
                     # the batch as wide as that half. It is lockstep per
                     # half.
                     while len(waiting[half]) < len(live):
-                        msg = self._req_q.get(timeout=WORKER_TIMEOUT_S)
+                        msg = self._receive()
                         if msg[0] == "done":
                             _tag, wid, rows, stats = msg
                             ends[wid] = rows

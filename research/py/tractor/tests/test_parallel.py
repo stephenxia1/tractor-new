@@ -297,3 +297,43 @@ def test_workers_play_the_starts_they_are_given() -> None:
         for rel in range(NUM_SEATS):
             assert np.array_equal(view[rel], st.hands[(st.landlord + rel) % NUM_SEATS])
         assert np.array_equal(view[NUM_SEATS], st.kitty)
+
+
+# --- liveness -------------------------------------------------------------------
+
+
+def test_an_idle_pool_waits_out_a_long_gap_between_rounds() -> None:
+    """A population's pre-play phase leaves the workers idle for half an
+    hour; they used to give up after a quarter of one. Idle for many
+    times its poll interval, a pool still plays the next round."""
+    import time
+
+    from tractor.train.parallel import RolloutPool
+
+    with RolloutPool(cfg=SMALL, workers=2, hands_per_round=4, poll_s=0.1) as pool:
+        net = _net()
+        buf, _st = pool.collect(net, np.random.default_rng(1), None, n_hands=4, device=DEVICE,
+                                pool=4)
+        time.sleep(2.0)  # twenty polls with no command
+        assert all(proc.is_alive() for proc in pool._procs)
+        buf, stats = pool.collect(net, np.random.default_rng(2), None, n_hands=4,
+                                  device=DEVICE, pool=4)
+        assert stats["hands"] == 4 and len(buf) > 0
+
+
+def test_a_dead_worker_is_an_error_at_once() -> None:
+    """Not a quarter-hour's silence before the round gives up."""
+    import time
+
+    import pytest
+
+    from tractor.train.parallel import RolloutPool
+
+    with RolloutPool(cfg=SMALL, workers=2, hands_per_round=4, poll_s=0.1) as pool:
+        pool._procs[1].kill()
+        pool._procs[1].join()
+        started = time.perf_counter()
+        with pytest.raises(RuntimeError, match="died"):
+            pool.collect(_net(), np.random.default_rng(1), None, n_hands=4, device=DEVICE,
+                         pool=4)
+        assert time.perf_counter() - started < 30
