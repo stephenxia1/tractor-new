@@ -370,8 +370,8 @@ nothing.
    phase (fixed, `96ad51a`). The cause is `torch.compile` of the update:
    README § *Why pop8 diverged*.
 
-   **`pop8b` is the run** (relaunched 2026-09-29, the user's call): the
-   same recipe without compiling the update --
+   **`pop8b`** (relaunched 2026-09-29, the user's call): the same recipe
+   without compiling the update --
 
    ```bash
    TRACTOR_TRAIN_APP=tractor-train-pop8b modal run --detach modal_train.py::launch \
@@ -386,6 +386,29 @@ nothing.
    ~51 s a play step, so 1300 steps end inside the 24-hour limit. Do
    not add `--compile` back without KL guarding; see the README.
 
+   It ran to step 934, KL-spiking in one or two agents at a time from
+   step 150 on (README § *pop8b's KL spikes, and the guard*). At 04:16
+   on 2026-09-30 Modal lost its worker and re-ran the call from step 0
+   into the same directory, overwriting checkpoints by step number;
+   stopped at the rerun's step 752. The first run's steps 150, 250,
+   350, 500, 750, 800, 850 and 900 are in `/vol/pop8b/milestones/`;
+   `metrics.jsonl` holds its 900 rows, then the rerun's 750.
+   `tractor.train.relaunch` now makes a rescheduled call resume from
+   its run's newest checkpoint, and refuses a fresh start into a run
+   that has checkpoints.
+
+   **`pop8c` is the run** (2026-09-30, the user's call): `pop8b`'s step
+   900 onward, with the KL guard --
+
+   ```bash
+   TRACTOR_TRAIN_APP=tractor-train-pop8c modal run --detach modal_train.py::launch \
+     --name pop8c --resume /vol/pop8b/milestones/step_0000900.pt --target-kl 0.05 \
+     <the same flags as pop8b>
+   ```
+
+   400 steps, ~5.5 h with two declare phases; milestones in
+   `/vol/pop8c/milestones/` (`::milestones --name pop8c`).
+
    **Training longer.** Resume with a larger absolute `--steps` and the
    same flags; the step, the schedule's place and every optimiser come
    back from the checkpoint, and the deals continue on a stream of their
@@ -394,8 +417,8 @@ nothing.
    cut the run off. Use a new app name for each launch:
 
    ```bash
-   TRACTOR_TRAIN_APP=tractor-train-pop8b-2 modal run --detach modal_train.py::launch \
-     --gpu h100 --name pop8b --resume latest --steps 3000 <the same flags as above>
+   TRACTOR_TRAIN_APP=tractor-train-pop8c-2 modal run --detach modal_train.py::launch \
+     --gpu h100 --name pop8c --resume latest --steps 3000 --target-kl 0.05 <the same flags>
    ```
 
    **Milestones.** `--keep-last 6` keeps only the newest 300 steps of
@@ -416,14 +439,16 @@ nothing.
    1.5 h on up to eight A10Gs; a rerun with the same `--out` resumes):
 
    ```bash
-   TRACTOR_EVAL_APP=tractor-eval-pop8b modal run --detach modal_eval.py::population \
-     --checkpoint /vol/pop8b/checkpoints/final.pt --out runs/pop8b-final.jsonl
+   TRACTOR_EVAL_APP=tractor-eval-pop8c modal run --detach modal_eval.py::population \
+     --checkpoint /vol/pop8c/checkpoints/final.pt --out runs/pop8c-final.jsonl
    # a milestone the same way: --checkpoint /vol/pop8b/milestones/step_0001000.pt
    # (step 150: evals/2026-09-29/pop8b-150-random.jsonl, --pre-play random
    # --gpu, since declaring and burial train only from step 300; best agent
    # -3.8 points over the ladder, worst -18.0, where v5 final is +10.5 on
    # the same deals. --gpu because 32-core CPU containers sat unscheduled
-   # for 20 minutes on 2026-09-29.)
+   # for 20 minutes on 2026-09-29. Step 500, random: best -4.7, mean -9.0
+   # against 150's -10.0 -- nearly flat; full hand 1-3 points worse than
+   # random, the learned declaring and burial weaker than the bots'.)
    # --pre-play random for play alone; pair the best agents against
    # evals/2026-09-24/v5-final-{policy,random}.jsonl with tab_evals.py --paired
    ```

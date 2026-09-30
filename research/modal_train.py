@@ -112,7 +112,8 @@ WANDB = _wandb_secret()
 
 
 def _train(steps: int, hands: int, name: str, gpu_label: str,
-           wandb_on: bool, resume: str, overrides: dict) -> dict:
+           wandb_on: bool, resume: str, overrides: dict,
+           overwrite: bool = False) -> dict:
     import os
 
     import torch
@@ -123,18 +124,18 @@ def _train(steps: int, hands: int, name: str, gpu_label: str,
     from tractor.train.loop import TrainConfig, train
     from tractor.train.population import PopulationConfig, train_population
 
+    from tractor.train.relaunch import resolve_resume
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = f"{VOLUME}/{name}/checkpoints"
     os.makedirs(ckpt, exist_ok=True)
-    if resume == "latest":
-        # The newest checkpoint of this run: final.pt after a run that
-        # finished, the last step_*.pt after one the 24-hour limit cut off.
-        import pathlib
-
-        found = sorted(pathlib.Path(ckpt).glob("*.pt"), key=lambda p: p.stat().st_mtime)
-        if not found:
-            raise FileNotFoundError(f"--resume latest: no checkpoint in {ckpt}")
-        resume = str(found[-1])
+    # `--resume latest`, a refusal to start fresh over a run's
+    # checkpoints, and -- when Modal reruns this call after losing its
+    # worker -- the run's newest checkpoint rather than step 0.
+    resume = resolve_resume(f"{VOLUME}/{name}", resume,
+                            modal.current_function_call_id(), overwrite=overwrite)
+    volume.commit()  # the record, for a rescheduled call to find
+    if resume:
         print(f"resuming from {resume}", flush=True)
 
     # `agents` in the overrides means a population (train/population.py).
@@ -222,7 +223,7 @@ def train_smoke() -> dict:
     """Three steps on a handful of hands: proves the loop runs on a GPU."""
     return _train(3, 4, "smoke", "A10G", False, "",
                   {"buffer_capacity": 2048, "checkpoint_every": 0,
-                   "ppo": {"epochs": 1, "minibatch": 64}})
+                   "ppo": {"epochs": 1, "minibatch": 64}}, overwrite=True)
 
 
 @app.local_entrypoint()
