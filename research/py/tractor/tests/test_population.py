@@ -685,6 +685,48 @@ def test_a_nonfinite_step_is_refused_on_the_device_as_on_the_host() -> None:
     assert all(float(st["step"]) == 0.0 for st in learner.opt.state.values())
 
 
+def test_the_kl_stops_the_update_on_the_device_as_on_the_host() -> None:
+    import copy
+
+    from ..train.buffer import DeviceRows
+    from ..train.ppo import PPOConfig, PPOLearner
+
+    nets, _c, _s, buf = _round()
+    # A large step, so the KL passes the threshold a few minibatches in:
+    # 0.007, 0.022, 0.057, ... of eight.
+    cfg = PPOConfig(minibatch=32, length_buckets=4, epochs=2, fixed_shapes=True, bf16=False,
+                    lr=3e-2, target_kl=0.04)
+    a, b = copy.deepcopy(nets[0]), copy.deepcopy(nets[0])
+    host, dev = PPOLearner(a, cfg, "cpu"), PPOLearner(b, cfg, "cpu")
+    assert dev.on_device_ok
+    rows = np.arange(0, len(buf), 2)
+    device_rows = DeviceRows(buf, "cpu")
+    torch.manual_seed(11)
+    m_host = host.update(buf, rows=rows)
+    torch.manual_seed(11)
+    m_dev = dev.update(buf, rows=rows, device_rows=device_rows)
+    assert m_host["early_stop"] == m_dev["early_stop"] == 1.0
+    assert 0 < m_dev["n_minibatches"] == m_host["n_minibatches"] < 8
+    assert m_dev["kl_at_stop"] > 0.04
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=1e-5, atol=1e-6)
+    for key, v in m_host.items():
+        np.testing.assert_allclose(m_dev[key], v, rtol=1e-4, atol=1e-6, err_msg=key)
+    assert host.steps == dev.steps
+    assert not hasattr(dev.opt, "found_inf")
+
+    # The next update starts unstopped.
+    cfg.target_kl = 10.0
+    torch.manual_seed(12)
+    m_host = host.update(buf, rows=rows)
+    torch.manual_seed(12)
+    m_dev = dev.update(buf, rows=rows, device_rows=device_rows)
+    assert m_dev["early_stop"] == 0.0 and m_dev["kl_at_stop"] == 0.0
+    assert m_dev["n_minibatches"] == m_host["n_minibatches"] == 8
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        torch.testing.assert_close(pa, pb, rtol=1e-5, atol=1e-6)
+
+
 def test_the_critic_fits_the_same_on_the_device() -> None:
     import copy
 

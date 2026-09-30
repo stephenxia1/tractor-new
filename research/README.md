@@ -1113,6 +1113,37 @@ Runs from scratch, same seed, 70-90 warm-up steps each, isolated it:
 
 `pop8b` runs R5's configuration.
 
+### pop8b's KL spikes, and the guard (2026-09-29)
+
+`pop8b` did not diverge, but its milder instability grew. Agent-steps
+with approx_kl over 0.05, per 50 steps: 0, 1, 6, 13, 24, 6 to step 300;
+then 39, 23, 114, 100 once learned declaring and burial changed the
+hands. By steps 401-500 agents 1 and 6 were over 0.05 on nearly every
+step (peaks 0.4-0.7, up to 3% of their rows at the log-ratio clamp),
+recovering each time but never settling; the other six stayed near
+0.01. Explained variance fell from ~0.19 to ~0.04 at step 300 with the
+critic's loss unchanged: the kitty's large, predictable rewards left
+with random burial (15 points buried -> 0.3), not a critic fault.
+
+`modal_perf.py::diag_kl` on the step-400 checkpoint
+(`evals/2026-09-29/diag-kl-pop8b-400.json`) settled where the KL comes
+from. Before the update, every agent's eager log-probabilities match the
+compiled rollout's (KL 0.0003-0.0014 in bf16, no clamped rows), so it is
+not a rollout/learner mismatch. Within one update agent 6's
+per-minibatch KL climbs: 0.002-0.005 for the first minibatches, 0.05 by
+the 16th of 136, 0.2-0.34 through the second half, 1.05 at worst. A
+healthy agent's never passes 0.045. The run's path (fixed shapes, CUDA
+graphs, device rows) gives the eager host update's KL to four digits.
+
+So the policy walks too far within a pass, which is what PPO's
+`target_kl` early stop is for. It now runs on the device path as well
+(`_update_on_device`: a flag set by the first minibatch over the
+threshold refuses it and every later one through the fused optimiser's
+`found_inf`, as for a non-finite step; the weights are the host path's),
+reports `kl_at_stop` and, per agent, `early_stop` and `n_minibatches`,
+and is `--target-kl` at launch. At 0.05 it would have stopped agent 6 at
+minibatch 16 of that update and left a healthy agent untouched.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

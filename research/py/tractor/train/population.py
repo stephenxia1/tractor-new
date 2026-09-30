@@ -586,7 +586,8 @@ def train_population(
                 **{
                     f"agent{k}/{key}": m[key]
                     for k, m in enumerate(per_agent)
-                    for key in ("explained_variance", "entropy", "approx_kl", "rows")
+                    for key in ("explained_variance", "entropy", "approx_kl", "rows",
+                                "early_stop", "kl_at_stop", "n_minibatches")
                 },
                 **{f"span/{k}": v["total"] for k, v in spans.summary().items()},
                 **{f"mem/{k}": v for k, v in memory_snapshot(device).items()},

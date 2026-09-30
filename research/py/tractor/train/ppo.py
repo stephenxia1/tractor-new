@@ -148,7 +148,11 @@ class PPOConfig:
     update stops there, so the policy returned has never knowingly left
     the trust region. Stopping after taking the offending step, which is
     the other common implementation, leaves the thing it was meant to
-    prevent in the weights.
+    prevent in the weights. On the device path the same minibatch and
+    every one after it are refused there (``_update_on_device``), so the
+    weights are the host path's; the metrics add ``kl_at_stop``, the
+    refused minibatch's KL, since the update's own ``approx_kl`` then
+    averages only the minibatches under the threshold.
 
     ``weight_decay`` is 0, not AdamW's 0.01. A decay the caller did not
     ask for is a regulariser on a policy network that is already
@@ -539,7 +543,7 @@ class PPOLearner:
         )
         # The device path's metric sums, kept across updates: a captured
         # step adds into them at a fixed address.
-        self._acc: tuple[Tensor, Tensor, Tensor] | None = None
+        self._acc: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
 
     # -- one minibatch -----------------------------------------------------
 
@@ -720,9 +724,8 @@ class PPOLearner:
 
         ``device_rows``, the buffer's rows already on the device
         (``buffer.DeviceRows``), moves the update there: see
-        ``_update_on_device``. It is taken when the shapes are fixed, the
-        optimiser is fused and ``target_kl`` is off, and ignored
-        otherwise.
+        ``_update_on_device``. It is taken when the shapes are fixed and
+        the optimiser is fused, and ignored otherwise.
         """
         cfg = self.cfg
         n = num_rows(buffer)
@@ -758,6 +761,7 @@ class PPOLearner:
         n_minibatches = 0
         epochs_run = 0
         early_stop = False
+        kl_at_stop = 0.0
         # Row counts rather than row means, and only over the minibatches
         # that actually stepped. Both answer "how many", so averaging
         # them per row would say nothing.
@@ -790,6 +794,7 @@ class PPOLearner:
                         # Discarded entirely: this minibatch contributes
                         # neither a step nor a metric.
                         early_stop = True
+                        kl_at_stop = float(parts["approx_kl"])
                         break
 
                 # A non-finite loss is refused before it can reach
@@ -833,7 +838,7 @@ class PPOLearner:
 
         metrics = self._finish(
             totals, rows_seen, ev, n_minibatches, epochs_run, early_stop, m,
-            skipped_ragged, nonfinite, outcome_rows, ratio_clamped,
+            skipped_ragged, nonfinite, outcome_rows, ratio_clamped, kl_at_stop,
         )
         if self.run is not None:
             self.run.log({f"ppo/{k}": v for k, v in metrics.items()}, step=self.steps)
@@ -843,6 +848,7 @@ class PPOLearner:
         self, totals: dict[str, float], rows_seen: int, ev: float,
         n_minibatches: int, epochs_run: int, early_stop: bool, m: int,
         skipped_ragged: int, nonfinite: int, outcome_rows: int, ratio_clamped: int,
+        kl_at_stop: float = 0.0,
     ) -> dict[str, float]:
         """The metrics of one update from its row-weighted sums."""
         self.updates += 1
@@ -854,6 +860,9 @@ class PPOLearner:
         metrics["n_minibatches"] = float(n_minibatches)
         metrics["epochs_run"] = float(epochs_run)
         metrics["early_stop"] = 1.0 if early_stop else 0.0
+        # 0.0 when nothing was refused for its KL: a stop is always
+        # above a positive threshold, so the zero cannot be mistaken.
+        metrics["kl_at_stop"] = float(kl_at_stop)
         metrics["rows"] = float(m)
         metrics["skipped_ragged_rows"] = float(skipped_ragged)
         metrics["nonfinite_minibatches"] = float(nonfinite)
@@ -882,11 +891,11 @@ class PPOLearner:
     @property
     def on_device_ok(self) -> bool:
         """Whether ``update`` can run on ``DeviceRows`` without a read a
-        minibatch: fixed shapes (the model then reads no length back),
-        no ``target_kl`` (which reads the KL to decide), and a fused
-        optimiser, which can skip a step on the device."""
+        minibatch: fixed shapes (the model then reads no length back) and
+        a fused optimiser, which can skip a step on the device -- for a
+        non-finite loss, and past ``target_kl``."""
         fused = bool(self.opt.param_groups[0].get("fused"))
-        return self.fixed and self.cfg.target_kl is None and fused
+        return self.fixed and fused
 
     def _update_on_device(
         self, buffer: PPOBuffer, selected: np.ndarray, ev: float, rows: Any
@@ -903,6 +912,11 @@ class PPOLearner:
           device: the fused optimiser's ``found_inf`` skips it whole --
           weights, moments and step count untouched -- as the host path
           does by not calling ``step``;
+        * past ``target_kl`` the same refusal stops the update: a flag on
+          the device, set by the first minibatch over it, refuses that
+          one and every one after, where the host path breaks out. The
+          rest of that epoch is still computed, for nothing; the flag is
+          read once an epoch, and a stopped update runs no further one;
         * the metrics are summed on the device, over the minibatches
           that stepped, and read once.
 
@@ -927,12 +941,15 @@ class PPOLearner:
         keys = _LOSS_KEYS + ("grad_norm",)
         if self._acc is None:
             # Row-weighted sums; then rows stepped, minibatches stepped,
-            # refused, outcome rows, clamped ratios.
+            # refused, outcome rows, clamped ratios; then whether the KL
+            # has stopped the update, and the KL that did.
             self._acc = (torch.zeros(len(keys), device=dev),
-                         torch.zeros(5, device=dev), torch.zeros((), device=dev))
-        sums, counts, zero = self._acc
+                         torch.zeros(5, device=dev), torch.zeros((), device=dev),
+                         torch.zeros(2, device=dev))
+        sums, counts, zero, halt = self._acc
         sums.zero_()
         counts.zero_()
+        halt.zero_()
         skipped_ragged = 0
         epochs_run = 0
 
@@ -946,7 +963,20 @@ class PPOLearner:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.net.parameters(), cfg.max_grad_norm
             )
-            ok = torch.isfinite(loss) & torch.isfinite(grad_norm)
+            finite = torch.isfinite(loss) & torch.isfinite(grad_norm)
+            ok = finite
+            if cfg.target_kl is not None:
+                # The host path's order: the KL first (a NaN one is not
+                # over it), and after a stop nothing counts at all.
+                kl = parts["approx_kl"].detach().float()
+                was = halt[0] > 0
+                stopped = was | (kl > float(cfg.target_kl))
+                halt.copy_(torch.stack((
+                    stopped.to(torch.float32),
+                    torch.where(stopped & ~was, kl, halt[1]),
+                )))
+                ok = finite & ~stopped
+                finite = finite | stopped  # not counted as refused
             self.opt.found_inf = (~ok).to(torch.float32)
             self.opt.step()
             values = torch.stack(
@@ -956,7 +986,7 @@ class PPOLearner:
             sums.add_(torch.where(ok, values * k, zero))
             okf = ok.to(torch.float32)
             counts.add_(torch.stack((
-                okf * k, okf, 1.0 - okf,
+                okf * k, okf, 1.0 - finite.to(torch.float32),
                 torch.where(ok, parts["outcome_rows"].float(), zero),
                 torch.where(ok, parts["ratio_clamped"].float(), zero),
             )))
@@ -987,20 +1017,24 @@ class PPOLearner:
                     else:
                         self.opt.zero_grad(set_to_none=True)
                         body(pos, width, k)
+                if cfg.target_kl is not None and bool(halt[0] > 0):
+                    break
         finally:
             # A later host-path step must not inherit the last verdict.
             if hasattr(self.opt, "found_inf"):
                 del self.opt.found_inf
 
-        got = torch.cat((sums, counts)).tolist()
+        got = torch.cat((sums, counts, halt)).tolist()
         totals = dict(zip(keys, got[: len(keys)]))
         rows_seen, n_steps, refused, outcome_rows, ratio_clamped = (
-            int(round(x)) for x in got[len(keys):]
+            int(round(x)) for x in got[len(keys): len(keys) + 5]
         )
+        stopped = got[-2] > 0
         self.steps += n_steps
         metrics = self._finish(
-            totals, rows_seen, ev, n_steps, epochs_run, False, m,
+            totals, rows_seen, ev, n_steps, epochs_run, stopped, m,
             skipped_ragged, refused, outcome_rows, ratio_clamped,
+            got[-1] if stopped else 0.0,
         )
         if self.run is not None:
             self.run.log({f"ppo/{k}": v for k, v in metrics.items()}, step=self.steps)

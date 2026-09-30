@@ -310,7 +310,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            reshuffle_every: int = 10, pool: int = 0, arch: str = "v5",
            forward_chunks: int = 1, rollout_overlap: bool = False,
            compile: bool = False, cuda_graphs: bool = False,
-           rollout_forwards: str = "", fixed_shapes: bool = False) -> None:
+           rollout_forwards: str = "", fixed_shapes: bool = False,
+           target_kl: float = 0.0) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -418,7 +419,10 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
                     "cuda_graphs": cuda_graphs,
                     # Fixed minibatch shapes and the device-rows path
                     # without torch.compile (implied by --compile).
-                    "fixed_shapes": fixed_shapes},
+                    "fixed_shapes": fixed_shapes,
+                    # An agent's update stops at the first minibatch whose
+                    # approx KL passes this (PPOConfig.target_kl); 0 is off.
+                    "target_kl": target_kl or None},
             # A hand writes at most 100 rows, and a round that cannot
             # fit every hand silently collects fewer of them.
             "buffer_capacity": buffer_capacity or hands * 100,

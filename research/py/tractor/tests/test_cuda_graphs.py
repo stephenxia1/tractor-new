@@ -69,6 +69,27 @@ def test_a_captured_update_is_the_update(compiled: bool) -> None:
     assert plain.steps == graphed.steps
 
 
+def test_a_captured_update_stops_at_the_kl_as_the_plain_one() -> None:
+    nets, _c, _s, buf = _round()
+    rows = DeviceRows(buf, DEV)
+    cfg = replace(CFG, lr=3e-2, target_kl=0.04)
+    plain = PPOLearner(copy.deepcopy(nets[0]), cfg, DEV)
+    graphed = PPOLearner(copy.deepcopy(nets[0]), replace(cfg, cuda_graphs=True), DEV)
+    stops = 0
+    for u in range(4):
+        torch.manual_seed(u)
+        want = plain.update(buf, device_rows=rows)
+        torch.manual_seed(u)
+        got = graphed.update(buf, device_rows=rows)
+        for key, v in want.items():
+            np.testing.assert_allclose(got[key], v, rtol=1e-4, atol=1e-6, err_msg=key)
+        stops += int(want["early_stop"])
+    assert stops > 0
+    assert graphed._graphs.captures > 0 and graphed._graphs.replays > 0
+    assert _max_diff(plain.net, graphed.net) < 1e-5
+    assert plain.steps == graphed.steps
+
+
 def test_a_captured_step_still_refuses_a_nonfinite_one() -> None:
     nets, _c, _s, buf = _round()
     rows = DeviceRows(buf, DEV)

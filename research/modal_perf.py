@@ -2532,3 +2532,200 @@ def logit_scan_h100(run: str, steps: list, hands: int) -> dict:
 def logit_scan(run: str = "diag-r1", steps: str = "10,20,30,40,50", hands: int = 256) -> None:
     call = logit_scan_h100.spawn(run, [int(s) for s in steps.split(",")], hands)
     print(f"spawned {call.object_id}; result -> /vol/bench/logit-scan-{run}.json")
+
+
+# --- pop8b's KL spikes: before the update, or during it? ----------------------
+
+
+def _diag_kl(checkpoint: str, hands: int, workers: int, focus: list,
+             out_path: str | None) -> dict:
+    """pop8b's agents spike to approx_kl 0.1-0.7 for a few steps and
+    recover. A guard that refuses an agent's steps past a KL threshold
+    helps only if the KL builds up *during* the update; if the rollout's
+    log-probabilities already disagree with the learner's before its
+    first step, the guard would refuse every step and freeze the agent.
+    From a checkpoint, with its config, seating and optimiser states:
+
+    1. A round collected as the run does after step 300: starts from the
+       agents' own declarations and burials, compiled forwards, the pool.
+       Every stored action's log-probability recomputed by each agent's
+       eager network in bf16 (the update's forward) and in float32:
+       the KL and the clamped rows *before* any step.
+    2. For the ``focus`` agents, one update on that round, the run's way
+       (fixed shapes, CUDA graphs, device rows) and eager on the host;
+       the host one records every minibatch's approx_kl, so the KL's
+       course through the update shows.
+    """
+    import copy
+    import json
+    import os
+    import time
+
+    import numpy as np
+    import torch
+
+    from tractor.nn.features import Cache
+    from tractor.sim.bury import BuryConfig
+    from tractor.train.buffer import DeviceRows, RolloutBuffer
+    from tractor.train.declare_loop import DeclareTrainConfig
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import (
+        PopulationConfig, agent_model_config, build_agents, build_critic, hand_agents,
+        load_agents, load_critic, seating,
+    )
+    from tractor.train.ppo import _MAX_LOG_RATIO, PPOConfig, PPOLearner
+    from tractor.train.starts import PrePlayConfig, make_starts
+
+    dev = torch.device("cuda")
+    out: dict = {"checkpoint": checkpoint, "gpu": torch.cuda.get_device_name(0)}
+
+    def save() -> None:
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2, default=float)
+            volume.commit()
+
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = PopulationConfig(**blob["config"])
+    bury_cfg = BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider,
+                          evaluator=cfg.bury_evaluator, worlds=cfg.bury_worlds)
+    burial = "policy" if cfg.bury_policy else "climb"
+    declare_cfg = DeclareTrainConfig(**{
+        **cfg.declare,
+        "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial=burial),
+    })
+    agents = build_agents(cfg, dev, declare_cfg)
+    critic = build_critic(cfg, dev)
+    load_critic(critic, blob)
+    step = load_agents(agents, blob)
+    saved_opt = [copy.deepcopy(s["optimizer"]) for s in blob["agents"]]
+    del blob
+    mcfg = agent_model_config(cfg)
+    nets = [a.net for a in agents]
+    for net in nets:
+        net.eval()
+    table = seating(cfg.seed, step // cfg.reshuffle_every, cfg.agents)
+    seat_of = hand_agents(table, hands)
+    out.update({"step": step, "focus": focus})
+    print(f"step {step}, seating {table.tolist()}", flush=True)
+
+    # -- 1. the round, and the log-probabilities before any step -------------
+    rng = np.random.default_rng([cfg.seed, step, 7])
+    cache = Cache()
+    play_pre = PrePlayConfig(random_burial_frac=cfg.random_burial_frac, bury=bury_cfg,
+                             burial=burial)
+    buf = RolloutBuffer(hands * 100, mcfg)
+    with RolloutPool(cfg=mcfg, workers=workers, hands_per_round=hands) as pool:
+        for rep in range(2):  # the first compiles; the second is the round
+            starts, _r, _st = make_starts(
+                rng, hands, nets, [a.declare.net for a in agents], dev, pre=play_pre,
+                cache=cache,
+                bury_net=None if agents[0].bury is None else [a.bury.net for a in agents],
+                agents=seat_of)
+            t0 = time.perf_counter()
+            buf, _stats = pool.collect(
+                nets, rng, buf, n_hands=hands, device=dev, pool=cfg.pool, amp=True,
+                level_weight=0.0, agents=seat_of, critic=critic.critic, overlap=True,
+                starts=starts, forwards="compiled")
+            print(f"  round {rep}: {len(buf)} rows in {time.perf_counter() - t0:.0f}s",
+                  flush=True)
+    n = len(buf)
+    owner = seat_of[buf.episode[:n], buf.seat[:n]]
+
+    def before(a: int) -> dict:
+        rows = np.nonzero(owner == a)[0]
+        res = {"rows": int(len(rows))}
+        for name, amp in (("bf16", True), ("fp32", False)):
+            d = np.empty(len(rows))
+            for lo in range(0, len(rows), 1024):
+                idx = rows[lo: lo + 1024]
+                obs, _p, sc = buf.as_torch(idx, dev)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
+                                                     enabled=amp):
+                    lp = nets[a].actor(obs).log_probs.float()
+                act = sc["action"].to(dev).long()[:, None]
+                d[lo: lo + len(idx)] = (lp.gather(1, act).squeeze(1).cpu().numpy()
+                                        - buf.logp[idx])
+            lr = np.clip(d, -_MAX_LOG_RATIO, _MAX_LOG_RATIO)
+            ad = np.abs(d)
+            res[name] = {
+                "kl_k3": float(np.mean(np.expm1(lr) - lr)),
+                "mean_abs": float(ad.mean()), "p99_abs": float(np.percentile(ad, 99)),
+                "max_abs": float(ad.max()), "over_0.5": int((ad > 0.5).sum()),
+                "clamped": int((ad > _MAX_LOG_RATIO).sum()),
+            }
+        print(f"  agent {a}: rows {res['rows']}  before the update, bf16: kl "
+              f"{res['bf16']['kl_k3']:.4g} max|d| {res['bf16']['max_abs']:.2f} "
+              f">0.5 {res['bf16']['over_0.5']} clamped {res['bf16']['clamped']}; fp32: kl "
+              f"{res['fp32']['kl_k3']:.4g} max|d| {res['fp32']['max_abs']:.2f} "
+              f"clamped {res['fp32']['clamped']}", flush=True)
+        return res
+
+    out["before"] = {str(a): before(a) for a in range(cfg.agents)}
+    save()
+
+    # -- 2. the update, the run's way and on the host -----------------------
+    compute_gae(buf, gamma=cfg.gamma, lam=cfg.lam)
+    rows_dev = DeviceRows(buf, dev)
+    host_cfg = replace_cfg(PPOConfig(**cfg.ppo), compile=False, cuda_graphs=False,
+                           fixed_shapes=True)
+    out["update"] = {}
+    for a in focus:
+        rows = np.nonzero(owner == a)[0]
+        res = {}
+        # On the host, with every minibatch's KL read as it goes.
+        net = copy.deepcopy(nets[a]).train()
+        learner = PPOLearner(net, host_cfg, dev)
+        learner.opt.load_state_dict(saved_opt[a])
+        kls: list = []
+        losses = learner._losses
+
+        def recording(*args, _losses=losses, _kls=kls, **kw):
+            loss, parts = _losses(*args, **kw)
+            _kls.append(float(parts["approx_kl"]))
+            return loss, parts
+
+        learner._losses = recording
+        torch.manual_seed(101)
+        m = learner.update(buf, rows=rows)
+        k = np.array(kls)
+        tenth = max(1, len(k) // 10)
+        res["host"] = {
+            "approx_kl": m["approx_kl"], "ratio_clamped": m["ratio_clamped"],
+            "clip_fraction": m["clip_fraction"], "grad_norm": m["grad_norm"],
+            "minibatches": int(len(k)), "first_5": k[:5].tolist(),
+            "by_tenth": [float(k[i: i + tenth].mean()) for i in range(0, len(k), tenth)],
+            "max": float(k.max()), "first_over_0.05": int(np.argmax(k > 0.05))
+            if (k > 0.05).any() else -1,
+        }
+        print(f"  agent {a} host: kl {m['approx_kl']:.4g} clamped {m['ratio_clamped']:.0f}; "
+              f"per minibatch first {np.round(k[:5], 4).tolist()} by tenth "
+              f"{np.round(res['host']['by_tenth'], 4).tolist()} max {k.max():.4g} "
+              f"first over 0.05 at {res['host']['first_over_0.05']}/{len(k)}", flush=True)
+        # The run's own learner: fixed shapes, CUDA graphs, device rows.
+        agents[a].net.train()
+        torch.manual_seed(101)
+        m = agents[a].learner.update(buf, rows=rows, device_rows=rows_dev)
+        res["run"] = {key: m[key] for key in ("approx_kl", "ratio_clamped", "clip_fraction",
+                                              "grad_norm", "nonfinite_minibatches")}
+        print(f"  agent {a} run's path: kl {m['approx_kl']:.4g} "
+              f"clamped {m['ratio_clamped']:.0f}", flush=True)
+        out["update"][str(a)] = res
+        save()
+    return out
+
+
+@app.function(image=image, gpu="H100", volumes={VOLUME: volume}, timeout=2 * 3600,
+              cpu=20.0, memory=98304)
+def diag_kl_h100(checkpoint: str, hands: int, workers: int, focus: list) -> dict:
+    name = checkpoint.split("/")[-3] + "-" + checkpoint.split("/")[-1].replace(".pt", "")
+    return _diag_kl(checkpoint, hands, workers, focus, f"{VOLUME}/bench/diag-kl-{name}.json")
+
+
+@app.local_entrypoint()
+def diag_kl(checkpoint: str = "/vol/pop8b/checkpoints/step_0000400.pt", hands: int = 4096,
+            workers: int = 16, focus: str = "6,5,0") -> None:
+    call = diag_kl_h100.spawn(checkpoint, hands, workers, [int(a) for a in focus.split(",")])
+    print(f"spawned {call.object_id}; result -> /vol/bench/diag-kl-*.json")
