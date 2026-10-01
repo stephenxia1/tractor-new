@@ -1144,6 +1144,21 @@ reports `kl_at_stop` and, per agent, `early_stop` and `n_minibatches`,
 and is `--target-kl` at launch. At 0.05 it would have stopped agent 6 at
 minibatch 16 of that update and left a healthy agent untouched.
 
+**`pop8c` -- `pop8b`'s step 900 to 1300 with `--target-kl 0.05`
+(2026-09-30, `evals/2026-09-30/pop8c-metrics.jsonl`).** The spikes went:
+no update's approx_kl passed 0.025 (`pop8b`'s reached 0.7), no agent was
+ever left without a step, and the guard refused single minibatches that
+had jumped to KL 1.25 and 1.8. But by step 900 the threshold bound almost
+every update, not only the spikes: 88-100% of agent-updates stopped
+early, the median one after 13 of ~125 minibatches, and the agents took
+24% of their minibatches overall (agent 7 5%, agent 4 8%, agent 5 48%).
+The KL at a stop sat just past the line (median 0.079, 99th percentile
+0.27). At step 400 a healthy agent's minibatches never passed 0.045; by
+step 900, with entropy 0.40 against ~0.55, the same learning rate
+crosses 0.05 within a few dozen steps. So 0.05 cut the learning roughly
+fourfold. Entropy kept falling (0.40 -> 0.37), the critic's loss rose
+(0.0016 -> 0.0017).
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
