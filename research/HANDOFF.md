@@ -407,7 +407,19 @@ nothing.
    ```
 
    400 steps, ~5.5 h with two declare phases; milestones in
-   `/vol/pop8c/milestones/` (`::milestones --name pop8c`).
+   `/vol/pop8c/milestones/` (`::milestones --name pop8c`). It reached
+   step 1300 on 2026-09-30 (README § *pop8b's KL spikes, and the
+   guard*; ladder evals in `evals/2026-09-30/`: best agent +2.9 points
+   with random pre-play, +0.9 with its own).
+
+   **Continued** 2026-10-01 00:51 EDT (the user's call: +1500 steps, the
+   guard loosened to 0.15 since 0.05 bound nearly every update), app
+   `tractor-train-pop8c-2`, ~21 h:
+
+   ```bash
+   TRACTOR_TRAIN_APP=tractor-train-pop8c-2 modal run --detach modal_train.py::launch \n     --name pop8c --resume latest --steps 2800 --target-kl 0.15 <the same flags as pop8b>
+   TRACTOR_TRAIN_APP=tractor-milestones-pop8c-2 modal run --detach \n     modal_train.py::milestones --name pop8c
+   ```
 
    **Training longer.** Resume with a larger absolute `--steps` and the
    same flags; the step, the schedule's place and every optimiser come

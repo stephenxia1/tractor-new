@@ -242,8 +242,9 @@ def keep_milestones(name: str, every: int, extra: list, poll_s: int) -> list:
 
     ``torch.save`` writes a checkpoint in place, and the volume can show
     a half-written file, so a checkpoint is copied only once a later one
-    (or ``final.pt``) is there. Returns the steps kept when ``final.pt``
-    appears.
+    (or ``final.pt``) is there. Returns the steps kept when a ``final.pt``
+    newer than this job appears -- a continued run starts with the last
+    segment's.
     """
     import re
     import shutil
@@ -251,10 +252,12 @@ def keep_milestones(name: str, every: int, extra: list, poll_s: int) -> list:
 
     src = pathlib.Path(VOLUME) / name / "checkpoints"
     dst = pathlib.Path(VOLUME) / name / "milestones"
+    started = time.time()
     kept = []
     while True:
         volume.reload()
-        final = (src / "final.pt").exists()
+        last = src / "final.pt"
+        final = last.exists() and last.stat().st_mtime > started
         steps = sorted(int(m.group(1)) for p in src.glob("step_*.pt")
                        if (m := re.fullmatch(r"step_(\d+)\.pt", p.name)))
         for s in steps:
