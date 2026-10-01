@@ -436,11 +436,18 @@ nothing.
    **Evaluating it.** Every agent against the whole ladder -- the four
    fair bots, 770 deals each, the full hand as trained -- with win rate,
    levels and points per bot and pooled, and the agents ranked (about
-   1.5 h on up to eight A10Gs; a rerun with the same `--out` resumes):
+   1.5 h on up to eight A10Gs). It runs on Modal end to end
+   (`population_job`, since 2026-09-30): the command returns at once, the
+   record and ranking land in `/vol/evals/runs/<out>` and
+   `<out>.summary.json` (fetch with `modal volume get`), failed pairs are
+   retried, and a rerun with the same `--out` resumes. `--no-remote` is
+   the old client-side loop, which a sleeping laptop or a memory kill
+   cancels:
 
    ```bash
    TRACTOR_EVAL_APP=tractor-eval-pop8c modal run --detach modal_eval.py::population \
-     --checkpoint /vol/pop8c/checkpoints/final.pt --out runs/pop8c-final.jsonl
+     --checkpoint /vol/pop8c/checkpoints/final.pt --out pop8c-final-policy.jsonl
+   modal volume get tractor-rl /evals/runs/pop8c-final-policy.jsonl evals/2026-09-30/
    # a milestone the same way: --checkpoint /vol/pop8b/milestones/step_0001000.pt
    # (step 150: evals/2026-09-29/pop8b-150-random.jsonl, --pre-play random
    # --gpu, since declaring and burial train only from step 300; best agent

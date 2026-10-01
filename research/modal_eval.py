@@ -17,9 +17,10 @@ tighter than either interval alone.
     modal run modal_eval.py::smart \\
       --checkpoints /vol/v2-points/checkpoints/step_0000500.pt,/vol/v2-points/checkpoints/final.pt
 
-A population's agents, every one against the whole ladder, ranked:
+A population's agents, every one against the whole ladder, ranked --
+run on Modal end to end, the record and ranking on the volume:
 
-    modal run modal_eval.py::population --checkpoint /vol/pop8/checkpoints/final.pt
+    modal run --detach modal_eval.py::population --checkpoint /vol/pop8/checkpoints/final.pt
 """
 
 from __future__ import annotations
@@ -51,6 +52,9 @@ Z95 = 1.959963984540054
 # connection and the app stopped with it, once after 2.5 hours with
 # every pair still running.
 RESULTS = f"{VOLUME}/evals"
+# A whole measurement's record and ranking, when it runs on Modal
+# (`population_job`).
+RUNS = f"{RESULTS}/runs"
 
 
 def _key(checkpoint: str, bot: str, deals: int, seed: int, pre_play: str,
@@ -180,9 +184,11 @@ def _label(path: str) -> str:
 
 def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
              path: str, pre_play: str, search: dict | None,
-             gpu: bool = False) -> dict | None:
+             gpu: bool = False, on_write=None) -> dict | None:
     """Every (checkpoint, bot) pair, measured or read back. -> the results,
-    or None while some pair is still unmeasured."""
+    or None while some pair is still unmeasured. ``on_write`` runs after
+    each write to ``path`` (a volume commit, on Modal)."""
+    on_write = on_write or (lambda: None)
     # Search, and the burial climb of --pre-play agent, are batched
     # forwards that a CPU thread runs at ~100 ms a row. `gpu` sends the
     # rest there too: 32-core CPU containers are sometimes not to be had
@@ -212,6 +218,7 @@ def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
             if r is not None:
                 results[(c, b)] = r
                 fh.write(json.dumps(r) + "\n")
+    on_write()
     todo = [p for p in pairs if p not in results]
     print(f"{len(pairs)} pairs, {len(pairs) - len(todo)} already measured, "
           f"{deals} deals each, seed {seed}, pre-play {pre_play}, "
@@ -227,6 +234,7 @@ def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
             results[(r["checkpoint"], r["bot"])] = r
             fh.write(json.dumps(r) + "\n")
             fh.flush()
+            on_write()
             print(f"  done {_label(r['checkpoint']):28} {r['bot']:10} "
                   f"win {r['winrate']:.3f}  levels {r['levels']:+.3f}  "
                   f"points {r['points']:+.1f}  {r['seconds'] / 60:5.1f} min")
@@ -329,14 +337,58 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
     print(f"\nraw results: {path}")
 
 
+def _population(checkpoint: str, agents: int, names: list, deals: int, seed: int,
+                workers: int, path: str, pre_play: str, gpu: bool,
+                on_write=None) -> list | None:
+    """Measure and rank a population's agents; the record at ``path``, the
+    ranking at ``<path>.summary.json``. -> the ranking, or None while some
+    pair is unmeasured."""
+    ckpts = [f"{checkpoint}#{k}" for k in range(agents)]
+    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, None,
+                       gpu, on_write)
+    if results is None:
+        return None
+    ranked = _report(ckpts, names, results, paired=False)
+    summary = {"checkpoint": checkpoint, "deals": deals, "seed": seed,
+               "pre_play": pre_play, "bots": names, "ranked": ranked}
+    with open(path + ".summary.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
+    (on_write or (lambda: None))()
+    return ranked
+
+
+@app.function(image=image, volumes={VOLUME: volume}, timeout=86400, cpu=1.0,
+              memory=2048)
+def population_job(checkpoint: str, agents: int, names: list, deals: int, seed: int,
+                   workers: int, out: str, pre_play: str, gpu: bool) -> list:
+    """``population`` run on Modal, start to finish: the pairs fan out
+    from here, and the record and ranking go to ``/vol/evals/runs/<out>``.
+    Nothing local has to stay up -- three times a local client's sleep or
+    a memory kill cancelled the pairs in flight. A pair that fails is
+    tried again, twice."""
+    volume.reload()
+    os.makedirs(RUNS, exist_ok=True)
+    path = f"{RUNS}/{out}"
+    for attempt in range(3):
+        ranked = _population(checkpoint, agents, names, deals, seed, workers, path,
+                             pre_play, gpu, on_write=volume.commit)
+        if ranked is not None:
+            return ranked
+        print(f"attempt {attempt + 1}: some pairs unmeasured; measuring them again")
+    raise RuntimeError(f"pairs still unmeasured after three attempts; see {path}")
+
+
 @app.local_entrypoint()
 def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
                deals: int = 770, seed: int = 20260923, workers: int = 32,
                out: str = "", pre_play: str = "agent-policy",
-               gpu: bool = False) -> None:
+               gpu: bool = False, remote: bool = True) -> None:
     """Every agent of a population checkpoint against the whole ladder.
 
-        modal run modal_eval.py::population --checkpoint /vol/pop8/checkpoints/final.pt
+        modal run --detach modal_eval.py::population \\
+          --checkpoint /vol/pop8/checkpoints/final.pt --out pop8-final.jsonl
+        # when it is done (modal app logs shows the ranking):
+        modal volume get tractor-rl /evals/runs/pop8-final.jsonl* evals/...
 
     Agents ``#0 .. #agents-1``, each against every fair bot (the four
     smart bots that play from their own seat) at ``deals`` deals, the
@@ -345,17 +397,21 @@ def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
     points against each bot and over the ladder, and the agents ranked;
     the ranking also lands in ``<out>.summary.json``. At the defaults,
     32 pairs on up to eight A10Gs: about an hour and a half.
+
+    By default the whole measurement runs on Modal (``population_job``)
+    and this returns at once; ``--no-remote`` runs the old way, the
+    client fanning the pairs out and writing ``out`` locally.
     """
-    ckpts = [f"{checkpoint}#{k}" for k in range(agents)]
     names = [b.strip() for b in bots.split(",") if b.strip()]
-    path = out or f"eval-{_label(checkpoint).replace('/', '-')}-{seed}.jsonl"
-    results = _measure(ckpts, names, deals, seed, workers, path, pre_play, None,
-                       gpu)
-    if results is None:
+    name = out or f"eval-{_label(checkpoint).replace('/', '-')}-{seed}.jsonl"
+    if remote:
+        name = os.path.basename(name)
+        call = population_job.spawn(checkpoint, agents, names, deals, seed, workers,
+                                    name, pre_play, gpu)
+        print(f"spawned {call.object_id}: {RUNS}/{name} (+ .summary.json)\n"
+              f"  fetch: modal volume get tractor-rl /evals/runs/{name} <dir>\n"
+              f"         modal volume get tractor-rl /evals/runs/{name}.summary.json <dir>")
         return
-    ranked = _report(ckpts, names, results, paired=False)
-    summary = {"checkpoint": checkpoint, "deals": deals, "seed": seed,
-               "pre_play": pre_play, "bots": names, "ranked": ranked}
-    with open(path + ".summary.json", "w") as fh:
-        json.dump(summary, fh, indent=2)
-    print(f"raw results: {path}\nranking: {path}.summary.json")
+    if _population(checkpoint, agents, names, deals, seed, workers, name, pre_play,
+                   gpu) is not None:
+        print(f"raw results: {name}\nranking: {name}.summary.json")
