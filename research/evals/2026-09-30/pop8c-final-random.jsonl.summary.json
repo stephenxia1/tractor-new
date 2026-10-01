@@ -1,0 +1,166 @@
+{
+  "checkpoint": "/vol/pop8c/checkpoints/final.pt",
+  "deals": 770,
+  "seed": 20260923,
+  "pre_play": "random",
+  "bots": [
+    "smart",
+    "smart-v18",
+    "smart-v28",
+    "smart-v34"
+  ],
+  "ranked": [
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#5",
+      "win": 0.537012987012987,
+      "win_ci": [
+        0.5245611182776775,
+        0.5494648557482966
+      ],
+      "levels": 0.0797077922077922,
+      "levels_half": 0.020671276427322072,
+      "points": 2.926948051948052,
+      "points_half": 0.7876570406531622,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#2",
+      "win": 0.5050324675324676,
+      "win_ci": [
+        0.492546973238525,
+        0.5175179618264101
+      ],
+      "levels": 0.02954545454545455,
+      "levels_half": 0.020395167268861633,
+      "points": 1.1810064935064934,
+      "points_half": 0.80304332750478,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#3",
+      "win": 0.4943181818181818,
+      "win_ci": [
+        0.4818328612744172,
+        0.5068035023619464
+      ],
+      "levels": -0.03295454545454546,
+      "levels_half": 0.02137346903688019,
+      "points": -1.1899350649350648,
+      "points_half": 0.841115558594983,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#4",
+      "win": 0.4777597402597403,
+      "win_ci": [
+        0.4652859716295622,
+        0.49023350888991835
+      ],
+      "levels": -0.11509740259740259,
+      "levels_half": 0.020136448735648498,
+      "points": -5.008928571428571,
+      "points_half": 0.8211914597908563,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#1",
+      "win": 0.4699675324675325,
+      "win_ci": [
+        0.4575039497707201,
+        0.48243111516434484
+      ],
+      "levels": -0.11428571428571428,
+      "levels_half": 0.020818025254681655,
+      "points": -4.640422077922078,
+      "points_half": 0.7904372524382537,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#0",
+      "win": 0.4625,
+      "win_ci": [
+        0.4500490400039775,
+        0.47495095999602255
+      ],
+      "levels": -0.11834415584415584,
+      "levels_half": 0.02060765853247555,
+      "points": -4.375811688311688,
+      "points_half": 0.843359710348098,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#6",
+      "win": 0.4599025974025974,
+      "win_ci": [
+        0.4474566858459589,
+        0.47234850895923597
+      ],
+      "levels": -0.12126623376623376,
+      "levels_half": 0.02072677396738058,
+      "points": -4.597402597402597,
+      "points_half": 0.8169352417281103,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c/checkpoints/final.pt#7",
+      "win": 0.4305194805194805,
+      "win_ci": [
+        0.4181544960566465,
+        0.44288446498231454
+      ],
+      "levels": -0.24188311688311687,
+      "levels_half": 0.020235054187052494,
+      "points": -9.65340909090909,
+      "points_half": 0.8151460735168282,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    }
+  ]
+}
