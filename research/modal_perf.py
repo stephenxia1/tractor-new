@@ -2957,3 +2957,129 @@ def diag_burial(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
     call = diag_burial_h100.spawn(checkpoint, hands, workers,
                                   [int(a) for a in focus.split(",")])
     print(f"spawned {call.object_id}; result -> /vol/bench/diag-burial-*.json")
+
+
+# --- burials to look at --------------------------------------------------------
+
+
+def _sample_burials(checkpoint: str, hands: int, seed: int, out_path: str | None) -> dict:
+    """Hands dealt and declared as training does, and for each landlord's
+    33 cards the burial its agent's network picks greedily (what the
+    evals play), one it samples (what training plays) and the heuristic's,
+    each with the shared critic's value of the play start from the
+    landlord's seat -- the burial policy's reward."""
+    import json
+    import os
+
+    import numpy as np
+    import torch
+
+    import tractor.train.starts as S
+    from tractor.nn.features import Cache
+    from tractor.rules.cards import POINTS
+    from tractor.sim.bury import BuryConfig, heuristic_burial
+    from tractor.train.declare_loop import DeclareTrainConfig
+    from tractor.train.population import (
+        PopulationConfig, build_agents, build_critic, hand_agents, load_agents, load_critic,
+        seating,
+    )
+
+    dev = torch.device("cuda")
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = PopulationConfig(**blob["config"])
+    bury_cfg = BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider,
+                          evaluator=cfg.bury_evaluator, worlds=cfg.bury_worlds)
+    declare_cfg = DeclareTrainConfig(**{
+        **cfg.declare,
+        "pre": S.PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial="policy"),
+    })
+    agents = build_agents(cfg, dev, declare_cfg)
+    critic = build_critic(cfg, dev)
+    load_critic(critic, blob)
+    step = load_agents(agents, blob)
+    del blob
+    nets = [a.net.eval() for a in agents]
+    table = seating(cfg.seed, step // cfg.reshuffle_every, cfg.agents)
+    seat_of = hand_agents(table, hands)
+
+    # The burial calls' inputs, kept so the same pools can be buried again.
+    calls = []
+    real = S.policy_burials
+
+    def keeping(net, pools, ctxs, standings, rng, *args, **kw):
+        calls.append((net, list(pools), list(ctxs), list(standings), kw.get("others")))
+        return real(net, pools, ctxs, standings, rng, *args, **kw)
+
+    S.policy_burials = keeping
+    rng = np.random.default_rng(seed)
+    pre = S.PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial="policy",
+                          greedy_bury=True)
+    starts, _rows, _st = S.make_starts(
+        rng, hands, nets, [a.declare.net for a in agents], dev, pre=pre, cache=Cache(),
+        bury_net=[a.bury.net for a in agents], agents=seat_of)
+    S.policy_burials = real
+
+    # Each recorded pool back to its hand: the pool is the landlord's kept
+    # hand plus the burial it made.
+    rows = [None] * hands
+    for net, pools, ctxs, standings, others in calls:
+        sampled, _ = real(net, pools, ctxs, standings, np.random.default_rng(seed + 1), dev,
+                          greedy=False, others=others)
+        for j, pool in enumerate(pools):
+            ctx = ctxs[j]
+            i = next(k for k, s in enumerate(starts) if rows[k] is None and np.array_equal(
+                s.hands[s.landlord].astype(np.int64) + s.kitty.astype(np.int64),
+                np.asarray(pool, dtype=np.int64)))
+            rows[i] = {"pool": np.asarray(pool, dtype=np.int64), "standing": standings[j],
+                       "sampled": sampled[j].astype(np.int64),
+                       "heuristic": heuristic_burial(np.asarray(pool), ctx).astype(np.int64)}
+
+    def start_with(s, burial):
+        hands_ = s.hands.astype(np.int8).copy()
+        pool = s.hands[s.landlord].astype(np.int64) + s.kitty.astype(np.int64)
+        hands_[s.landlord] = (pool - burial).astype(np.int8)
+        return S.Start(hands=hands_, kitty=burial.astype(np.int8), landlord=s.landlord,
+                       level_rank=s.level_rank, trump_suit=s.trump_suit)
+
+    values = {}
+    for kind in ("greedy", "sampled", "heuristic"):
+        batch = [start_with(s, s.kitty.astype(np.int64) if kind == "greedy" else rows[i][kind])
+                 for i, s in enumerate(starts)]
+        v = S.critic_values(nets, batch, dev, agents=seat_of, shared=critic.critic)
+        values[kind] = [float(v[i, s.landlord]) for i, s in enumerate(starts)]
+
+    out = {"checkpoint": checkpoint, "step": step, "seed": seed, "hands": []}
+    for i, s in enumerate(starts):
+        r = rows[i]
+        out["hands"].append({
+            "landlord": int(s.landlord), "agent": int(seat_of[i, s.landlord]),
+            "level_rank": int(s.level_rank), "trump_suit": int(s.trump_suit),
+            "standing_tier": int(r["standing"][0]), "declarer_rel": int(r["standing"][1]),
+            "pool": r["pool"].tolist(),
+            "greedy": s.kitty.astype(np.int64).tolist(),
+            "sampled": r["sampled"].tolist(), "heuristic": r["heuristic"].tolist(),
+            "points": {k: int((np.asarray(b) * POINTS).sum()) for k, b in
+                       (("greedy", s.kitty), ("sampled", r["sampled"]),
+                        ("heuristic", r["heuristic"]))},
+            "critic": {k: values[k][i] for k in values},
+        })
+    if out_path:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as fh:
+            json.dump(out, fh)
+        volume.commit()
+    return out
+
+
+@app.function(image=image, gpu="A10G", volumes={VOLUME: volume}, timeout=3600,
+              cpu=8.0, memory=32768)
+def sample_burials_a10g(checkpoint: str, hands: int, seed: int) -> dict:
+    name = checkpoint.split("/")[-3] + "-" + checkpoint.split("/")[-1].replace(".pt", "")
+    return _sample_burials(checkpoint, hands, seed, f"{VOLUME}/bench/burials-{name}.json")
+
+
+@app.local_entrypoint()
+def sample_burials(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
+                   hands: int = 256, seed: int = 7) -> None:
+    call = sample_burials_a10g.spawn(checkpoint, hands, seed)
+    print(f"spawned {call.object_id}; result -> /vol/bench/burials-*.json")
