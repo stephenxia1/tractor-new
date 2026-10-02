@@ -44,6 +44,10 @@ VOLUME = modal_train.VOLUME
 # -v9 search on the true deal and are left out; see `LADDER` in
 # tractor/eval/bots.py.
 SMART = ("smart", "smart-v18", "smart-v28", "smart-v34")
+# GPU containers a measurement may hold at once: the workspace's limit of
+# 10. A training run's GPU counts against the same limit, so set
+# TRACTOR_EVAL_GPUS=9 beside one (or the eval queues behind it).
+GPUS = int(os.environ.get("TRACTOR_EVAL_GPUS", "10"))
 Z95 = 1.959963984540054
 
 # Where each pair's result is kept, keyed by everything that defines it.
@@ -168,7 +172,7 @@ def play(checkpoint: str, bot: str, deals: int, seed: int,
 # keeps one launch from taking the device a training run needs. Pairs
 # past the cap wait their turn rather than fail.
 @app.function(image=image, volumes={VOLUME: volume}, gpu="A10G", cpu=32.0,
-              memory=32768, timeout=8 * 3600, max_containers=8)
+              memory=32768, timeout=8 * 3600, max_containers=GPUS)
 def play_gpu(checkpoint: str, bot: str, deals: int, seed: int,
              workers: int, pre_play: str, search: dict | None) -> dict:
     return _play(checkpoint, bot, deals, seed, workers, pre_play, search, "cuda")
@@ -396,7 +400,7 @@ def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
     declarations and learned burial). Each agent's win rate, levels and
     points against each bot and over the ladder, and the agents ranked;
     the ranking also lands in ``<out>.summary.json``. At the defaults,
-    32 pairs on up to eight A10Gs: about an hour and a half.
+    32 pairs on up to ten A10Gs (`TRACTOR_EVAL_GPUS`): about an hour.
 
     By default the whole measurement runs on Modal (``population_job``)
     and this returns at once; ``--no-remote`` runs the old way, the

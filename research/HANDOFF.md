@@ -448,7 +448,7 @@ nothing.
    **Evaluating it.** Every agent against the whole ladder -- the four
    fair bots, 770 deals each, the full hand as trained -- with win rate,
    levels and points per bot and pooled, and the agents ranked (about
-   1.5 h on up to eight A10Gs). It runs on Modal end to end
+   about an hour on up to ten A10Gs). It runs on Modal end to end
    (`population_job`, since 2026-09-30): the command returns at once, the
    record and ranking land in `/vol/evals/runs/<out>` and
    `<out>.summary.json` (fetch with `modal volume get`), failed pairs are
