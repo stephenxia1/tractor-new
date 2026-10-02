@@ -4,11 +4,12 @@
 """
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, r"C:\Users\xiast\OneDrive\Documents\GitHub\tractor-new\research\py")
-from tractor.rules.cards import POINTS, RANK_NAMES, Ctx, card_name  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "py"))
+from tractor.rules.cards import RANK_NAMES, Ctx, card_name  # noqa: E402
 
 SYM = {"S": "♠", "H": "♥", "D": "♦", "C": "♣"}
 SUIT_ORDER = ["S", "H", "D", "C"]
@@ -56,7 +57,6 @@ def main():
         print("33 cards:  " + grouped(pool, ctx))
         for kind in ("greedy", "sampled", "heuristic"):
             b = np.array(h[kind])
-            kept = pool - b
             label = {"greedy": "policy (greedy, as evaluated)", "sampled": "policy (sampled, as trained)",
                      "heuristic": "heuristic"}[kind]
             print(f"  {label:31} buries: {' '.join(name(t) for t in sorted(cards_of(b), key=lambda t: (not ctx.is_trump[t], card_name(t)[-1], -float(ctx.strength[t]))))}"
