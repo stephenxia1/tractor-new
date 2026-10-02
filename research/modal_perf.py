@@ -2729,3 +2729,231 @@ def diag_kl(checkpoint: str = "/vol/pop8b/checkpoints/step_0000400.pt", hands: i
             workers: int = 16, focus: str = "6,5,0") -> None:
     call = diag_kl_h100.spawn(checkpoint, hands, workers, [int(a) for a in focus.split(",")])
     print(f"spawned {call.object_id}; result -> /vol/bench/diag-kl-*.json")
+
+
+# --- what the randomly buried fifth of the hands does to the update ----------
+
+
+def _diag_burial(checkpoint: str, hands: int, workers: int, focus: list,
+                 out_path: str | None) -> dict:
+    """A fifth of play starts are buried at random (``random_burial_frac``)
+    so the shared critic stays accurate off the burial policy's path. They
+    leave ~15 points in the kitty where the policy leaves ~0.3, and the
+    kitty's multiplier makes them the hands with the largest returns. Do
+    they dominate the update? From a checkpoint, one round collected as
+    the run does, with which hands were buried at random known (the starts
+    are made in two parts, random then the policy's):
+
+    1. Per agent and per kind of hand: rows, the returns' size, the share
+       of the advantages' square sum, and the critic's error.
+    2. For the ``focus`` agents, one update with no KL guard on the host,
+       recording every minibatch's KL and its share of random-burial rows;
+       then the policy's movement (KL from the rollout's log-probabilities)
+       on each kind of hand. Again with the random-burial rows left out of
+       the update, to see what the rest moves on its own.
+    """
+    import copy
+    import json
+    import os
+    import time
+
+    import numpy as np
+    import torch
+
+    from tractor.nn.features import Cache
+    from tractor.sim.bury import BuryConfig
+    from tractor.train.buffer import RolloutBuffer
+    from tractor.train.declare_loop import DeclareTrainConfig
+    from tractor.train.gae import compute_gae
+    from tractor.train.parallel import RolloutPool
+    from tractor.train.population import (
+        PopulationConfig, agent_model_config, build_agents, build_critic, hand_agents,
+        load_agents, load_critic, seating,
+    )
+    from tractor.train.ppo import _MAX_LOG_RATIO, PPOConfig, PPOLearner
+    from tractor.train.starts import PrePlayConfig, make_starts
+
+    dev = torch.device("cuda")
+    out: dict = {"checkpoint": checkpoint, "gpu": torch.cuda.get_device_name(0)}
+
+    def save() -> None:
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2, default=float)
+            volume.commit()
+
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = PopulationConfig(**blob["config"])
+    bury_cfg = BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider,
+                          evaluator=cfg.bury_evaluator, worlds=cfg.bury_worlds)
+    burial = "policy" if cfg.bury_policy else "climb"
+    declare_cfg = DeclareTrainConfig(**{
+        **cfg.declare,
+        "pre": PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial=burial),
+    })
+    agents = build_agents(cfg, dev, declare_cfg)
+    critic = build_critic(cfg, dev)
+    load_critic(critic, blob)
+    step = load_agents(agents, blob)
+    saved_opt = [copy.deepcopy(s["optimizer"]) for s in blob["agents"]]
+    del blob
+    mcfg = agent_model_config(cfg)
+    nets = [a.net for a in agents]
+    for net in nets:
+        net.eval()
+    table = seating(cfg.seed, step // cfg.reshuffle_every, cfg.agents)
+    seat_of = hand_agents(table, hands)
+    n_random = int(round(hands * cfg.random_burial_frac))
+    out.update({"step": step, "focus": focus, "random_hands": n_random, "hands": hands})
+    print(f"step {step}, {n_random} of {hands} hands buried at random", flush=True)
+
+    # -- the round: hands [0, n_random) buried at random, the rest by policy --
+    rng = np.random.default_rng([cfg.seed, step, 11])
+    cache = Cache()
+    declare_nets = [a.declare.net for a in agents]
+    bury_nets = None if agents[0].bury is None else [a.bury.net for a in agents]
+
+    def starts_for() -> list:
+        parts = []
+        for lo, hi, frac in ((0, n_random, 1.0), (n_random, hands, 0.0)):
+            pre = PrePlayConfig(random_burial_frac=frac, bury=bury_cfg, burial=burial)
+            got, _r, st = make_starts(rng, hi - lo, nets, declare_nets, dev, pre=pre,
+                                      cache=cache, bury_net=bury_nets,
+                                      agents=seat_of[lo:hi])
+            parts.append((got, st))
+        out.setdefault("kitty_points", [st.get("bury/kitty_points") for _g, st in parts])
+        return parts[0][0] + parts[1][0]
+
+    buf = RolloutBuffer(hands * 100, mcfg)
+    with RolloutPool(cfg=mcfg, workers=workers, hands_per_round=hands) as pool:
+        for rep in range(2):  # the first compiles; the second is the round
+            starts = starts_for()
+            t0 = time.perf_counter()
+            buf, _stats = pool.collect(
+                nets, rng, buf, n_hands=hands, device=dev, pool=cfg.pool, amp=True,
+                level_weight=0.0, agents=seat_of, critic=critic.critic, overlap=True,
+                starts=starts, forwards="compiled")
+            print(f"  round {rep}: {len(buf)} rows in {time.perf_counter() - t0:.0f}s",
+                  flush=True)
+    print(f"  kitty points buried (random, policy): {out['kitty_points']}", flush=True)
+    compute_gae(buf, gamma=cfg.gamma, lam=cfg.lam)
+    n = len(buf)
+    owner = seat_of[buf.episode[:n], buf.seat[:n]]
+    rand = buf.episode[:n] < n_random
+
+    # -- 1. the rows, the returns, the advantages, the critic's error ---------
+    def kinds(a: int) -> dict:
+        rows = owner == a
+        adv = buf.advantage[:n][rows]
+        z = (adv - adv.mean()) / (adv.std() + 1e-8)
+        res = {}
+        for name, m in (("random", rand[rows]), ("policy", ~rand[rows])):
+            ret = buf.ret[:n][rows][m]
+            val = buf.value[:n][rows][m]
+            res[name] = {
+                "rows": int(m.sum()),
+                "row_share": float(m.mean()),
+                "mean_abs_return": float(np.abs(ret).mean()),
+                "return_var": float(ret.var()),
+                "frac_abs_return_over_1": float((np.abs(ret) > 1).mean()),
+                "adv_sq_share": float((z[m] ** 2).sum() / (z ** 2).sum()),
+                "critic_mse": float(((val - ret) ** 2).mean()),
+                "critic_ev": float(1 - ((val - ret) ** 2).mean() / max(ret.var(), 1e-12)),
+            }
+        print(f"  agent {a}: random rows {res['random']['row_share']:.2f} carry "
+              f"{res['random']['adv_sq_share']:.2f} of the advantages' squares; "
+              f"|return| {res['random']['mean_abs_return']:.3f} vs "
+              f"{res['policy']['mean_abs_return']:.3f}; critic mse "
+              f"{res['random']['critic_mse']:.4f} vs {res['policy']['critic_mse']:.4f}, ev "
+              f"{res['random']['critic_ev']:.3f} vs {res['policy']['critic_ev']:.3f}",
+              flush=True)
+        return res
+
+    out["kinds"] = {str(a): kinds(a) for a in range(cfg.agents)}
+    save()
+
+    # -- 2. one unguarded update, and where the policy moved -------------------
+    host_cfg = replace_cfg(PPOConfig(**cfg.ppo), compile=False, cuda_graphs=False,
+                           fixed_shapes=True, target_kl=None)
+
+    def moved(net, rows) -> dict:
+        res = {}
+        for name, m in (("random", rand[rows]), ("policy", ~rand[rows])):
+            idx_all = rows.nonzero()[0][m]
+            d = np.empty(len(idx_all))
+            for lo in range(0, len(idx_all), 1024):
+                idx = idx_all[lo: lo + 1024]
+                obs, _p, sc = buf.as_torch(idx, dev)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    lp = net.actor(obs).log_probs.float()
+                act = sc["action"].to(dev).long()[:, None]
+                d[lo: lo + len(idx)] = (lp.gather(1, act).squeeze(1).cpu().numpy()
+                                        - buf.logp[idx])
+            lr = np.clip(d, -_MAX_LOG_RATIO, _MAX_LOG_RATIO)
+            res[name] = float(np.mean(np.expm1(lr) - lr))
+        return res
+
+    def update(a: int, use: np.ndarray) -> dict:
+        net = copy.deepcopy(nets[a]).train()
+        learner = PPOLearner(net, host_cfg, dev)
+        learner.opt.load_state_dict(saved_opt[a])
+        rec: list = []
+        losses = learner._losses
+
+        def recording(obs, privileged, batch, *args, _losses=losses, **kw):
+            loss, parts = _losses(obs, privileged, batch, *args, **kw)
+            ep = batch["episode"].cpu().numpy()
+            rec.append((float(parts["approx_kl"]), float((ep < n_random).mean())))
+            return loss, parts
+
+        learner._losses = recording
+        torch.manual_seed(202)
+        m = learner.update(buf, rows=np.nonzero(use)[0])
+        kl = np.array([k for k, _f in rec])
+        fr = np.array([f for _k, f in rec])
+        tenth = max(1, len(kl) // 10)
+        heavy = fr > np.median(fr)
+        net.eval()
+        res = {
+            "approx_kl": m["approx_kl"], "ratio_clamped": m["ratio_clamped"],
+            "minibatches": int(len(kl)),
+            "kl_by_tenth": [float(kl[i: i + tenth].mean()) for i in range(0, len(kl), tenth)],
+            "kl_max": float(kl.max()),
+            "first_over_0.15": int(np.argmax(kl > 0.15)) if (kl > 0.15).any() else -1,
+            "corr_kl_random_share": float(np.corrcoef(kl, fr)[0, 1]) if fr.std() > 0 else None,
+            "kl_mean_random_heavy_minibatches": float(kl[heavy].mean()) if heavy.any() else None,
+            "kl_mean_random_light_minibatches": float(kl[~heavy].mean()) if (~heavy).any() else None,
+            "moved": moved(net, owner == a),
+        }
+        return res
+
+    out["update"] = {}
+    for a in focus:
+        rows = owner == a
+        res = {"all rows": update(a, rows), "without random-burial rows": update(a, rows & ~rand)}
+        for name, r in res.items():
+            print(f"  agent {a} {name:28}: kl {r['approx_kl']:.4g} max {r['kl_max']:.3g} "
+                  f"by tenth {np.round(r['kl_by_tenth'], 3).tolist()} first>0.15 "
+                  f"{r['first_over_0.15']}/{r['minibatches']}; moved on random hands "
+                  f"{r['moved']['random']:.4g}, on policy hands {r['moved']['policy']:.4g}; "
+                  f"corr(kl, random share) {r['corr_kl_random_share']}", flush=True)
+        out["update"][str(a)] = res
+        save()
+    return out
+
+
+@app.function(image=image, gpu="H100", volumes={VOLUME: volume}, timeout=2 * 3600,
+              cpu=20.0, memory=98304)
+def diag_burial_h100(checkpoint: str, hands: int, workers: int, focus: list) -> dict:
+    name = checkpoint.split("/")[-3] + "-" + checkpoint.split("/")[-1].replace(".pt", "")
+    return _diag_burial(checkpoint, hands, workers, focus,
+                        f"{VOLUME}/bench/diag-burial-{name}.json")
+
+
+@app.local_entrypoint()
+def diag_burial(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
+                hands: int = 4096, workers: int = 16, focus: str = "3,1,7,0") -> None:
+    call = diag_burial_h100.spawn(checkpoint, hands, workers,
+                                  [int(a) for a in focus.split(",")])
+    print(f"spawned {call.object_id}; result -> /vol/bench/diag-burial-*.json")
