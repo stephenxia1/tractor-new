@@ -1159,6 +1159,20 @@ crosses 0.05 within a few dozen steps. So 0.05 cut the learning roughly
 fourfold. Entropy kept falling (0.40 -> 0.37), the critic's loss rose
 (0.0016 -> 0.0017).
 
+Ladder at step 1300 (`evals/2026-09-30/pop8c-final-*`): the population's
+mean went from -9.0 points at step 500 to -3.2 with random pre-play
+(-10.1 to -3.5 with its own), the best agent to +2.9 (0.537 win) and
++0.9 (0.500). Whether the guard helped is not separable from that: the
+gain spans 400 unguarded and 400 guarded steps (`pop8b` step 900 is kept
+to split them).
+
+**Continued to step 2800 with the guard at 0.15** (2026-10-01, the
+user's call). Updates stopped early 56% of the time and took 58% of
+their minibatches (agents from 20%, agent 3, to 84%); no update's KL
+passed 0.086, none went without a step, and 37 single minibatches that
+had jumped past KL 1 (up to 3.7) were refused. Entropy held (0.38 ->
+0.37); the critic's loss kept rising (0.0017 -> 0.0023).
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
