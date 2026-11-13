@@ -130,6 +130,44 @@ raw bytes precisely so featurisation can move onto the device.
 
 ---
 
+## Running on Modal
+
+`modal_app.py` runs any script under `py/` or `src/` on a large Modal CPU
+container, started and watched over plain HTTPS. That way a client that
+cannot speak gRPC (the Modal CLI's protocol) can still drive it. Each job
+clones a branch of this repo when it starts, so pushing code never needs a
+redeploy. `checkpoints/`, `runs/` and each job's log live on the
+`tractor-runs` Volume. A restarted `train2.py` job resumes from its own
+latest checkpoint.
+
+One-time setup, from a machine with the Modal CLI (`pip install modal`, then
+`modal setup`):
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"      # keep this value
+modal secret create tractor-control TRACTOR_CONTROL_TOKEN=<that value>
+modal volume create tractor-runs
+modal volume put tractor-runs <path>/v2_latest.pt checkpoints/v2_latest.pt
+modal deploy research/modal_app.py      # prints https://<workspace>--tractor-control.modal.run
+```
+
+Then, with `URL` that address and `TOKEN` the value above:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"ref":"claude/adoring-sagan-s6vwwp","script":"py/sweep_throughput.py","args":[]}' $URL/jobs
+curl -H "Authorization: Bearer $TOKEN" $URL/jobs                  # list, with status
+curl -H "Authorization: Bearer $TOKEN" "$URL/jobs/<id>?lines=100"  # status + log tail
+curl -H "Authorization: Bearer $TOKEN" "$URL/files?prefix=checkpoints"
+curl -H "Authorization: Bearer $TOKEN" -O "$URL/file?path=runs/<run>.jsonl"
+curl -X POST -H "Authorization: Bearer $TOKEN" $URL/jobs/<id>/cancel
+```
+
+A job defaults to 16 CPUs and 32 GB; pass `"cpu"` and `"memory_mb"` to
+change that. Branches allowed: `main`, `rl-research`, `claude/...`.
+
+---
+
 ## Design notes
 
 **Episodes are single hands.** Landlord seat and both team levels are
