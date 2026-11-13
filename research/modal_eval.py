@@ -62,15 +62,21 @@ RUNS = f"{RESULTS}/runs"
 
 
 def _key(checkpoint: str, bot: str, deals: int, seed: int, pre_play: str,
-         search: dict | None) -> str:
+         search: dict | None, candidates: str = "host") -> str:
     import hashlib
 
-    spec = json.dumps([checkpoint, bot, deals, seed, pre_play, search], sort_keys=True)
+    # `candidates` joins the spec only when it is not the engine's list, so
+    # every result stored before the option existed keeps its key.
+    parts = [checkpoint, bot, deals, seed, pre_play, search]
+    if candidates != "host":
+        parts.append(candidates)
+    spec = json.dumps(parts, sort_keys=True)
     return hashlib.sha1(spec.encode()).hexdigest()[:16]
 
 
 def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
-          pre_play: str, search: dict | None, device: str) -> dict:
+          pre_play: str, search: dict | None, device: str,
+          candidates: str = "host") -> dict:
     import time
 
     import torch
@@ -122,16 +128,18 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
                                  if pre_play == "agent-critic" else
                                  BuryConfig(
                                      rounds=0 if pre_play == "agent-heur" else 8,
-                                     consider=12)))
+                                     consider=12)),
+                             candidates=candidates)
     stats["seconds"] = time.perf_counter() - started
     stats["checkpoint"] = checkpoint
     stats["bot"] = bot
     stats["pre_play"] = pre_play
     stats["search"] = search
+    stats["candidates"] = candidates
     stats["declare_net"] = declare_net is not None
     stats["seed"] = seed
     os.makedirs(RESULTS, exist_ok=True)
-    key = _key(checkpoint, bot, deals, seed, pre_play, search)
+    key = _key(checkpoint, bot, deals, seed, pre_play, search, candidates)
     with open(f"{RESULTS}/{key}.json", "w") as fh:
         json.dump(stats, fh)
     volume.commit()
@@ -156,8 +164,10 @@ def fetch(keys: list) -> list:
 @app.function(image=image, volumes={VOLUME: volume}, cpu=32.0,
               memory=32768, timeout=4 * 3600)
 def play(checkpoint: str, bot: str, deals: int, seed: int,
-         workers: int, pre_play: str, search: dict | None) -> dict:
-    return _play(checkpoint, bot, deals, seed, workers, pre_play, search, "cpu")
+         workers: int, pre_play: str, search: dict | None,
+         candidates: str = "host") -> dict:
+    return _play(checkpoint, bot, deals, seed, workers, pre_play, search, "cpu",
+                 candidates)
 
 
 # Search needs the GPU. A searched decision is tens of forward rows, and
@@ -174,8 +184,10 @@ def play(checkpoint: str, bot: str, deals: int, seed: int,
 @app.function(image=image, volumes={VOLUME: volume}, gpu="A10G", cpu=32.0,
               memory=32768, timeout=8 * 3600, max_containers=GPUS)
 def play_gpu(checkpoint: str, bot: str, deals: int, seed: int,
-             workers: int, pre_play: str, search: dict | None) -> dict:
-    return _play(checkpoint, bot, deals, seed, workers, pre_play, search, "cuda")
+             workers: int, pre_play: str, search: dict | None,
+             candidates: str = "host") -> dict:
+    return _play(checkpoint, bot, deals, seed, workers, pre_play, search, "cuda",
+                 candidates)
 
 
 def _label(path: str) -> str:
@@ -188,7 +200,7 @@ def _label(path: str) -> str:
 
 def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
              path: str, pre_play: str, search: dict | None,
-             gpu: bool = False, on_write=None) -> dict | None:
+             gpu: bool = False, on_write=None, candidates: str = "host") -> dict | None:
     """Every (checkpoint, bot) pair, measured or read back. -> the results,
     or None while some pair is still unmeasured. ``on_write`` runs after
     each write to ``path`` (a volume commit, on Modal)."""
@@ -211,12 +223,14 @@ def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
                 r = json.loads(line)
                 if (r["deals"] == deals
                         and r.get("pre_play", "bot") == pre_play
-                        and r.get("search") == search):
+                        and r.get("search") == search
+                        and r.get("candidates", "host") == candidates):
                     results[(r["checkpoint"], r["bot"])] = r
     # Results a previous client asked for and never received are on the
     # volume; take them before measuring anything again.
     missing = [p for p in pairs if p not in results]
-    stored = fetch.remote([_key(c, b, deals, seed, pre_play, search) for c, b in missing])
+    stored = fetch.remote([_key(c, b, deals, seed, pre_play, search, candidates)
+                           for c, b in missing])
     with open(path, "a") as fh:
         for (c, b), r in zip(missing, stored):
             if r is not None:
@@ -226,10 +240,10 @@ def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
     todo = [p for p in pairs if p not in results]
     print(f"{len(pairs)} pairs, {len(pairs) - len(todo)} already measured, "
           f"{deals} deals each, seed {seed}, pre-play {pre_play}, "
-          f"search {search}")
+          f"search {search}, candidates from {candidates}")
 
     with open(path, "a") as fh:
-        for r in fn.starmap([(c, b, deals, seed, workers, pre_play, search)
+        for r in fn.starmap([(c, b, deals, seed, workers, pre_play, search, candidates)
                                  for c, b in todo],
                               order_outputs=False, return_exceptions=True):
             if isinstance(r, BaseException):
@@ -323,18 +337,24 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
           seed: int = 20260923, workers: int = 32, out: str = "",
           pre_play: str = "random", search_worlds: int = 0,
           search_top: int = 3, search_extra_tricks: int = 0,
-          search_confident: float = 0.9, gpu: bool = False) -> None:
+          search_confident: float = 0.9, gpu: bool = False,
+          candidates: str = "host") -> None:
     # `--search-worlds 0` is the plain policy, on CPU as before.
+    # `--candidates sim`: the network chooses from the simulator's list,
+    # the one it trained on, rather than the engine's (README, *Which
+    # follows the network is shown*). Stored apart from `host` results.
     search = None
     if search_worlds > 0:
         search = {"worlds": search_worlds, "top_k": search_top,
                   "extra_tricks": search_extra_tricks,
                   "confident": search_confident}
+    if candidates not in ("host", "sim"):
+        raise ValueError(f"--candidates is host or sim, not {candidates!r}")
     ckpts = [c.strip() for c in checkpoints.split(",") if c.strip()]
     names = [b.strip() for b in bots.split(",") if b.strip()]
     path = out or f"eval-smart-{seed}.jsonl"
     results = _measure(ckpts, names, deals, seed, workers, path, pre_play, search,
-                       gpu)
+                       gpu, candidates=candidates)
     if results is None:
         return
     _report(ckpts, names, results, paired=True)
@@ -343,18 +363,19 @@ def smart(checkpoints: str, bots: str = ",".join(SMART), deals: int = 770,
 
 def _population(checkpoint: str, agents: int, names: list, deals: int, seed: int,
                 workers: int, path: str, pre_play: str, gpu: bool,
-                on_write=None) -> list | None:
+                on_write=None, candidates: str = "host") -> list | None:
     """Measure and rank a population's agents; the record at ``path``, the
     ranking at ``<path>.summary.json``. -> the ranking, or None while some
     pair is unmeasured."""
     ckpts = [f"{checkpoint}#{k}" for k in range(agents)]
     results = _measure(ckpts, names, deals, seed, workers, path, pre_play, None,
-                       gpu, on_write)
+                       gpu, on_write, candidates)
     if results is None:
         return None
     ranked = _report(ckpts, names, results, paired=False)
     summary = {"checkpoint": checkpoint, "deals": deals, "seed": seed,
-               "pre_play": pre_play, "bots": names, "ranked": ranked}
+               "pre_play": pre_play, "candidates": candidates, "bots": names,
+               "ranked": ranked}
     with open(path + ".summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
     (on_write or (lambda: None))()
@@ -364,7 +385,8 @@ def _population(checkpoint: str, agents: int, names: list, deals: int, seed: int
 @app.function(image=image, volumes={VOLUME: volume}, timeout=86400, cpu=1.0,
               memory=2048)
 def population_job(checkpoint: str, agents: int, names: list, deals: int, seed: int,
-                   workers: int, out: str, pre_play: str, gpu: bool) -> list:
+                   workers: int, out: str, pre_play: str, gpu: bool,
+                   candidates: str = "host") -> list:
     """``population`` run on Modal, start to finish: the pairs fan out
     from here, and the record and ranking go to ``/vol/evals/runs/<out>``.
     Nothing local has to stay up -- three times a local client's sleep or
@@ -375,7 +397,8 @@ def population_job(checkpoint: str, agents: int, names: list, deals: int, seed: 
     path = f"{RUNS}/{out}"
     for attempt in range(3):
         ranked = _population(checkpoint, agents, names, deals, seed, workers, path,
-                             pre_play, gpu, on_write=volume.commit)
+                             pre_play, gpu, on_write=volume.commit,
+                             candidates=candidates)
         if ranked is not None:
             return ranked
         print(f"attempt {attempt + 1}: some pairs unmeasured; measuring them again")
@@ -386,7 +409,8 @@ def population_job(checkpoint: str, agents: int, names: list, deals: int, seed: 
 def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
                deals: int = 770, seed: int = 20260923, workers: int = 32,
                out: str = "", pre_play: str = "agent-policy",
-               gpu: bool = False, remote: bool = True) -> None:
+               gpu: bool = False, remote: bool = True,
+               candidates: str = "host") -> None:
     """Every agent of a population checkpoint against the whole ladder.
 
         modal run --detach modal_eval.py::population \\
@@ -406,16 +430,18 @@ def population(checkpoint: str, agents: int = 8, bots: str = ",".join(SMART),
     and this returns at once; ``--no-remote`` runs the old way, the
     client fanning the pairs out and writing ``out`` locally.
     """
+    if candidates not in ("host", "sim"):
+        raise ValueError(f"--candidates is host or sim, not {candidates!r}")
     names = [b.strip() for b in bots.split(",") if b.strip()]
     name = out or f"eval-{_label(checkpoint).replace('/', '-')}-{seed}.jsonl"
     if remote:
         name = os.path.basename(name)
         call = population_job.spawn(checkpoint, agents, names, deals, seed, workers,
-                                    name, pre_play, gpu)
+                                    name, pre_play, gpu, candidates)
         print(f"spawned {call.object_id}: {RUNS}/{name} (+ .summary.json)\n"
               f"  fetch: modal volume get tractor-rl /evals/runs/{name} <dir>\n"
               f"         modal volume get tractor-rl /evals/runs/{name}.summary.json <dir>")
         return
     if _population(checkpoint, agents, names, deals, seed, workers, name, pre_play,
-                   gpu) is not None:
+                   gpu, candidates=candidates) is not None:
         print(f"raw results: {name}\nranking: {name}.summary.json")

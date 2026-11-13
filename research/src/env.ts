@@ -170,6 +170,7 @@ export class GameSlot {
   private closingCursor = 0;
   private closingPasses = 0;
   private forcedLeads = 0;
+  private learnerBlocked = 0;
   private assertNoForcedLead = false;
 
   constructor(opts: SlotOptions) {
@@ -327,6 +328,44 @@ export class GameSlot {
     } finally {
       this.assertNoForcedLead = false;
     }
+  }
+
+  // Commits a learner move given as card counts per slot, the shape the
+  // Python simulator's candidates have, instead of an index into
+  // `pending.candidates`. This is how an evaluation offers the network
+  // the list it trained on (`--candidates sim`): the simulator lists the
+  // moves, and the engine's reducer still judges the one chosen, so an
+  // illegal choice stops the game exactly as before.
+  //
+  // The simulator offers throws that are possible but not provably safe,
+  // as training does, so a blocked throw here is a move the network chose
+  // knowing the risk. The engine applies the penalty (rules.md §7.6) and
+  // the block is counted rather than treated as a host fault.
+  playCounts(counts: ReadonlyArray<number>): void {
+    const pending = this.pending;
+    if (pending === null) throw new Error('no pending decision');
+    const hand = this.state.currentHand?.hands[pending.seat] ?? [];
+    const left = counts.slice();
+    const cards: Card[] = [];
+    for (const c of hand) {
+      const slot = cardSlot(c);
+      if ((left[slot] ?? 0) > 0) {
+        left[slot] = left[slot]! - 1;
+        cards.push(c);
+      }
+    }
+    if (left.some((n) => n !== 0)) {
+      throw new Error(`seat ${pending.seat} does not hold the cards it chose to play`);
+    }
+    this.pending = null;
+    const before = this.forcedLeads;
+    this.apply({ kind: 'play_cards', seat: pending.seat, cards });
+    this.learnerBlocked += this.forcedLeads - before;
+  }
+
+  // Blocked throws among the learner's own moves (`playCounts` only).
+  get learnerBlockedCount(): number {
+    return this.learnerBlocked;
   }
 
   // Positions reachable from the pending decision, for value-guided

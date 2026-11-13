@@ -113,6 +113,10 @@ type HalfResult = {
   readonly playStart: string;
   readonly episode: EpisodeSummary;
   readonly decisions: number;
+  // The learner's throws the engine blocked, which only a move sent as
+  // cards (`--candidates sim`) can produce: the host's own candidates are
+  // provably safe.
+  readonly learnerBlocked: number;
 };
 
 // The deal digest is taken right after the shuffle, so it cannot see the
@@ -150,6 +154,7 @@ async function playHand(
   readLine: () => Promise<string | null>,
 ): Promise<HalfResult> {
   let decisions = 0;
+  const blockedBefore = slot.learnerBlockedCount;
   let playStart: string | null = null;
   let declarer = -1;
   let trumpAtStart = -1;
@@ -186,6 +191,7 @@ async function playHand(
       return {
         digest: episode.dealDigest, playStart, episode, decisions,
         declarer, trumpSuit: trumpAtStart, kittyPoints,
+        learnerBlocked: slot.learnerBlockedCount - blockedBefore,
       };
     }
 
@@ -319,11 +325,21 @@ async function playHand(
 
     const reply = await readLine();
     if (reply === null) throw new Error('client closed the stream mid-hand');
-    const parsed = JSON.parse(reply) as { t?: string; index?: number };
-    if (parsed.t !== 'choose' || typeof parsed.index !== 'number') {
-      throw new Error(`expected a choose message, got ${reply.slice(0, 120)}`);
+    // `choose` picks from the candidates above; `play` names the cards,
+    // for a client that lists moves itself (the simulator's list, which
+    // is what the network trained on). Either way the reducer judges it.
+    const parsed = JSON.parse(reply) as { t?: string; index?: number; cards?: number[] };
+    if (parsed.t === 'choose' && typeof parsed.index === 'number') {
+      slot.choose(parsed.index);
+    } else if (
+      parsed.t === 'play' &&
+      Array.isArray(parsed.cards) &&
+      parsed.cards.length === NUM_SLOTS
+    ) {
+      slot.playCounts(parsed.cards);
+    } else {
+      throw new Error(`expected a choose or play message, got ${reply.slice(0, 120)}`);
     }
-    slot.choose(parsed.index);
     decisions += 1;
   }
 }
@@ -408,6 +424,7 @@ async function main(): Promise<void> {
         declarer: result.declarer,
         trump_suit: result.trumpSuit,
         kitty_points: result.kittyPoints,
+        learner_blocked: result.learnerBlocked,
       });
     }
 

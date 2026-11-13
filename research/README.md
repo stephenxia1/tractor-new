@@ -1220,7 +1220,28 @@ counts it (`botFollowRepairs()`), leaving legal follows, and the bots'
 internal simulations, exactly as they were. `smart-v18`/`v28`/`v34` needed
 no repairs over 48 real positions with a live tractor obligation, too few
 to clear them; the guard covers them either way. Re-running the failing
-pair would confirm the fix end to end.
+pair would confirm the fix end to end; it did (2026-11-13: all 770 deals,
+0.562 win, +0.18 levels, +7.0 points, `evals/2026-11-13/`).
+
+**Evaluating on the training list** (`--candidates sim`, 2026-11-14). The
+client can list the network's moves itself, with the simulator's
+`legal_moves(cap=max_candidates)` on the rebuilt position -- the rollout's
+exact call -- and send the chosen cards (`{"t": "play", "cards": [...]}`);
+the host maps them to the seat's cards and the engine's reducer judges
+them as before. That list also carries throws that are possible but not
+provably safe, as training's does, so a blocked throw is played out with
+the engine's penalty and counted (`learner_blocked`), not raised. The
+default stays `host`, so every stored result keeps its meaning and its
+key; `sim` results are stored apart and `tab_evals.py` labels them
+`+sim`.
+
+```bash
+TRACTOR_EVAL_APP=tractor-eval-v5-sim modal run --detach modal_eval.py::smart \
+  --checkpoints /vol/v5-bury/checkpoints/final.pt --pre-play random --candidates sim
+TRACTOR_EVAL_APP=tractor-eval-pop8c-sim modal run --detach modal_eval.py::population \
+  --checkpoint /vol/pop8c/milestones/step_0002800.pt --pre-play random --candidates sim \
+  --out pop8c-2800-random-sim.jsonl
+```
 
 ## Next steps
 

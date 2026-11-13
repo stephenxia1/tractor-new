@@ -310,6 +310,9 @@ def _launcher(node: str | Sequence[str] | None) -> list[str]:
 # --- scoring one decision -------------------------------------------------
 
 
+CANDIDATE_SOURCES = ("host", "sim")
+
+
 def _greedy_index(
     net: Any,
     msg: dict,
@@ -318,16 +321,38 @@ def _greedy_index(
     device: torch.device,
     rng: np.random.Generator,
     search: SearchConfig | None = None,
-) -> tuple[int, bool]:
-    """The network's move, as an index into the host's candidate list,
-    and whether it came from a search rather than the policy alone.
+    source: str = "host",
+) -> tuple[int, bool, list[np.ndarray]]:
+    """The network's move, as an index into the candidate list it was
+    shown, whether it came from a search rather than the policy alone,
+    and that list.
+
+    ``source`` says who lists the moves. ``"host"`` is the engine's
+    ``enumerateCandidates``, sent with the message. ``"sim"`` is the
+    simulator's ``legal_moves`` on the rebuilt position -- the list the
+    network trained on, which offers follows the engine's truncates away
+    and throws that are possible but not provably safe (README, *Which
+    follows the network is shown*). The engine's reducer judges the move
+    either way.
 
     Greedy, for the same reason ``train/evaluate.py`` is: a measurement
     wants the policy's considered move, and sampling would add variance
     the duplicate pairing cannot cancel because it is not a property of
     the deal.
     """
-    candidates = [np.asarray(c, dtype=np.int8) for c in msg["candidates"]]
+    state = state_from_wire(msg)
+    seat = int(msg["seat"])
+    if int(state.to_act) != seat:
+        raise HostError(f"asked seat {seat} to act, but {int(state.to_act)} is to act")
+    if source == "sim":
+        # Exactly the rollout's call (``rollout._pack``), cap included.
+        candidates = list(state.legal_moves(cap=cfg.max_candidates).moves)
+        if not candidates:
+            raise HostError(f"the simulator found no legal move for seat {seat}")
+    elif source == "host":
+        candidates = [np.asarray(c, dtype=np.int8) for c in msg["candidates"]]
+    else:
+        raise ValueError(f"source must be one of {CANDIDATE_SOURCES}, not {source!r}")
     if len(candidates) > cfg.max_candidates:
         # The host is capped by --max-candidates and this should be
         # unreachable, but silently keeping a prefix would hide a
@@ -336,10 +361,6 @@ def _greedy_index(
             f"the host offered {len(candidates)} candidates, more than the "
             f"model's {cfg.max_candidates}"
         )
-    state = state_from_wire(msg)
-    seat = int(msg["seat"])
-    if int(state.to_act) != seat:
-        raise HostError(f"asked seat {seat} to act, but {int(state.to_act)} is to act")
 
     packed = _pack(
         _InFlight(state=state, episode=0),
@@ -363,11 +384,12 @@ def _greedy_index(
         out, _value = _evaluate(net, obs, privileged)
     if search is not None and len(candidates) > 1:
         log_prior = out.log_probs[0, : len(candidates)].float().cpu().numpy()
-        return search_move(
+        index, did = search_move(
             net, state, candidates, log_prior, search, rng, cache, cfg, device
         )
+        return index, did, candidates
     slots, _logp = _choose(out.logits, obs.candidate_mask, 1.0, True, rng)
-    return int(slots[0]), False
+    return int(slots[0]), False, candidates
 
 
 # --- the learner's own pre-play (--pre-play agent) --------------------------
@@ -443,6 +465,8 @@ class _Half:
     # predate them.
     declarer: int = -1
     kitty_points: int = 0
+    # The network's throws the engine blocked (``candidates="sim"`` only).
+    learner_blocked: int = 0
 
 
 def _paired(
@@ -616,8 +640,14 @@ def play_against_bot(
     declare_net: Any = None,
     bury: BuryConfig | None = None,
     bury_net: Any = None,
+    candidates: str = "host",
 ) -> dict[str, Any]:
     """Duplicate-score ``net`` against the engine's ``bot``.
+
+    ``candidates`` says who lists the network's moves: ``"host"``, the
+    engine's enumerator (every measurement before 2026-11-14), or
+    ``"sim"``, the simulator's ``legal_moves`` that training uses. See
+    ``_greedy_index``.
 
     ``num_deals`` deals, each played twice with the seats swapped, so
     ``2 * num_deals`` hands. ``seed`` is the deal seed base: fixed
@@ -637,6 +667,8 @@ def play_against_bot(
     """
     if num_deals < 1:
         raise ValueError(f"num_deals must be at least 1, got {num_deals}")
+    if candidates not in CANDIDATE_SOURCES:
+        raise ValueError(f"candidates must be one of {CANDIDATE_SOURCES}, not {candidates!r}")
     if not HOST.exists():  # pragma: no cover - a broken checkout
         raise HostError(f"the evaluation host is missing: {HOST}")
     cfg = cfg or getattr(net, "cfg", None) or ModelConfig()
@@ -697,11 +729,14 @@ def play_against_bot(
                     decision_rng = np.random.default_rng(
                         [int(seed), key[0], key[1], pending_decisions[key]]
                     )
-                    index, did = _greedy_index(
-                        net, msg, cache, cfg, device, decision_rng, search
+                    index, did, offered = _greedy_index(
+                        net, msg, cache, cfg, device, decision_rng, search, candidates
                     )
                     searched[shard] += int(did)
-                    host.write({"t": "choose", "index": index})
+                    if candidates == "sim":
+                        host.write({"t": "play", "cards": offered[index].tolist()})
+                    else:
+                        host.write({"t": "choose", "index": index})
                 elif kind == "hand":
                     game = int(msg["game"])
                     half = int(msg["half"])
@@ -716,6 +751,7 @@ def play_against_bot(
                         decisions=pending_decisions.pop((game, half), 0),
                         declarer=int(msg.get("declarer", -1)),
                         kitty_points=int(msg.get("kitty_points", 0)),
+                        learner_blocked=int(msg.get("learner_blocked", 0)),
                     )
                 elif kind == "declare":
                     host.write({
@@ -765,6 +801,9 @@ def play_against_bot(
         )
     stats: dict[str, Any] = summarise(merged)
     stats["searched_decisions"] = float(sum(searched.values()))
+    stats["learner_blocked"] = float(
+        sum(h.learner_blocked for halves in merged.values() for h in halves.values())
+    )
     if per_hand:
         # In deal order, half 0 then half 1, so two measurements taken
         # at the same seed line up hand for hand and can be differenced.
@@ -789,6 +828,9 @@ def main() -> int:
     ap.add_argument("--max-candidates", type=int, default=128)
     ap.add_argument("--checkpoint", default="")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--candidates", choices=CANDIDATE_SOURCES, default="host",
+                    help="who lists the network's moves: the engine, or the "
+                         "simulator that training uses")
     args = ap.parse_args()
 
     cfg = ModelConfig()
@@ -811,6 +853,7 @@ def main() -> int:
         num_deals=args.deals,
         seed=args.seed,
         max_candidates=args.max_candidates,
+        candidates=args.candidates,
     )
     elapsed = time.perf_counter() - started
 

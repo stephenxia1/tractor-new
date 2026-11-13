@@ -36,6 +36,10 @@ def label(r: dict) -> tuple[str, str]:
     mode = r.get("pre_play", "bot")
     if r.get("search"):
         mode += "+search"
+    # The simulator's candidate list (`--candidates sim`) rather than the
+    # engine's: a different measurement basis, so never pooled with it.
+    if r.get("candidates", "host") != "host":
+        mode += f"+{r['candidates']}"
     return ckpt, mode
 
 

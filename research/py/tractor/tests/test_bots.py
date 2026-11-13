@@ -482,6 +482,73 @@ def test_a_real_match_against_the_engine() -> None:
     )
 
 
+def test_sim_candidates_are_the_rollouts_list() -> None:
+    """``candidates="sim"`` shows the network what training showed it.
+
+    Every decision of a few generated hands, rebuilt from the wire as the
+    host sends it: the list ``_greedy_index`` scores must be the
+    simulator's ``legal_moves`` at the model's cap, move for move and in
+    order -- the call ``rollout._pack`` makes -- and the move it returns
+    must be one of them. The host's list (left empty here) is ignored.
+    """
+    import torch
+
+    from tractor.eval.bots import _greedy_index
+
+    cfg = _tiny()
+    net = ActorCritic(cfg).eval()
+    cache = Cache()
+    rng = np.random.default_rng(SEED + 7)
+    checked = 0
+    for _hand in range(3):
+        state, _record = generate(rng, num_decks=DECKS)
+        while not state.done:
+            msg = {**json.loads(json.dumps(to_wire(state))),
+                   "seat": int(state.to_act), "candidates": []}
+            want = state.legal_moves(cap=cfg.max_candidates).moves
+            index, did, offered = _greedy_index(
+                net, msg, cache, cfg, torch.device("cpu"), rng, None, "sim"
+            )
+            assert not did
+            assert len(offered) == len(want)
+            assert all(np.array_equal(x, y) for x, y in zip(offered, want))
+            assert 0 <= index < len(offered)
+            state.step(offered[index])
+            checked += 1
+    assert checked > 100
+    print(f"    {checked} decisions: the simulator's list, in order")
+
+
+def test_a_real_match_on_the_simulators_candidates() -> None:
+    """``candidates="sim"`` end to end. NEEDS NODE.
+
+    The moves come from the simulator and go to the host as cards; the
+    engine's reducer accepts every one or the match crashes. Blocked
+    throws -- possible with the simulator's list, never with the host's
+    -- are counted, not fatal.
+    """
+    if shutil.which("npx") is None:
+        print("    SKIPPED: npx is not on PATH, so the TypeScript host cannot run")
+        return
+
+    cfg = _tiny()
+    net = ActorCritic(cfg)
+    stats = _with_deadline(
+        lambda: play_against_bot(
+            net, "lowball", cfg=cfg, num_deals=4, seed=4243,
+            max_candidates=MOVE_CAP, workers=2, candidates="sim",
+        ),
+        900,
+    )
+    assert stats["deals"] == 4.0
+    assert stats["decisions"] > 0.0
+    assert stats["learner_blocked"] >= 0.0
+    print(
+        f"    untrained vs lowball, simulator's list: {int(stats['decisions'])} "
+        f"decisions, {int(stats['learner_blocked'])} blocked throws"
+    )
+
+
 def main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
