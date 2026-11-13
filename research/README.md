@@ -1173,6 +1173,55 @@ passed 0.086, none went without a step, and 37 single minibatches that
 had jumped past KL 1 (up to 3.7) were refused. Entropy held (0.38 ->
 0.37); the critic's loss kept rising (0.0017 -> 0.0023).
 
+### Which follows the network is shown, in training and in evaluation (2026-11-13)
+
+**Training and evaluation offer the network different follows.** Training
+shows it the simulator's MoveSet (`legal_moves(cap=max_candidates)`, 128).
+The evaluation host shows it the engine's `enumerateCandidates` at 128,
+and the agent can only pick from what it is shown. Both were compared with
+the exact legal set: brute force, judged by the respective rules, which
+agree exactly (below). Random play over 2,000 hands (simulator) and
+600 hands (host), policy weighted toward large plays:
+
+| multi-card follows | simulator (training) | host (evaluation) |
+| --- | --- | --- |
+| offered set incomplete | 0.8% | 13.8% |
+| a trick-winning follow is legal, none offered | **1.3%** (52 of 4,060) | **11.8%** (149 of 1,264) |
+| the same, pair leads only | 0.2% | 7.2% |
+| the same, 4-card leads | 28% | 49% |
+
+With a uniform random policy the losses are 0.7% and 9.8%. So the network
+trains with nearly every follow on offer and is benchmarked with a
+thinner list: about 0.25 lost winning follows a hand in evaluation, against
+~0.03 in training. Every number against the bots so far was measured
+through the host's list, so they are likely to understate the agents. The
+remaining simulator gap sits at tractor and throw leads, where it falls
+back to the single canonical follow once 1,024 fills are exceeded.
+
+```bash
+python scripts/follow_coverage.py 2000 128 big      # the simulator
+npx tsx src/followCoverage.ts 600 big                # the evaluation host
+```
+
+**The two follow rules agree.** `src/dumpFollowAll.ts` judges *every*
+follow of 600 structure-rich positions (trump led half the time, throws
+carrying tractors), not a random hundred as `tests/test_differential.py`
+does: 212,585 follows, 1,968 of them legal, and the Python rule matches
+the engine on all of them (`scripts/compare_follow_all.py`).
+
+**`smart` was the bot refusing its own follows.** pop8c's agent 3 against
+`smart` with bot pre-play failed on every attempt with "must include
+tractors of length 2 in trump". The host's candidates all pass the
+reducer (412,084 checked over 700 hands); `smart`'s own follows did not.
+Its follow paths predate the order-independent obligations, and on 20 of
+the 600 positions above it played loose pairs where the rule demands a
+tractor. `pickBotAction` now repairs a refused follow on its way out and
+counts it (`botFollowRepairs()`), leaving legal follows, and the bots'
+internal simulations, exactly as they were. `smart-v18`/`v28`/`v34` needed
+no repairs over 48 real positions with a live tractor obligation, too few
+to clear them; the guard covers them either way. Re-running the failing
+pair would confirm the fix end to end.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
