@@ -1194,7 +1194,7 @@ function isPlayValid(
     }
     const leadThrow = decomposeThrow(lead, ctx, n);
     if (leadThrow.ok) {
-      return validateFollowThrow(leadThrow.throw, selected, myCards, ctx).ok;
+      return validateFollowThrow(leadThrow.throw, selected, myCards, ctx, n).ok;
     }
     return false;
   }
