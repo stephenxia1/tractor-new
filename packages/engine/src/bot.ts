@@ -25,6 +25,7 @@ import {
 import {
   canonicalFollow,
   leadObligations,
+  obligatoryCore,
   validateFollow,
   validateFollowThrow,
 } from './follow';
@@ -291,7 +292,27 @@ function turnSeat(state: GameState): Seat | null {
   );
 }
 
+// Every bot move leaves through here, and a follow is checked against the
+// engine's own rule on the way out. The hand-written strategies predate
+// the order-independent follow obligations (a shorter tractor against a
+// longer one, several tractors against a throw), and a follow the engine
+// refuses does not merely play badly: the caller's applyEvent fails and
+// the game stops. In a duplicate-deal evaluation that drops the pair on
+// every attempt, since the same deal reaches the same position.
+//
+// The repair changes nothing a bot already did legally, so a strategy's
+// results on positions it always handled stay exactly as they were. Its
+// own simulations call the unguarded function for the same reason: their
+// rollouts are part of how a strategy chooses, and are left as they were.
 export function pickBotAction(
+  state: GameState,
+  seat: Seat,
+  type: BotType = 'lowball',
+): BotAction {
+  return legalFollowOrRepair(state, seat, pickBotActionUnguarded(state, seat, type), type);
+}
+
+function pickBotActionUnguarded(
   state: GameState,
   seat: Seat,
   type: BotType = 'lowball',
@@ -721,6 +742,77 @@ function fillFollow(
     addCard(c);
   }
   return legalOrCanonical(chosen, leadParts, leadClass, thrown, leadCount, ledSuit, pool, ctx, n);
+}
+
+// Checks a bot's follow against the engine and, if it breaks a rule,
+// returns the nearest legal follow instead: the structure the obligations
+// demand (rules.md §7.3), then the bot's own choice of led-suit cards,
+// then the lowest other led-suit cards, then the bot's own off-suit cards,
+// then the lowest of the rest. Leads and legal follows pass unchanged.
+// How many bot follows the guard has repaired, by bot type, since the last
+// reset. Evaluations against these bots can report it, so a repair is a
+// counted event rather than an invisible change of opponent.
+const FOLLOW_REPAIRS = new Map<string, number>();
+export function botFollowRepairs(): ReadonlyMap<string, number> {
+  return new Map(FOLLOW_REPAIRS);
+}
+export function resetBotFollowRepairs(): void {
+  FOLLOW_REPAIRS.clear();
+}
+
+function legalFollowOrRepair(
+  state: GameState,
+  seat: Seat,
+  action: BotAction,
+  type: BotType,
+): BotAction {
+  if (action.kind !== 'play_cards' || state.phase !== 'play') return action;
+  const hand = state.currentHand;
+  if (hand === null || hand.trumpRank === null) return action;
+  const trick = hand.currentTrick;
+  if (trick === null || trick.plays.length === 0) return action;
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank, trumpSuit: hand.trumpSuit };
+  const n = state.config.numDecks;
+  const myCards = hand.hands[seat] ?? [];
+  const leadCards = trick.plays[0]!.cards;
+  const leadClass = classifyCombo(leadCards, ctx, n);
+  const thrownResult = leadClass.ok ? null : decomposeThrow(leadCards, ctx, n);
+  const thrown = thrownResult !== null && thrownResult.ok ? thrownResult.throw : null;
+  if (!leadClass.ok && thrown === null) return action;
+  const check = (cards: ReadonlyArray<Card>): boolean =>
+    leadClass.ok
+      ? validateFollow(leadClass.combo, cards, myCards, ctx, n).ok
+      : validateFollowThrow(thrown!, cards, myCards, ctx, n).ok;
+  if (check(action.cards)) return action;
+  FOLLOW_REPAIRS.set(type, (FOLLOW_REPAIRS.get(type) ?? 0) + 1);
+
+  const leadParts = leadClass.ok ? [leadClass.combo] : thrown!.components;
+  const leadCount = leadCards.length;
+  const ledSuit = leadClass.ok ? leadClass.combo.effectiveSuit : thrown!.effectiveSuit;
+  const inLed = myCards.filter((c) => effectiveSuit(c, ctx) === ledSuit);
+  const core = obligatoryCore(leadObligations(leadParts, n), leadCount, inLed, ctx, n);
+  // The core is the obligations' structure followed by led-suit filler of
+  // its own choosing; keep only the structure (cards held as an n-kind in
+  // the core) so the bot's choice can replace the filler.
+  const inCore = new Map<string, number>();
+  for (const c of core) inCore.set(cardKey(c), (inCore.get(cardKey(c)) ?? 0) + 1);
+  const identity = (c: Card): string => `${cardKey(c)}#${c.deckId}`;
+  const out: Card[] = [];
+  const used = new Set<string>();
+  const add = (c: Card): void => {
+    if (out.length >= leadCount || used.has(identity(c))) return;
+    out.push(c);
+    used.add(identity(c));
+  };
+  for (const c of core) if ((inCore.get(cardKey(c)) ?? 0) >= n) add(c);
+  const low = (cards: ReadonlyArray<Card>): Card[] => [...cards].sort((a, b) => compareCards(a, b, ctx));
+  const isLed = (c: Card): boolean => effectiveSuit(c, ctx) === ledSuit;
+  for (const c of action.cards) if (isLed(c)) add(c);
+  for (const c of low(inLed)) add(c);
+  for (const c of action.cards) add(c);
+  for (const c of low(myCards)) add(c);
+  if (check(out)) return { kind: 'play_cards', cards: out };
+  return { kind: 'play_cards', cards: canonicalFollow(leadParts, leadCount, ledSuit, myCards, ctx, n) };
 }
 
 // The heuristics above choose *which* legal follow to play; this is the
@@ -1791,7 +1883,7 @@ function scoreFollowCandidate(
     if (trick.plays.length >= s.config.numPlayers) break;
     const next = nextToPlay(s);
     if (next === null) break;
-    const action = pickBotAction(s, next, 'smart');
+    const action = pickBotActionUnguarded(s, next, 'smart');
     if (action.kind !== 'play_cards') break;
     const r = applyEvent(s, {
       kind: 'play_cards',
@@ -2019,7 +2111,7 @@ function simulateTricks(
     while (s.phase === 'play' && guard++ < 5) {
       const next = nextToPlay(s);
       if (next === null) break;
-      const action = pickBotAction(s, next, opponentModel);
+      const action = pickBotActionUnguarded(s, next, opponentModel);
       if (action.kind !== 'play_cards') break;
       const r = applyEvent(s, {
         kind: 'play_cards',
@@ -4187,7 +4279,7 @@ function simulateTricksAndWinsV18(
     while (s.phase === 'play' && guard++ < 5) {
       const next = nextToPlay(s);
       if (next === null) break;
-      const action = pickBotAction(s, next, opponentModel);
+      const action = pickBotActionUnguarded(s, next, opponentModel);
       if (action.kind !== 'play_cards') break;
       const r = applyEvent(s, {
         kind: 'play_cards',
@@ -4954,7 +5046,7 @@ function simulateTricksAndState(
     while (s.phase === 'play' && guard++ < 5) {
       const next = nextToPlay(s);
       if (next === null) break;
-      const action = pickBotAction(s, next, opponentModel);
+      const action = pickBotActionUnguarded(s, next, opponentModel);
       if (action.kind !== 'play_cards') break;
       const r = applyEvent(s, {
         kind: 'play_cards',

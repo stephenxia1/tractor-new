@@ -99,6 +99,8 @@ export {
 
 export {
   pickBotAction,
+  botFollowRepairs,
+  resetBotFollowRepairs,
   botTypeLabel,
   BOT_TYPES,
   VISIBLE_BOT_TYPES,
