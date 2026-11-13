@@ -18,6 +18,15 @@ on:
         default: setup
         type: choice
         options: [setup, deploy]
+  # A push to a research branch that changes the app (re)deploys it. It also
+  # lets the workflow run before it exists on main, which manual dispatch
+  # requires. Only collaborators can push branches here, so only they can
+  # make it run with the repository's secrets.
+  push:
+    branches: ["claude/**"]
+    paths:
+      - research/modal_app.py
+      - .github/workflows/modal-ops.yml
 
 permissions:
   contents: read
@@ -47,7 +56,7 @@ jobs:
             exit 1
           fi
       - name: Store the control token as a Modal secret
-        if: inputs.op == 'setup'
+        if: github.event_name == 'push' || inputs.op == 'setup'
         env:
           TRACTOR_CONTROL_TOKEN: ${{ secrets.TRACTOR_CONTROL_TOKEN }}
         run: |
