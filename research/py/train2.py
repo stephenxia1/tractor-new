@@ -26,7 +26,7 @@ import json
 import os
 import signal
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -36,6 +36,8 @@ import torch
 from tractor_rl import layout as L
 from tractor_rl.dmc2 import DMC2Config, Learner2, ReplayBuffer2, hand_returns
 from tractor_rl.features2 import (
+    ACTION_DIM,
+    ACTION_DIM_SEQ,
     action_features,
     field_u8,
     field_u16,
@@ -46,7 +48,7 @@ from tractor_rl.features2 import (
     split_per_worker,
     state_features,
 )
-from tractor_rl.model2 import NetConfig, PrivilegedCritic, TractorNet
+from tractor_rl.model2 import NetConfig, PrivilegedCritic, TractorNet, widen_action_inputs
 from tractor_rl.protocol import WorkerConfig, WorkerPool
 
 RESEARCH_DIR = Path(__file__).resolve().parents[1]
@@ -126,6 +128,11 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--history", type=str, default="attn", choices=["attn", "none"])
+    # "sequential" builds each play a card at a time (rl/v2/sequential.ts).
+    # Resuming a checkpoint trained on enumerated candidates widens its
+    # action inputs with zeros, so it starts from the same function.
+    ap.add_argument("--action-space", type=str, default="enumerated",
+                    choices=["enumerated", "sequential"])
     ap.add_argument("--lambda-mc", type=float, default=DMC2Config().lambda_mc)
     ap.add_argument("--batch-size", type=int, default=DMC2Config().batch_size)
     ap.add_argument("--train-every", type=int, default=DMC2Config().train_every)
@@ -142,6 +149,12 @@ def main() -> None:
     ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
     ap.add_argument("--run-name", type=str, default="v2")
     ap.add_argument("--resume", type=str, default="")
+    # Used only when the resumed checkpoint carries no optimizer state (all
+    # checkpoints written before it was saved, including the shipped
+    # 966k one) or when that state no longer fits the network.
+    # Opt-in: a 300-step warm-up did not stop a short resume on a 4-core box
+    # from losing strength (RESULTS.md), so it is not imposed by default.
+    ap.add_argument("--resume-warmup-steps", type=int, default=0)
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
@@ -153,17 +166,18 @@ def main() -> None:
     cfg = DMC2Config(
         lambda_mc=args.lambda_mc, batch_size=args.batch_size,
         train_every=args.train_every, steps_per_train=args.steps_per_train)
-    net_cfg = NetConfig(history=args.history)
+    action_in = ACTION_DIM_SEQ if args.action_space == "sequential" else ACTION_DIM
+    net_cfg = NetConfig(history=args.history, action_in=action_in)
     net = TractorNet(net_cfg).to(device)
-    critic = PrivilegedCritic().to(device)
+    critic = PrivilegedCritic(action_in=action_in).to(device)
     resumed_snapshots: list[dict] = []
     resumed_steps = 0
     hands_base = 0
     if args.resume:
         state = torch.load(args.resume, map_location=device)
-        net.load_state_dict(state["model"])
+        net.load_state_dict(widen_action_inputs(state["model"], action_in))
         if "critic" in state:
-            critic.load_state_dict(state["critic"])
+            critic.load_state_dict(widen_action_inputs(state["critic"], action_in))
         resumed_snapshots = state.get("snapshots", [])
         resumed_steps = int(state.get("steps", 0))
         hands_base = int(state.get("hands", 0))
@@ -171,6 +185,26 @@ def main() -> None:
               f"{len(resumed_snapshots)} snapshots)")
     learner = Learner2(net, critic, cfg, device)
     learner.steps = resumed_steps
+    if args.resume:
+        # Optimizer state is training state like the snapshot pool: without
+        # it RMSprop restarts from zero second moments and its first updates
+        # are several times too large. Restore it when it fits; otherwise
+        # warm the learning rate up instead.
+        restored = False
+        # Widened action inputs change one tensor's shape, and a mismatched
+        # running average would only fail at the first optimizer step.
+        widened = state["model"]["action_encoder.0.weight"].shape[1] != action_in
+        if "opt" in state and "critic_opt" in state and not widened:
+            try:
+                learner.opt.load_state_dict(state["opt"])
+                learner.critic_opt.load_state_dict(state["critic_opt"])
+                restored = True
+            except (ValueError, RuntimeError) as err:
+                print(f"optimizer state not restored: {' '.join(str(err).split())[:160]}")
+        if not restored and args.resume_warmup_steps > 0:
+            cfg.lr_warmup_steps = args.resume_warmup_steps
+            print(f"no usable optimizer state; warming the learning rate up over "
+                  f"{args.resume_warmup_steps} steps")
     buffer = ReplayBuffer2(cfg.buffer_capacity, L.STATE_BYTES_PRIVILEGED)
     rng = np.random.default_rng(args.seed)
 
@@ -182,7 +216,7 @@ def main() -> None:
     # under a different --history, say) must not be fatal: crashing here
     # costs the whole run, since this is boot time on a spot box.
     for snap in resumed_snapshots[-args.snapshot_pool:]:
-        state = _to_float(snap["state"])
+        state = widen_action_inputs(_to_float(snap["state"]), action_in)
         try:
             snapshot_net.load_state_dict(state)
         except RuntimeError as err:
@@ -200,7 +234,8 @@ def main() -> None:
     configs = [
         WorkerConfig(
             games=args.games, seed=args.seed + i * 101, learner_seats=mask,
-            baseline=bot, preplay="smart-v34", privileged=True)
+            baseline=bot, preplay="smart-v34", privileged=True,
+            action_space=args.action_space)
         for i, (_, mask, _, bot) in enumerate(matchups)
     ]
     pool = WorkerPool(args.workers, configs[0], configs=configs, num_groups=args.groups)
@@ -276,8 +311,8 @@ def main() -> None:
                 continue
 
             sf_all = torch.from_numpy(state_features(merged.states)).to(device)
-            af_all = torch.from_numpy(
-                action_features(merged.cands, merged.states, merged.owner)).to(device)
+            af_all = torch.from_numpy(action_features(
+                merged.cands, merged.states, merged.owner, width=action_in)).to(device)
             if args.history == "attn":
                 tok_np, msk_np = history_features(merged.states)
                 tokens_all = torch.from_numpy(tok_np).to(device)
@@ -313,11 +348,13 @@ def main() -> None:
             game_ids = field_u16(merged.states, L.H_GAME_ID)
             hand_ids = field_u32(merged.states, L.H_HAND_ID)
             trick_idx = field_u8(merged.states, L.H_TRICK_INDEX)
+            trick_pos = field_u8(merged.states, L.H_TRICK_POS)
             attacker = field_u8(merged.states, L.H_I_AM_ATTACKER)
             for local_i, i in enumerate(rows_cur):
                 key = (int(worker_ids[i]), int(game_ids[i]), int(hand_ids[i]))
                 pending.setdefault(key, []).append(
-                    (store, local_i, int(trick_idx[i]), 1.0 if attacker[i] else -1.0))
+                    (store, local_i, int(trick_idx[i]), 1.0 if attacker[i] else -1.0,
+                     int(trick_pos[i]), bool(explore[local_i])))
             decisions += merged.num_decisions
             trained_decisions += rows_cur.shape[0]
 
@@ -332,13 +369,21 @@ def main() -> None:
                     returns, level = hand_returns(ep, cfg)
                     if returns.shape[0] == 0:
                         continue
+                    entries = drop_before_exploration(entries)
                     st = np.stack([e[0].states[e[1]] for e in entries])
                     ac = np.stack([e[0].actions[e[1]] for e in entries])
                     tr = np.clip(np.fromiter((e[2] for e in entries), np.int64, len(entries)),
                                  0, returns.shape[0] - 1)
                     sg = np.fromiter((e[3] for e in entries), np.float32, len(entries))
+                    # (trick, position in trick) names one decision within a
+                    # hand. In the sequential action space its m learned
+                    # sub-steps share it, and each gets weight 1/m.
+                    decision = [(e[2], e[4]) for e in entries]
+                    per_decision = Counter(decision)
+                    wt = np.fromiter((1.0 / per_decision[d] for d in decision),
+                                     np.float32, len(entries))
                     buffer.add(st, ac, (returns[tr] * sg).astype(np.float32),
-                               (level * sg).astype(np.float32))
+                               (level * sg).astype(np.float32), wt)
 
             t4 = time.perf_counter()
             if rounds % cfg.train_every == 0:
@@ -415,6 +460,26 @@ def main() -> None:
           f"in {el/60:.1f} min, {learner.steps} steps")
 
 
+def drop_before_exploration(entries: list) -> list:
+    """Drops sub-steps whose play was finished by an exploratory sub-step.
+
+    In the sequential action space one decision spans several sub-steps,
+    all regressed on the return of the finished play. If a later sub-step
+    picked its card at random, that return describes a play the earlier
+    sub-steps' policy would not have finished, so they are dropped; the
+    exploratory sub-step and those after it keep their targets. Across
+    decisions R0 already accepts this contamination, as DMC does. With one
+    sub-step per decision (enumerated candidates) nothing is dropped.
+    """
+    last_explore: dict[tuple[int, int], int] = {}
+    for idx, e in enumerate(entries):
+        if e[5]:
+            last_explore[(e[2], e[4])] = idx
+    if not last_explore:
+        return entries
+    return [e for idx, e in enumerate(entries) if idx >= last_explore.get((e[2], e[4]), -1)]
+
+
 # Snapshots are frozen *opponents*, never the weights being trained, so
 # they are stored at half precision. It halves a file that mirrors to S3
 # on a timer, and a few thousandths of drift in an opponent net is not
@@ -447,6 +512,8 @@ def save(net, critic, learner, cfg, net_cfg, args, hands, snapshots=(),
         "config": asdict(cfg),
         "steps": learner.steps,
         "hands": hands,
+        "opt": learner.opt.state_dict(),
+        "critic_opt": learner.critic_opt.state_dict(),
         # The opponent pool is training state, not a by-product. Left out,
         # a resume restarts self-play against copies of the current net
         # and needs snapshot_every * snapshot_pool steps -- 100k at the

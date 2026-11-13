@@ -4,6 +4,7 @@
 //
 //   npm run selftest            (from research/)
 //   HANDS=200 PREPLAY=lowball npm run selftest
+//   ACTION_SPACE=sequential npm run selftest   (card-by-card sub-steps)
 
 import { mulberry32, sumPoints, type Card } from '@tractor/engine';
 
@@ -32,6 +33,7 @@ import {
 const HANDS = Number(process.env['HANDS'] ?? 100);
 const PREPLAY = (process.env['PREPLAY'] ?? 'smart-v34') as never;
 const SEED = Number(process.env['SEED'] ?? 12345);
+const ACTION_SPACE = (process.env['ACTION_SPACE'] ?? 'enumerated') as 'enumerated' | 'sequential';
 
 function main(): void {
   const rng = mulberry32(SEED);
@@ -40,6 +42,7 @@ function main(): void {
     seed: SEED,
     learnerSeats: [true, true, true, true],
     prePlayBot: PREPLAY,
+    actionSpace: ACTION_SPACE,
   });
 
   const writer = new ByteWriter();
@@ -90,7 +93,7 @@ function main(): void {
     writeDecision(
       writer,
       slot.gameState,
-      { gameId: slot.gameId, handId: slot.handId, seat: pending.seat, myKitty: slot.kitty },
+      { gameId: slot.gameId, handId: slot.handId, seat: pending.seat, myKitty: slot.kittyFor(pending.seat) },
       pending.candidates,
     );
     const buf = writer.taken();
@@ -117,6 +120,7 @@ function main(): void {
   }
 
   const elapsed = (Date.now() - started) / 1000;
+  console.log(`action space     ${ACTION_SPACE}`);
   console.log(`hands            ${handsDone} in ${elapsed.toFixed(2)}s = ${(handsDone / elapsed).toFixed(1)} hands/s`);
   console.log(`decisions        ${decisions} (${(decisions / handsDone).toFixed(1)}/hand)`);
   console.log(`lead candidates  mean ${(leadCandidates / Math.max(leads, 1)).toFixed(1)} over ${leads} leads`);

@@ -55,6 +55,9 @@ class WorkerConfig:
     search_worlds: int = 0
     search_top: int = 6
     search_opponent: str = "smart-v2"
+    # "enumerated" candidate lists, or the "sequential" card-by-card space
+    # in which each sub-step with a choice is its own decision record.
+    action_space: str = "enumerated"
 
 
 class Worker:
@@ -94,6 +97,8 @@ class Worker:
                 "--search-top", str(config.search_top),
                 "--search-opponent", config.search_opponent,
             ]
+        if config.action_space != "enumerated":
+            args += ["--action-space", config.action_space]
         if config.baseline_alt is not None:
             args += ["--baseline-alt", config.baseline_alt, "--alt-seats", str(config.alt_seats)]
         self.index = index

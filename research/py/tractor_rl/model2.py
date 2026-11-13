@@ -55,6 +55,10 @@ class NetConfig:
     hist_model: int = 96
     hist_layers: int = 2
     hist_heads: int = 4
+    # Width of the action features: ACTION_DIM for enumerated candidates,
+    # ACTION_DIM_SEQ for the sequential action space. Checkpoints written
+    # before this field existed load with the default.
+    action_in: int = ACTION_DIM
 
 
 class ResidualBlock(nn.Module):
@@ -132,7 +136,7 @@ class TractorNet(nn.Module):
         self.fuse = nn.Sequential(nn.LayerNorm(fuse_in), nn.Linear(fuse_in, cfg.width), nn.ReLU())
 
         self.action_encoder = nn.Sequential(
-            nn.Linear(ACTION_DIM, cfg.action_dim), nn.ReLU(),
+            nn.Linear(cfg.action_in, cfg.action_dim), nn.ReLU(),
             nn.Linear(cfg.action_dim, cfg.action_dim), nn.ReLU(),
         )
 
@@ -209,13 +213,13 @@ class PrivilegedCritic(nn.Module):
     quantity the policy net is trying to learn -- but far quieter.
     """
 
-    def __init__(self, width: int = 512, action_dim: int = 128) -> None:
+    def __init__(self, width: int = 512, action_dim: int = 128, action_in: int = ACTION_DIM) -> None:
         super().__init__()
         self.stem = nn.Sequential(
             nn.Linear(STATE_DIM + PRIVILEGED_DIM, width), nn.ReLU(),
             nn.Linear(width, width), nn.ReLU(),
         )
-        self.action_encoder = nn.Sequential(nn.Linear(ACTION_DIM, action_dim), nn.ReLU())
+        self.action_encoder = nn.Sequential(nn.Linear(action_in, action_dim), nn.ReLU())
         self.head = nn.Sequential(
             nn.Linear(width + action_dim, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1),
@@ -231,3 +235,27 @@ class PrivilegedCritic(nn.Module):
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+ACTION_INPUT_KEY = "action_encoder.0.weight"
+
+
+def widen_action_inputs(state: dict, new_in: int, key: str = ACTION_INPUT_KEY) -> dict:
+    """Zero-pads an action encoder's input columns up to `new_in`.
+
+    The added action features are appended after the old ones, so a network
+    trained on fewer of them computes exactly the same function on the wider
+    input until training moves the new columns. Used to warm-start the
+    sequential action space from a checkpoint trained on enumerated
+    candidates. Works for TractorNet and PrivilegedCritic alike, since both
+    name their first action layer the same way.
+    """
+    w = state.get(key)
+    if w is None or w.shape[1] == new_in:
+        return state
+    if w.shape[1] > new_in:
+        raise ValueError(f"cannot narrow {key} from {w.shape[1]} to {new_in} inputs")
+    pad = torch.zeros(w.shape[0], new_in - w.shape[1], dtype=w.dtype, device=w.device)
+    out = dict(state)
+    out[key] = torch.cat([w, pad], dim=1)
+    return out

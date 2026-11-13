@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "numSlots": 54,
   "header": {
     "bytes": 36,
@@ -49,8 +49,9 @@
   },
   "stateBytes": 768,
   "candidate": {
-    "headerBytes": 4,
-    "bytes": 20,
+    "headerBytes": 5,
+    "bytes": 21,
+    "remaining": 4,
     "maxCards": 16,
     "noCard": 255,
     "shapes": {
@@ -66,7 +67,8 @@
       "allTrump": 1,
       "allLedSuit": 2,
       "hasPoints": 4,
-      "beatsWinner": 8
+      "beatsWinner": 8,
+      "complete": 16
     }
   },
   "episode": {

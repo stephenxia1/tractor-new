@@ -181,7 +181,11 @@ def main() -> None:
         search_worlds=args.search_worlds if model is not None else 0,
         search_top=args.search_top,
         search_opponent=args.search_opponent,
+        # A network plays in the action space it was trained in.
+        action_space=getattr(model, "action_space", "enumerated"),
     )
+    if base_cfg.action_space == "sequential" and base_cfg.search_worlds > 0:
+        raise SystemExit("search is not supported in the sequential action space yet")
     configs: list[WorkerConfig] = []
     for i in range(args.worker_pairs):
         pair_base = args.base + i * 1_000_003

@@ -12,7 +12,7 @@
 
 import { NUM_SLOTS } from './cards';
 
-export const RECORD_VERSION = 5;
+export const RECORD_VERSION = 6;
 
 // ---- Decision record header ------------------------------------------------
 
@@ -101,14 +101,24 @@ export const FLAG_ALL_TRUMP = 1;
 export const FLAG_ALL_LED_SUIT = 2; // follows: entirely in the led suit
 export const FLAG_HAS_POINTS = 4;
 export const FLAG_BEATS_WINNER = 8; // would take the trick as it stands
+// Sequential action space only: taking this candidate plays these cards.
+// Without it the candidate is a partial play that later sub-steps extend.
+// Enumerated candidates are always whole plays and never carry it, so a
+// network trained before the sequential space sees exactly what it saw.
+export const FLAG_COMPLETE = 16;
 
-// Per candidate: u8 nCards, u8 shape, u8 flags, u8 points, then a
-// fixed-width card-slot array padded with NO_CARD. Fixed width so the
-// Python side can reshape a whole batch of candidates in one numpy call
-// instead of walking them in a loop.
-export const CANDIDATE_HEADER_BYTES = 4;
+// Per candidate: u8 nCards, u8 shape, u8 flags, u8 points, u8 remaining,
+// then a fixed-width card-slot array padded with NO_CARD. Fixed width so
+// the Python side can reshape a whole batch of candidates in one numpy
+// call instead of walking them in a loop.
+//
+// `remaining` is how many more cards a partial follow still needs (the
+// lead fixes its size); 0 for whole plays, for leads and for enumerated
+// candidates.
+export const C_REMAINING = 4;
+export const CANDIDATE_HEADER_BYTES = 5;
 export const MAX_CANDIDATE_CARDS = 16;
-export const CANDIDATE_BYTES = CANDIDATE_HEADER_BYTES + MAX_CANDIDATE_CARDS; // 20
+export const CANDIDATE_BYTES = CANDIDATE_HEADER_BYTES + MAX_CANDIDATE_CARDS; // 21
 export const NO_CARD = 255;
 
 // ---- Episode record --------------------------------------------------------
@@ -297,6 +307,7 @@ export function layoutSpec(): Record<string, unknown> {
     candidate: {
       headerBytes: CANDIDATE_HEADER_BYTES,
       bytes: CANDIDATE_BYTES,
+      remaining: C_REMAINING,
       maxCards: MAX_CANDIDATE_CARDS,
       noCard: NO_CARD,
       shapes: {
@@ -313,6 +324,7 @@ export function layoutSpec(): Record<string, unknown> {
         allLedSuit: FLAG_ALL_LED_SUIT,
         hasPoints: FLAG_HAS_POINTS,
         beatsWinner: FLAG_BEATS_WINNER,
+        complete: FLAG_COMPLETE,
       },
     },
     episode: {

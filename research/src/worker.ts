@@ -41,6 +41,8 @@ type Args = {
   searchWorlds: number;
   searchTop: number;
   searchOpponent: BotType;
+  // 'enumerated' candidate lists or the 'sequential' card-by-card space.
+  actionSpace: 'enumerated' | 'sequential';
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Args {
@@ -83,7 +85,13 @@ function parseArgs(argv: ReadonlyArray<string>): Args {
     searchWorlds: Number(get('search-worlds') ?? '0'),
     searchTop: Number(get('search-top') ?? '6'),
     searchOpponent: (get('search-opponent') ?? 'smart-v2') as BotType,
+    actionSpace: parseActionSpace(get('action-space') ?? 'enumerated'),
   };
+}
+
+function parseActionSpace(raw: string): 'enumerated' | 'sequential' {
+  if (raw === 'enumerated' || raw === 'sequential') return raw;
+  throw new Error(`--action-space ${raw}: expected enumerated or sequential`);
 }
 
 // Reassembles length-prefixed frames arriving on a stream.
@@ -193,6 +201,7 @@ async function main(): Promise<void> {
         fixedLandlord: args.fixedLandlord,
         fixedLevel: args.fixedLevel,
         baselineBotBySeat: args.baselineBySeat,
+        actionSpace: args.actionSpace,
       }),
     );
   }
@@ -222,7 +231,7 @@ async function main(): Promise<void> {
           gameId: slot.gameId,
           handId: slot.handId,
           seat: pending.seat,
-          myKitty: slot.kitty,
+          myKitty: slot.kittyFor(pending.seat),
           privileged: args.privileged,
         },
         pending.candidates,
@@ -248,7 +257,7 @@ async function main(): Promise<void> {
                 gameId: slot.gameId,
                 handId: slot.handId,
                 seat: pending.seat,
-                myKitty: slot.kitty,
+                myKitty: slot.kittyFor(pending.seat),
                 privileged: false,
                 leafOf: leaf.candidateIndex,
                 leafPoints: leaf.points,

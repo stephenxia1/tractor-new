@@ -42,6 +42,7 @@ class PolicyV1:
         self._state_features = state_features
         self._action_features = action_features
         self.device = device
+        self.action_space = "enumerated"
         self.net = QNet(ModelConfig()).to(device)
         self.net.load_state_dict(state["model"])
         self.net.eval()
@@ -62,7 +63,7 @@ class PolicyV2:
     """v2 network: chain-position features, per-role heads, move history."""
 
     def __init__(self, state: dict, device: torch.device) -> None:
-        from .features2 import action_features, history_features, state_features
+        from .features2 import ACTION_DIM_SEQ, action_features, history_features, state_features
         from .model2 import NetConfig, TractorNet
 
         self._state_features = state_features
@@ -70,6 +71,8 @@ class PolicyV2:
         self._history_features = history_features
         self.device = device
         cfg = NetConfig(**state.get("net_config", {}))
+        # The worker must offer the action space this network was trained in.
+        self.action_space = "sequential" if cfg.action_in == ACTION_DIM_SEQ else "enumerated"
         self.cfg = cfg
         self.net = TractorNet(cfg).to(device)
         self.net.load_state_dict(state["model"])
@@ -97,8 +100,8 @@ class PolicyV2:
         if merged.num_decisions == 0:
             return np.zeros(0, dtype=np.int64)
         sf = torch.from_numpy(self._state_features(merged.states)).to(self.device)
-        af = torch.from_numpy(
-            self._action_features(merged.cands, merged.states, merged.owner)).to(self.device)
+        af = torch.from_numpy(self._action_features(
+            merged.cands, merged.states, merged.owner, width=self.cfg.action_in)).to(self.device)
         owner = torch.from_numpy(merged.owner).to(self.device)
         roles = torch.from_numpy(merged.states[:, L.H_ROLE].astype(np.int64)).to(self.device)
         if self.cfg.history == "attn":

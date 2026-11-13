@@ -30,7 +30,13 @@ import { cardSlot } from './cards';
 // the arena; without it the engine throws rather than substituting.
 import '@tractor/engine/rl/v2/register';
 
-import { enumerateCandidates, type Candidate } from './candidates';
+import {
+  enumerateCandidates,
+  sequentialChildren,
+  type Candidate,
+  type SequentialChild,
+} from './candidates';
+import { SequentialPlay } from '@tractor/engine/rl/v2/sequential';
 import { summarizeHand, type EpisodeSummary } from './encode';
 import { buildLeaves, type SearchOptions, type SearchResult } from './search';
 
@@ -66,6 +72,13 @@ export type SlotOptions = {
   // Bot used for declaration and kitty burial at every seat.
   readonly prePlayBot?: BotType;
   readonly maxCandidates?: number;
+  // How a play decision is offered to the learner. 'enumerated' (the
+  // default) sends one record with a candidate list of whole plays.
+  // 'sequential' builds the play a card at a time: each sub-step with more
+  // than one option is its own record, sub-steps with one option are taken
+  // here without asking, and a decision ends when a child marked complete
+  // is chosen. See packages/engine/src/rl/v2/sequential.ts.
+  readonly actionSpace?: 'enumerated' | 'sequential';
   // Randomise landlord + levels per hand (on by default; off for
   // duplicate-deal evaluation, where the deal must be reproducible).
   readonly randomize?: boolean;
@@ -126,6 +139,14 @@ export class GameSlot {
   private dealtCards: DealtCards | null = null;
   private buriedKitty: Card[] = [];
   private pending: Pending | null = null;
+  // The decision in progress in the sequential action space: the play
+  // being built and the children offered at the current sub-step.
+  private seqDecision: {
+    readonly seat: Seat;
+    readonly seq: SequentialPlay;
+    readonly prefix: ReadonlyArray<number>;
+    readonly children: ReadonlyArray<SequentialChild>;
+  } | null = null;
   private forcedLeads = 0;
   private assertNoForcedLead = false;
 
@@ -152,6 +173,13 @@ export class GameSlot {
 
   get kitty(): ReadonlyArray<Card> {
     return this.buriedKitty;
+  }
+
+  // The buried kitty as `seat` knows it: the landlord buried it, nobody
+  // else has seen it. Everything that builds a seat's view -- candidates,
+  // records, search worlds -- must go through this, not `kitty`.
+  kittyFor(seat: Seat): ReadonlyArray<Card> {
+    return seat === this.state.currentHand?.landlord ? this.buriedKitty : [];
   }
 
   // Fingerprint of the current hand's deal, taken right after the shuffle.
@@ -219,10 +247,15 @@ export class GameSlot {
       if (phase === 'play') {
         const seat = nextToPlay(this.state);
         if (seat === null) throw new Error('play phase with no seat to act');
+        if (this.opts.learnerSeats[seat] === true && this.opts.actionSpace === 'sequential') {
+          const pend = this.sequentialStep(seat);
+          if (pend !== null) return { episodes, pending: pend };
+          continue;
+        }
         if (this.opts.learnerSeats[seat] === true) {
           const candidates = enumerateCandidates(this.state, seat, {
             maxCandidates: this.opts.maxCandidates,
-            myKitty: this.buriedKitty,
+            myKitty: this.kittyFor(seat),
           });
           if (candidates.length > 0) {
             this.pending = { seat, candidates };
@@ -238,10 +271,79 @@ export class GameSlot {
     throw new Error('GameSlot.advance exceeded step budget');
   }
 
+  // Advances the sequential decision for `seat` until a sub-step offers a
+  // real choice (returned as pending) or the play is complete (applied,
+  // returning null). One-option sub-steps are taken here, not sent.
+  private sequentialStep(seat: Seat): Pending | null {
+    let d = this.seqDecision;
+    let seq: SequentialPlay;
+    let prefix: ReadonlyArray<number>;
+    if (d !== null && d.seat === seat) {
+      seq = d.seq;
+      prefix = d.prefix;
+    } else {
+      seq = new SequentialPlay(this.state, seat, { myKitty: this.kittyFor(seat) });
+      prefix = [];
+      // A follow longer than the record can carry goes to the bot, as an
+      // oversized enumerated candidate always did.
+      if (seq.mode === 'none' || (seq.mode === 'follow' && seq.size === null)) {
+        this.seqDecision = null;
+        this.playWithBot(seat, this.botForSeat(seat));
+        return null;
+      }
+    }
+    for (;;) {
+      const children = sequentialChildren(this.state, seat, seq, prefix);
+      if (children.length === 0) {
+        throw new Error(`sequential action space dead end at prefix [${prefix.join(',')}]`);
+      }
+      if (children.length === 1) {
+        const only = children[0]!;
+        if (only.complete) {
+          this.seqDecision = null;
+          this.playLearnerCards(seat, only.cards);
+          return null;
+        }
+        prefix = only.prefix;
+        continue;
+      }
+      this.seqDecision = { seat, seq, prefix, children };
+      this.pending = { seat, candidates: children };
+      return this.pending;
+    }
+  }
+
+  // Applies a learner's play, asserting the engine never applies the
+  // forced-lead penalty to it: every offered throw is provably safe.
+  private playLearnerCards(seat: Seat, cards: ReadonlyArray<Card>): void {
+    this.assertNoForcedLead = true;
+    try {
+      this.apply({ kind: 'play_cards', seat, cards });
+    } finally {
+      this.assertNoForcedLead = false;
+    }
+  }
+
   // Commits the learner's choice and clears the pending decision.
   choose(index: number): void {
     const pending = this.pending;
     if (pending === null) throw new Error('no pending decision');
+    const d = this.seqDecision;
+    if (d !== null) {
+      const child = d.children[index];
+      if (child === undefined) {
+        throw new Error(`child ${index} out of range (have ${d.children.length})`);
+      }
+      this.pending = null;
+      if (child.complete) {
+        this.seqDecision = null;
+        this.playLearnerCards(d.seat, child.cards);
+      } else {
+        // The next advance() continues this decision from the new prefix.
+        this.seqDecision = { ...d, prefix: child.prefix, children: [] };
+      }
+      return;
+    }
     const candidate = pending.candidates[index];
     if (candidate === undefined) {
       throw new Error(
@@ -267,11 +369,17 @@ export class GameSlot {
     const pending = this.pending;
     const hand = this.state.currentHand;
     if (pending === null || hand === null || hand.trumpRank === null) return null;
+    if (this.seqDecision !== null) {
+      // Search compares whole plays; in this action space a sub-step's
+      // children are partial plays. A beam over the sequential policy is
+      // what replaces the candidate list here, and it does not exist yet.
+      throw new Error('search is not supported in the sequential action space yet');
+    }
     return buildLeaves(
       this.state,
       pending.seat,
       pending.candidates,
-      this.buriedKitty,
+      this.kittyFor(pending.seat),
       { trumpRank: hand.trumpRank, trumpSuit: hand.trumpSuit },
       opts,
     );
@@ -328,6 +436,7 @@ export class GameSlot {
     base = { ...base, landlord, teamLevels: levels };
     this.state = base;
     this.buriedKitty = [];
+    this.seqDecision = null;
     this.apply({ kind: 'start_hand', seed: handSeed });
     this.dealDigestValue = this.computeDealDigest();
     this.dealtCards =

@@ -29,10 +29,12 @@ import { decomposePlay, decomposeThrow, decomposedBeats } from '../../throws';
 import { type Card, type EffectiveSuit, type TrumpContext } from '../../types';
 
 import { cardSlot, NUM_SLOTS } from './cards';
+import type { SequentialPlay } from './sequential';
 import {
   FLAG_ALL_LED_SUIT,
   FLAG_ALL_TRUMP,
   FLAG_BEATS_WINNER,
+  FLAG_COMPLETE,
   FLAG_HAS_POINTS,
   SHAPE_BROKEN,
   SHAPE_PAIR,
@@ -48,6 +50,9 @@ export type Candidate = {
   readonly shape: number;
   readonly flags: number;
   readonly points: number;
+  // Sequential action space: cards a partial follow still needs. Absent
+  // (written as 0) for whole plays.
+  readonly remaining?: number;
 };
 
 export type CandidateOptions = {
@@ -138,6 +143,67 @@ export function enumerateCandidates(
       lastTruncated = cardSets.length > out.length;
       break;
     }
+  }
+  return out;
+}
+
+// --- sequential action space -------------------------------------------------
+
+export type SequentialChild = Candidate & {
+  // The partial play after taking this child.
+  readonly prefix: ReadonlyArray<number>;
+  // Taking this child plays `cards` and ends the decision.
+  readonly complete: boolean;
+};
+
+// The options at one sub-step of the sequential action space: one child
+// per card that may be added next, plus "submit" when the prefix is
+// already a legal lead that could also be extended. A child whose only
+// continuation would be to submit it is itself marked complete, so a lone
+// single lead -- the commonest lead -- is one decision rather than two.
+export function sequentialChildren(
+  state: GameState,
+  seat: Seat,
+  seq: SequentialPlay,
+  prefix: ReadonlyArray<number>,
+): SequentialChild[] {
+  const hand = state.currentHand;
+  if (hand === null || hand.trumpRank === null) return [];
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank, trumpSuit: hand.trumpSuit };
+  const n = state.config.numDecks;
+  const trick = hand.currentTrick;
+  const isLead = trick === null || trick.plays.length === 0;
+  let ledSuit: EffectiveSuit | null = null;
+  let winning: ReturnType<typeof decomposePlay> = null;
+  if (!isLead && trick !== null) {
+    ledSuit = effectiveSuit(trick.plays[0]!.cards[0]!, ctx);
+    winning = winningPlay(trick, ctx, n);
+  }
+  const opts = seq.options(prefix);
+  const out: SequentialChild[] = [];
+  const make = (p: ReadonlyArray<number>, complete: boolean): void => {
+    const cards = seq.cards(p);
+    out.push({
+      cards,
+      shape: shapeOf(cards, ctx, n),
+      flags: flagsOf(cards, ctx, n, ledSuit, winning) | (complete ? FLAG_COMPLETE : 0),
+      points: Math.min(sumPoints(cards), 255),
+      remaining: complete || seq.size === null ? 0 : seq.size - p.length,
+      prefix: p,
+      complete,
+    });
+  };
+  if (isLead && opts.canSubmit && prefix.length > 0) make([...prefix], true);
+  for (const c of opts.next) {
+    const p = [...prefix, c];
+    let complete: boolean;
+    if (seq.mode === 'follow') {
+      complete = p.length === seq.size;
+    } else {
+      const after = seq.options(p);
+      complete = after.canSubmit && after.next.length === 0;
+    }
+    make(p, complete);
   }
   return out;
 }

@@ -14,6 +14,7 @@ import {
   ByteWriter,
   CANDIDATE_BYTES,
   CANDIDATE_HEADER_BYTES,
+  C_REMAINING,
   MAX_CANDIDATE_CARDS,
   NO_CARD,
   E_ATTACKER_POINTS,
@@ -274,6 +275,7 @@ export function writeDecision(
     slots[1] = c.shape;
     slots[2] = c.flags;
     slots[3] = c.points;
+    slots[C_REMAINING] = Math.min(c.remaining ?? 0, 255);
     slots.fill(NO_CARD, CANDIDATE_HEADER_BYTES, CANDIDATE_BYTES);
     for (let i = 0; i < c.cards.length && i < MAX_CANDIDATE_CARDS; i++) {
       slots[CANDIDATE_HEADER_BYTES + i] = cardSlot(c.cards[i]!);

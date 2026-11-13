@@ -645,3 +645,93 @@ The `rl-dmc` entry that has been in the lobby dropdown is a placeholder:
 trained export, so every Q value tied and the bot played the first
 enumerated candidate each turn. It stays in `BOT_TYPES` for the protocol
 but `rl-v2` replaces it in `VISIBLE_BOT_TYPES`.
+
+## Action space, and a leak in the actor (Phase 6)
+
+### The candidate list missed legal follows
+
+The network can only choose among the candidates the actor enumerates, and
+for follows that list was far from complete. Against a brute-force
+enumeration of every distinct legal play (`rl/v2/oracle.ts`), over 40 hands
+of `smart-v2` play:
+
+| | legal per decision | offered | legal plays covered |
+| --- | --- | --- | --- |
+| leads | 12.7 | 12.4 | 97.7% |
+| follows | 13.1 | 5.6 | **43.0%** |
+
+Of 563 throws a fair-play agent could safely lead, 320 were offered. A
+separate 300-hand probe found that in 36.3% of multi-card follow positions
+where a trick-winning follow was legal (259 of 714), no winning follow was
+offered at all. The cause is the filler step: when a follower must add cards
+beyond its forced led-suit cards, the enumerator takes the first 32 subsets
+in the hand's stored order, which is deal order, so almost every offered
+fill contains one of the first two cards dealt.
+
+`rl/v2/sequential.ts` replaces the list with a card-by-card action space:
+cards are added in a canonical order (strongest first, copies
+interchangeable), follows complete themselves at the lead's size, leads end
+with a submit, and the masks are exact. Checked against the oracle at every
+play decision of 40 hands (3,624 decisions, none skipped): the reachable
+plays equal the legal ones exactly (37,003), with no dead ends and one
+sequence per play, and ~20k sampled plays pass the reducer without a
+forced-lead penalty. Mutating the pair rule or the throw-safety rule makes
+the test fail.
+
+Cost on the same positions: 0.97 sub-steps with more than one option per
+decision; mask construction 26 us per decision and 2 us per lookup. Under a
+random policy 92% of decisions take one learned sub-step, and the
+environment runs at 230 hands/s against 258 for the enumerated list.
+
+### The landlord's buried kitty leaked to the other seats
+
+`env.ts` passed the buried kitty to every learner seat, not only the
+landlord, in two places. The shipped bot (`rl/v2/agent.ts`) checks for the
+landlord correctly, so the app was never affected.
+
+* **Candidates.** Throw safety treated the kitty's cards as seen. On 60
+  hands of `smart-v2` play, 9.0% of non-landlord leads (67 of 747) got a
+  different candidate set, with 90 extra throws in total. R0's training
+  data includes these.
+* **Search worlds.** For a non-landlord seat the sampled worlds dealt the
+  other hands only from the true non-kitty cards and left the kitty empty.
+  The search results under "Search (Phase 3)" were measured with this leak
+  on every non-landlord decision and should be re-run before they are
+  relied on. The TypeScript `rl-v2` arena numbers in Phase 5 used the
+  engine bot and are unaffected.
+
+Fixed by `GameSlot.kittyFor(seat)`, which every view of a seat now goes
+through.
+
+### Switching action spaces, and what a short resume costs
+
+The 966k network was rebuilt from the shipped float16 export (no critic, no
+snapshot pool, no optimizer state) and trained for 3 minutes (~900 learner
+steps) on this 4-vCPU container, where each sample is drawn about 6 times
+against 0.79 on the training box. All rows: 96 duplicate pairs against
+`smart`, base 90210.
+
+| network | point margin |
+| --- | --- |
+| 966k as shipped, enumerated candidates | +52.71 [+45.36, +60.06] |
+| same weights, sequential action space, no training | +18.75 [+10.75, +26.75] |
+| + 3 min sequential, fresh critic (lambda 0.3) | +4.22 [-3.49, +11.93] |
+| + 3 min sequential, no critic (lambda 1) | +6.30 [-1.17, +13.78] |
+| + 3 min enumerated, fresh critic | +25.26 [+17.84, +32.68] |
+| + 3 min enumerated, no critic | +38.80 [+30.95, +46.65] |
+| + 3 min enumerated, no critic, 300-step LR warm-up | +28.70 [+22.05, +35.35] |
+
+Three readings. At fixed weights the sequential space costs about 34
+points: the network has never valued a partial play, so the sequential arm
+has to be fine-tuned and compared with a control at matched steps. A fresh
+critic costs about 13 more, which a real run avoids by resuming the trained
+one. And resuming at all lost about 14 points in 900 steps in the
+enumerated space too.
+
+That last one matters for every arm, since they all warm-start from R0.
+Checkpoints did not save optimizer state, so RMSprop restarted with empty
+second moments; they now do. But a learning-rate warm-up did not recover
+the loss, so the optimizer reset is not the explanation. The suspect is the
+small, heavily reused buffer at the start of a run on this machine. It has
+to be checked on the training hardware before E1: resume R0 in its own
+action space and confirm it holds its strength.

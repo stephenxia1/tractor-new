@@ -67,6 +67,13 @@ class DMC2Config:
     # The teacher trains on every Nth learner step; it converges fast and
     # costs as much per step as the policy network does.
     critic_every: int = 2
+    # Linear learning-rate warm-up over this many learner steps, counted
+    # from the start of this process. RMSprop's running mean of squared
+    # gradients starts at zero, so without its saved state the first ~100
+    # updates are several times their steady-state size; on a trained
+    # network that is a shock. train2 sets this when it resumes without
+    # optimizer state, and leaves it at 0 otherwise.
+    lr_warmup_steps: int = 0
 
 
 def hand_returns(episode: Episode, cfg: DMC2Config) -> tuple[np.ndarray, float]:
@@ -93,11 +100,18 @@ def hand_returns(episode: Episode, cfg: DMC2Config) -> tuple[np.ndarray, float]:
 
 
 class ReplayBuffer2:
-    """Raw wire bytes plus both targets.
+    """Raw wire bytes plus both targets and a per-sample loss weight.
 
     Records are kept in wire form (~1 KB with the privileged block) rather
     than as features: it is smaller, and a change to the featuriser does
     not invalidate everything already collected.
+
+    The weight exists for the sequential action space, where one decision
+    is built over m sub-steps that share a state and a target. Each is
+    stored with weight 1/m so a decision counts once in the loss however
+    many cards it took to build -- dividing the *weight*, not the target,
+    which stays the value of the whole play. Enumerated candidates are one
+    sub-step per decision, so their weight is always 1.
     """
 
     def __init__(self, capacity: int, state_bytes: int) -> None:
@@ -106,35 +120,43 @@ class ReplayBuffer2:
         self.actions = np.zeros((capacity, L.CANDIDATE_BYTES), dtype=np.uint8)
         self.g_points = np.zeros(capacity, dtype=np.float32)
         self.g_level = np.zeros(capacity, dtype=np.float32)
+        self.weights = np.ones(capacity, dtype=np.float32)
         self.size = 0
         self.cursor = 0
 
-    def add(self, states, actions, g_points, g_level) -> None:
+    def add(self, states, actions, g_points, g_level, weights=None) -> None:
         n = states.shape[0]
         if n == 0:
             return
+        if weights is None:
+            weights = np.ones(n, dtype=np.float32)
+        columns = [
+            (self.states, states), (self.actions, actions), (self.g_points, g_points),
+            (self.g_level, g_level), (self.weights, weights),
+        ]
         if n > self.capacity:
-            states, actions = states[-self.capacity:], actions[-self.capacity:]
-            g_points, g_level = g_points[-self.capacity:], g_level[-self.capacity:]
+            columns = [(dst, src[-self.capacity:]) for dst, src in columns]
             n = self.capacity
         end = self.cursor + n
         if end <= self.capacity:
-            sl = slice(self.cursor, end)
-            self.states[sl], self.actions[sl] = states, actions
-            self.g_points[sl], self.g_level[sl] = g_points, g_level
+            for dst, src in columns:
+                dst[self.cursor:end] = src
         else:
             first = self.capacity - self.cursor
-            self.states[self.cursor:], self.actions[self.cursor:] = states[:first], actions[:first]
-            self.g_points[self.cursor:], self.g_level[self.cursor:] = g_points[:first], g_level[:first]
-            rest = n - first
-            self.states[:rest], self.actions[:rest] = states[first:], actions[first:]
-            self.g_points[:rest], self.g_level[:rest] = g_points[first:], g_level[first:]
+            for dst, src in columns:
+                dst[self.cursor:] = src[:first]
+                dst[:n - first] = src[first:]
         self.cursor = end % self.capacity
         self.size = min(self.size + n, self.capacity)
 
     def sample(self, batch_size: int, rng: np.random.Generator):
         idx = rng.integers(0, self.size, size=batch_size)
-        return self.states[idx], self.actions[idx], self.g_points[idx], self.g_level[idx]
+        return (self.states[idx], self.actions[idx], self.g_points[idx],
+                self.g_level[idx], self.weights[idx])
+
+
+def _wmean(per_sample: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return (per_sample * w).sum() / w.sum().clamp(min=1e-8)
 
 
 class Learner2:
@@ -152,6 +174,7 @@ class Learner2:
         self.opt = torch.optim.RMSprop(net.parameters(), lr=cfg.lr)
         self.critic_opt = torch.optim.RMSprop(critic.parameters(), lr=cfg.critic_lr)
         self.steps = 0
+        self._steps_this_run = 0
         self._last_critic_loss = float("nan")
         self.stats: dict[str, float] = {}
 
@@ -159,12 +182,22 @@ class Learner2:
         cfg = self.cfg
         if buffer.size < cfg.min_buffer:
             return None
-        states, actions, g_points, g_level = buffer.sample(cfg.batch_size, rng)
+        if cfg.lr_warmup_steps > 0:
+            scale = min(1.0, (self._steps_this_run + 1) / cfg.lr_warmup_steps)
+            for g in self.opt.param_groups:
+                g["lr"] = cfg.lr * scale
+            for g in self.critic_opt.param_groups:
+                g["lr"] = cfg.critic_lr * scale
+        states, actions, g_points, g_level, weights = buffer.sample(cfg.batch_size, rng)
         n = states.shape[0]
         owner_np = np.arange(n, dtype=np.int64)
 
         sf = torch.from_numpy(state_features(states)).to(self.device)
-        af = torch.from_numpy(action_features(actions, states, owner_np)).to(self.device)
+        # The network's own input width decides which action features it
+        # reads (enumerated vs sequential action space).
+        af = torch.from_numpy(action_features(
+            actions, states, owner_np, width=self.net.cfg.action_in)).to(self.device)
+        w = torch.from_numpy(weights).to(self.device)
         owner = torch.from_numpy(owner_np).to(self.device)
         roles = torch.from_numpy(
             states[:, L.H_ROLE].astype(np.int64)).to(self.device)
@@ -179,7 +212,7 @@ class Learner2:
         train_critic = self.steps % cfg.critic_every == 0
         if train_critic:
             q_priv = self.critic(sf, priv, af, owner)
-            critic_loss = F.mse_loss(q_priv, tgt_points)
+            critic_loss = _wmean((q_priv - tgt_points) ** 2, w)
             self.critic_opt.zero_grad(set_to_none=True)
             critic_loss.backward()
             nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
@@ -197,11 +230,12 @@ class Learner2:
         else:
             target = cfg.lambda_mc * tgt_points + (1.0 - cfg.lambda_mc) * q_priv
 
-        loss_q = F.mse_loss(out["q"], target)
-        loss_level = F.mse_loss(out["q_level"], tgt_level)
-        loss_v = F.mse_loss(out["v"], tgt_points)
+        loss_q = _wmean((out["q"] - target) ** 2, w)
+        loss_level = _wmean((out["q_level"] - tgt_level) ** 2, w)
+        loss_v = _wmean((out["v"] - tgt_points) ** 2, w)
         belief = torch.from_numpy(belief_targets(states)).to(self.device)
-        loss_belief = F.binary_cross_entropy_with_logits(out["belief"], belief)
+        loss_belief = _wmean(F.binary_cross_entropy_with_logits(
+            out["belief"], belief, reduction="none").mean(dim=1), w)
         loss = (
             loss_q
             + cfg.w_level * loss_level
@@ -214,6 +248,7 @@ class Learner2:
         self.opt.step()
 
         self.steps += 1
+        self._steps_this_run += 1
         with torch.no_grad():
             # How much quieter the teacher's target is than the raw return
             # is the whole point of it, so measure it rather than assume.

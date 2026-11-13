@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 # The version this Python code was written against.
-LAYOUT_VERSION = 5
+LAYOUT_VERSION = 6
 
 RESEARCH_DIR = Path(__file__).resolve().parents[2]
 SPEC_PATH = RESEARCH_DIR / "spec.json"
@@ -93,6 +93,10 @@ FLAG_ALL_TRUMP: int = _C["flags"]["allTrump"]
 FLAG_ALL_LED_SUIT: int = _C["flags"]["allLedSuit"]
 FLAG_HAS_POINTS: int = _C["flags"]["hasPoints"]
 FLAG_BEATS_WINNER: int = _C["flags"]["beatsWinner"]
+# Sequential action space: the candidate is a whole play (taking it ends
+# the decision), and how many cards a partial follow still needs.
+FLAG_COMPLETE: int = _C["flags"]["complete"]
+C_REMAINING: int = _C["remaining"]
 
 _E = SPEC["episode"]
 EPISODE_BYTES: int = _E["bytes"]

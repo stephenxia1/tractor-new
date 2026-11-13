@@ -66,6 +66,12 @@ SCALAR_DIM = (
 STATE_DIM = PLANE_DIM + SCALAR_DIM
 
 ACTION_DIM = 2 * NUM_ENC_SLOTS + L.NUM_SHAPES + 4 + 2
+# The sequential (card-by-card) action space adds two inputs: whether the
+# candidate is a whole play, and how many cards a partial follow still
+# needs. They are appended, so a network trained on enumerated candidates
+# reads exactly the columns it was trained on and a checkpoint can be
+# widened by zero-padding (model2.widen_action_inputs).
+ACTION_DIM_SEQ = ACTION_DIM + 2
 
 # History token: the cards played, who played them, where in the trick, when.
 HISTORY_TOKEN_DIM = NUM_ENC_SLOTS + 4 + 4 + 2
@@ -295,10 +301,17 @@ def history_features(states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return tokens, mask
 
 
-def action_features(cands: np.ndarray, states: np.ndarray, owner: np.ndarray) -> np.ndarray:
+def action_features(
+    cands: np.ndarray, states: np.ndarray, owner: np.ndarray, width: int = ACTION_DIM
+) -> np.ndarray:
+    """[N, width]. `width` is the network's action input: ACTION_DIM for a
+    network trained on enumerated candidates, ACTION_DIM_SEQ for one trained
+    in the sequential action space."""
+    if width not in (ACTION_DIM, ACTION_DIM_SEQ):
+        raise ValueError(f"action feature width {width} is neither {ACTION_DIM} nor {ACTION_DIM_SEQ}")
     n = cands.shape[0]
     if n == 0:
-        return np.zeros((0, ACTION_DIM), dtype=np.float32)
+        return np.zeros((0, width), dtype=np.float32)
     n_cards = cands[:, 0].astype(np.float32)
     shape = cands[:, 1].astype(np.int64)
     flags = cands[:, 2].astype(np.int64)
@@ -313,7 +326,7 @@ def action_features(cands: np.ndarray, states: np.ndarray, owner: np.ndarray) ->
     rank, suit = _trump(states)
     counts = encode_planes(raw, rank[owner], suit[owner])[:, 0]
 
-    out = np.zeros((n, ACTION_DIM), dtype=np.float32)
+    out = np.zeros((n, width), dtype=np.float32)
     out[:, :NUM_ENC_SLOTS] = counts >= 1
     out[:, NUM_ENC_SLOTS : 2 * NUM_ENC_SLOTS] = counts >= 2
     base = 2 * NUM_ENC_SLOTS
@@ -326,6 +339,9 @@ def action_features(cands: np.ndarray, states: np.ndarray, owner: np.ndarray) ->
     base += 4
     out[:, base] = n_cards / 8.0
     out[:, base + 1] = points / 30.0
+    if width == ACTION_DIM_SEQ:
+        out[:, ACTION_DIM] = (flags & L.FLAG_COMPLETE) != 0
+        out[:, ACTION_DIM + 1] = cands[:, L.C_REMAINING].astype(np.float32) / 8.0
     return out
 
 
