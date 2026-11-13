@@ -265,6 +265,37 @@ files and committing every few seconds all ended up visible to each other
 (after `reload()`) and to the client. Arms write disjoint paths by
 `run_name`, so a sweep needs no volume-per-arm.
 
+## Driving Modal from a cloud agent session (`modal_bridge.py`)
+
+A cloud agent session cannot run the Modal CLI: its network carries
+HTTPS but not gRPC. `modal_bridge.py` puts an HTTPS API in front of the
+same work. `.github/workflows/modal-ops.yml` deploys it whenever a push to
+`rl-research` or a `claude/...` branch changes it, using three repository
+secrets (`MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `TRACTOR_CONTROL_TOKEN`).
+The session then holds `TRACTOR_CONTROL_TOKEN` as a network secret for the
+bridge's host, `https://<workspace>--tractor-control.<region>.modal.run`.
+
+A job clones a branch, then runs one of:
+
+| kind | runs, from `research/` |
+| --- | --- |
+| `script` | `python py/**.py` or `scripts/*.py`, `npx tsx src/*.ts` |
+| `module` | `python -m tractor.…` |
+| `modal` | `modal run --detach modal_*.py::<function> …`, as from a laptop |
+
+```bash
+URL=https://<workspace>--tractor-control.<region>.modal.run   # bearer token added by the session
+curl -H "Content-Type: application/json" -d '{"ref":"rl-research","kind":"modal",
+  "target":"modal_eval.py::smart","args":["--checkpoints","/vol/v5-bury/checkpoints/final.pt"],
+  "env":{"TRACTOR_EVAL_APP":"tractor-eval-x"}}' $URL/jobs
+curl "$URL/jobs/<id>?lines=100"                                   # status + log tail
+curl "$URL/file?volume=rl&path=pop8c/metrics.jsonl&tail_bytes=20000"
+```
+
+`/files` and `/file` read both `tractor-runs` (the bridge's own job logs)
+and `tractor-rl` (`volume=rl`). Env vars may be set only if named
+`TRACTOR_*`; nothing goes through a shell.
+
 ## Where each piece lives
 
 | | |
