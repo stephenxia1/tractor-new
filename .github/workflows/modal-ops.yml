@@ -1,0 +1,61 @@
+name: modal-ops
+
+# Deploys research/modal_app.py from GitHub's runners, so the research stack
+# can run on Modal without a local Modal CLI. Once deployed, jobs are started
+# and watched through the app's HTTPS control API, not through this workflow.
+#
+# Needs three repository secrets: MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (a
+# Modal API token), and TRACTOR_CONTROL_TOKEN (the bearer token the control
+# API will require). This repository is public, so its Actions logs are too:
+# nothing here prints a secret, and GitHub masks them if anything tries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: "setup: store the control token as a Modal secret, then deploy. deploy: redeploy only."
+        required: true
+        default: setup
+        type: choice
+        options: [setup, deploy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modal-ops
+  cancel-in-progress: false
+
+jobs:
+  modal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the Modal client
+        run: pip install --quiet modal
+      - name: Check the Modal token is configured
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::Add MODAL_TOKEN_ID and MODAL_TOKEN_SECRET as repository secrets."
+            exit 1
+          fi
+      - name: Store the control token as a Modal secret
+        if: inputs.op == 'setup'
+        env:
+          TRACTOR_CONTROL_TOKEN: ${{ secrets.TRACTOR_CONTROL_TOKEN }}
+        run: |
+          if [ -z "$TRACTOR_CONTROL_TOKEN" ]; then
+            echo "::error::Add TRACTOR_CONTROL_TOKEN as a repository secret."
+            exit 1
+          fi
+          modal secret create tractor-control "TRACTOR_CONTROL_TOKEN=$TRACTOR_CONTROL_TOKEN" --force > /dev/null
+          echo "stored secret tractor-control"
+      - name: Deploy research/modal_app.py
+        run: modal deploy research/modal_app.py
