@@ -1311,6 +1311,43 @@ leave-one-out, -0.012 played out), with a quarter of C's landlords a
 step. `zero2` took the play-out return from step 900
 (`--bury-reward playout --bury-landlords 512`).
 
+### A zero bot that beats the fair search bots (2026-11-14)
+
+The user's condition: the bot must be zero, trained without any
+heuristic knowledge. `zero2` is: random initialisation, single-agent
+self-play, its own declaration and burial policies learned from
+scratch (no climb, no heuristic burial, no bot data). v5 networks with
+the v5 lineage's update settings (lr 3e-4, minibatch 256, one epoch, no
+KL guard), 1024 hands a step, warm-up 300 steps on uniform declarations
+and burials, then blocks of 100 pre-play and 200 play steps. Burial:
+leave-one-out over 4 burials per landlord (E3 arm C), with played-out
+returns from step 900 (arm F2, 512 landlords a step). Launched
+2026-11-14 05:16; step 1000 at 09:40.
+
+Own declarations and burials against smart-v18/v28/v34, 770 deals a bot:
+
+| step | search | seed | win | levels | points |
+| --- | --- | --- | --- | --- | --- |
+| 500 | -- | 20260923 | 0.473 | -0.038 | -1.0 |
+| 500 | 8 worlds | 20260923 | 0.523 | +0.048 | +2.0 |
+| 750 | -- | 20260923 | 0.493 | -0.007 | +0.2 |
+| 750 | 8 worlds | 20260923 | 0.527 | +0.068 | +3.2 |
+| 1000 | -- | 20260923 | 0.516 | +0.057 | +2.5 |
+| 1000 | 8 worlds | 20260923 | **0.556** | **+0.125** | **+4.4** |
+| 1000 | 8 worlds | **20261114** | **0.572** | **+0.165** | **+6.2** |
+
+Play only (random pre-play for both sides): 0.513 / +1.5 points at step
+500, 0.531 / +3.4 at step 1000. Search (`eval/search.py`: worlds dealt
+under the public constraints, the policy and the critic) is zero too;
+it added +0.050, +0.034 and +0.041 win at steps 500, 750 and 1000
+(paired). For comparison, v5-bury -- not zero, its v4 parent played
+from heuristic-seeded burials -- reached 0.566 with its own pre-play
+and no search. Records: `evals/2026-11-14/zero2-*`.
+
+`zero1` (v6 networks, same zero recipe) stalled at 0.48-0.49 play only:
+on v6, lr 3e-4 crossed the KL guard within a pass, and at the lower
+rates that kept it inside the guard it learned little. Stopped at step 1950.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
