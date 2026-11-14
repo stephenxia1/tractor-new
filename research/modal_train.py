@@ -317,7 +317,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            rollout_forwards: str = "", fixed_shapes: bool = False,
            target_kl: float = 0.0, bury_samples: int = 1,
            bury_lr: float = 0.0, bury_epochs: int = 0,
-           lr: float = 0.0, minibatch: int = 0) -> None:
+           lr: float = 0.0, minibatch: int = 0,
+           bury_scale_minibatch: bool = True) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -447,7 +448,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             # Burials per landlord in the burial update, judged against
             # each other (DeclareTrainConfig.bury_samples); 1 is the
             # value-head baseline every run before 2026-11-14 used.
-            "declare": {"hands_per_step": declare_hands, "bury_samples": bury_samples},
+            # --no-bury-scale-minibatch keeps the burial minibatch at its
+            # default with k samples: k times the optimiser steps (E3 arm C,
+            # which beat the heuristic by the critic; arm D scaled it).
+            "declare": {"hands_per_step": declare_hands, "bury_samples": bury_samples,
+                        "bury_scale_minibatch": bury_scale_minibatch},
             # The burial learner (BuryTrainConfig); 0 keeps its default.
             "bury_train": {k: v for k, v in (("lr", bury_lr), ("epochs", bury_epochs)) if v},
             "prefetch_starts": prefetch_starts,
