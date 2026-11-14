@@ -255,7 +255,14 @@ def _preplay_step(
 
     per_agent: list[dict[str, float]] = [{} for _ in agents]
     bury = pre_rows.bury
-    if bury_nets is not None and bury is not None and len(bury):
+    loo_stats: dict[str, float] = {}
+    if bury_nets is not None and bury is not None and len(bury) and cfg.bury_samples > 1:
+        from .declare_loop import bury_update_loo
+
+        loo_stats = bury_update_loo(
+            None, nets, starts, bury, values, cfg, rng, device, cache,
+            agents=seat_of, shared=shared, learners=[a.bury for a in agents])
+    elif bury_nets is not None and bury is not None and len(bury):
         owner = seat_of[bury.hand, landlord[bury.hand]]
         ret = values[bury.hand, landlord[bury.hand]].astype(np.float32) * cfg.reward_scale
         for k, a in enumerate(agents):
@@ -273,6 +280,7 @@ def _preplay_step(
     return {
         **stats,
         **_mean_over([p for p in per_agent if p]),
+        **loo_stats,
         "declare/critic_landlord_value": float(values[np.arange(n), landlord].mean()),
         "time/critic_s": t_update - t_critic,
         "time/update_s": time.perf_counter() - t_update,

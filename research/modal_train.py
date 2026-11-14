@@ -315,7 +315,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            forward_chunks: int = 1, rollout_overlap: bool = False,
            compile: bool = False, cuda_graphs: bool = False,
            rollout_forwards: str = "", fixed_shapes: bool = False,
-           target_kl: float = 0.0) -> None:
+           target_kl: float = 0.0, bury_samples: int = 1) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -437,7 +437,10 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             "random_burial_frac": random_burial_frac,
             "bury_rounds": bury_rounds,
             "bury_consider": bury_consider,
-            "declare": {"hands_per_step": declare_hands},
+            # Burials per landlord in the burial update, judged against
+            # each other (DeclareTrainConfig.bury_samples); 1 is the
+            # value-head baseline every run before 2026-11-14 used.
+            "declare": {"hands_per_step": declare_hands, "bury_samples": bury_samples},
             "prefetch_starts": prefetch_starts,
             "bury_evaluator": bury_evaluator,
             "bury_policy": bury_policy,

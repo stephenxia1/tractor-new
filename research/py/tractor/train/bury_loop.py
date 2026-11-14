@@ -58,8 +58,13 @@ class BuryLearner:
         self.opt = torch.optim.AdamW(net.parameters(), lr=self.cfg.lr)
         self.amp = bool(self.cfg.bf16) and self.device.type == "cuda"
 
-    def update(self, rows: BuryRows, returns: np.ndarray) -> dict[str, float]:
-        """One PPO update. ``returns[i]`` is row ``i``'s return."""
+    def update(
+        self, rows: BuryRows, returns: np.ndarray, advantages: np.ndarray | None = None
+    ) -> dict[str, float]:
+        """One PPO update. ``returns[i]`` is row ``i``'s return, which the
+        value head fits. ``advantages``, when given, replace return minus
+        value head as the policy's signal -- a leave-one-out baseline over
+        several burials of the same landlord (``starts.burial_samples``)."""
         cfg = self.cfg
         dev = self.device
         cards = torch.from_numpy(rows.cards).to(dev)
@@ -69,7 +74,8 @@ class BuryLearner:
         action = torch.from_numpy(rows.action).to(dev)
         old_logp = torch.from_numpy(rows.logp).to(dev)
         ret = torch.from_numpy(np.asarray(returns, dtype=np.float32)).to(dev)
-        adv = ret - torch.from_numpy(rows.value).to(dev)
+        adv = (ret - torch.from_numpy(rows.value).to(dev) if advantages is None else
+               torch.from_numpy(np.asarray(advantages, dtype=np.float32)).to(dev))
         adv = (adv - adv.mean()) / (adv.std() + 1e-8) if len(adv) > 1 else adv
 
         self.net.train()
@@ -97,9 +103,9 @@ class BuryLearner:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
                 self.opt.step()
-                totals["policy"] += float(pg)
-                totals["value"] += float(vloss)
-                totals["entropy"] += float(ent)
+                totals["policy"] += float(pg.detach())
+                totals["value"] += float(vloss.detach())
+                totals["entropy"] += float(ent.detach())
                 totals["clip_frac"] += float(((ratio - 1).abs() > cfg.clip).float().mean())
                 count += 1
         self.net.eval()

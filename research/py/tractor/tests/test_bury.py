@@ -216,3 +216,62 @@ def test_imitation_teaches_the_heuristics_burial() -> None:
     overlap = np.mean([int(np.minimum(g, heuristic_burial(p, c)).sum()) / 8
                        for g, p, c in zip(greedy, ps, cs)])
     assert overlap > 0.85, overlap
+
+
+def test_leave_one_out_subtracts_the_others_mean() -> None:
+    from ..train.starts import leave_one_out
+
+    v = np.array([[1.0, 4.0], [2.0, 0.0], [6.0, 2.0]])
+    got = leave_one_out(v)
+    assert np.allclose(got[:, 0], [1 - 4, 2 - 3.5, 6 - 1.5])
+    # The k advantages of a landlord sum to zero.
+    assert np.allclose(got.sum(axis=0), 0.0)
+    # Adding a constant to a landlord's column changes nothing.
+    assert np.allclose(leave_one_out(v + np.array([10.0, -3.0])), got)
+
+
+def test_extra_burials_share_their_landlords_hand() -> None:
+    """``burial_samples``: k burials per landlord, every one legal, every
+    start the original one but for the landlord's hand and the kitty, and
+    the rows of sample s pointing at the hand they bury for."""
+    from ..nn.bury_net import BuryNet
+    from ..sim.bury import policy_burials
+    from ..train.starts import Start, burial_samples
+
+    torch.manual_seed(8)
+    net = BuryNet().eval()
+    with torch.no_grad():
+        net.score.weight.normal_()
+    rng = np.random.default_rng(9)
+    starts, pools, cs = [], [], []
+    for _ in range(5):
+        state, _info = generate(rng)
+        pool = (state.hands[state.landlord] + state.kitty).astype(np.int8)
+        pools.append(pool)
+        cs.append(state.ctx)
+    others = np.zeros((5, 3, NUM_TYPES), dtype=np.float32)
+    burials, rows = policy_burials(net, pools, cs, [(1, 0)] * 5, rng, others=others,
+                                   record=True)
+    # Starts made from the pools: the landlord holds pool - burial.
+    rng2 = np.random.default_rng(9)
+    for i in range(5):
+        state, _info = generate(rng2)
+        hands = state.hands.astype(np.int8).copy()
+        hands[state.landlord] = (pools[i] - burials[i]).astype(np.int8)
+        starts.append(Start(hands=hands, kitty=burials[i].astype(np.int8),
+                            landlord=state.landlord, level_rank=state.ctx.level_rank,
+                            trump_suit=state.ctx.trump_suit))
+    merged, sample_of, hand_of, more = burial_samples(net, starts, rows, 3, rng)
+    assert len(more) == 3 * 5 and len(merged) == 3 * 8 * 5
+    assert np.array_equal(np.bincount(sample_of), [40, 40, 40])
+    for s_idx, st in enumerate(more):
+        h = hand_of[s_idx]
+        orig = starts[h]
+        assert int(st.kitty.sum()) == 8
+        assert np.array_equal(st.hands[st.landlord].astype(np.int64) + st.kitty,
+                              pools[h].astype(np.int64))
+        for seat in range(4):
+            if seat != st.landlord:
+                assert np.array_equal(st.hands[seat], orig.hands[seat])
+    assert set(merged.hand.tolist()) == set(range(5))
+    assert np.all(merged.mask[np.arange(len(merged)), merged.action])

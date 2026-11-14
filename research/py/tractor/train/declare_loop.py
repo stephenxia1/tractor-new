@@ -26,7 +26,9 @@ import torch.nn.functional as F
 
 from ..nn.declare import DeclareNet
 from ..nn.features import Cache
-from .starts import DeclareRows, PrePlayConfig, critic_values, make_starts
+from .starts import (
+    DeclareRows, PrePlayConfig, burial_samples, critic_values, leave_one_out, make_starts,
+)
 
 __all__ = ["DeclareTrainConfig", "DeclareLearner"]
 
@@ -48,6 +50,11 @@ class DeclareTrainConfig:
     # the real pipeline makes. ``pre.burial`` says what buries -- the
     # value climb, or the burial policy, which then trains here too.
     pre: PrePlayConfig = field(default_factory=lambda: PrePlayConfig(random_burial_frac=0.0))
+    # Burials per landlord for the burial policy's update. 1: one, with the
+    # burial network's value head as baseline (every run before
+    # 2026-11-14). k > 1: k burials of the same landlord, each valued by
+    # the critic, each judged against the mean of the other k - 1.
+    bury_samples: int = 1
 
 
 class DeclareLearner:
@@ -80,9 +87,14 @@ class DeclareLearner:
             # The landlord's play-start value is the return of all eight
             # of its picks.
             landlord = np.array([s.landlord for s in starts], dtype=np.int64)
-            hand = pre_rows.bury.hand
-            ret = values[hand, landlord[hand]].astype(np.float32) * cfg.reward_scale
-            stats.update(self.bury.update(pre_rows.bury, ret))
+            if cfg.bury_samples > 1:
+                stats.update(bury_update_loo(
+                    self.bury, play_net, starts, pre_rows.bury, values, cfg, rng,
+                    self.device, self.cache))
+            else:
+                hand = pre_rows.bury.hand
+                ret = values[hand, landlord[hand]].astype(np.float32) * cfg.reward_scale
+                stats.update(self.bury.update(pre_rows.bury, ret))
         rows = pre_rows.declare
         if len(rows) == 0:
             return {**stats, "declare/rows": 0.0}
@@ -147,3 +159,45 @@ class DeclareLearner:
             "declare/return_mean": float(ret.mean()),
             "declare/declare_rate": float(declared.mean()),
         }
+
+
+def bury_update_loo(
+    bury: Any, play_net: Any, starts: list, rows: Any, values: np.ndarray,
+    cfg: DeclareTrainConfig, rng: np.random.Generator, device: Any, cache: Cache,
+    agents: Any = None, shared: Any = None, learners: Any = None,
+) -> dict[str, float]:
+    """The burial update with ``cfg.bury_samples`` burials per landlord and
+    a leave-one-out baseline. ``values`` are the critic's at ``starts``
+    (sample 0). For a population, ``agents`` routes each landlord to its
+    agent, ``bury`` and ``learners`` are per agent and ``shared`` is the
+    shared critic. -> the update's statistics (averaged over agents)."""
+    nets = [b.net for b in learners] if learners is not None else bury.net
+    merged, sample_of, hand_of, more = burial_samples(
+        nets, starts, rows, cfg.bury_samples, rng, device, cache, agents=agents)
+    n = len(more) // cfg.bury_samples
+    v_more = critic_values(play_net, more[n:], device, agents=(
+        None if agents is None else np.asarray(agents)[hand_of[n:]]), shared=shared)
+    landlord = np.array([s.landlord for s in more], dtype=np.int64)
+    v = np.empty(len(more), dtype=np.float64)
+    v[:n] = values[hand_of[:n], landlord[:n]]
+    v[n:] = v_more[np.arange(len(more) - n), landlord[n:]]
+    table = v.reshape(cfg.bury_samples, n)
+    adv = leave_one_out(table).reshape(-1)
+    # Each row's landlord and sample -> its column in ``table``.
+    col = {int(h): j for j, h in enumerate(hand_of[:n])}
+    idx = sample_of * n + np.array([col[int(h)] for h in merged.hand])
+    ret = (v[idx] * cfg.reward_scale).astype(np.float32)
+    a = (adv[idx] * cfg.reward_scale).astype(np.float32)
+    stats_extra = {"bury/loo_spread": float(table.std(axis=0).mean() * cfg.reward_scale),
+                   "bury/samples": float(cfg.bury_samples)}
+    if learners is None:
+        return {**bury.update(merged, ret, a), **stats_extra}
+    owner = np.asarray(agents)[merged.hand, [starts[int(h)].landlord for h in merged.hand]]
+    per = []
+    for k, learner in enumerate(learners):
+        sel = np.nonzero(owner == k)[0]
+        if len(sel):
+            per.append(learner.update(merged.subset(sel), ret[sel], a[sel]))
+    keys = {key for p in per for key in p}
+    return {**{key: float(np.mean([p[key] for p in per if key in p])) for key in keys},
+            **stats_extra}

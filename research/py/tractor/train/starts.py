@@ -456,3 +456,77 @@ def critic_values(
                 )
                 out[r] = v.float().cpu().numpy()
     return out.reshape(len(starts), NUM_SEATS)
+
+
+def burial_samples(
+    bury_net: Any,
+    starts: list[Start],
+    rows: BuryRows,
+    k: int,
+    rng: np.random.Generator,
+    device: Any = "cpu",
+    cache: Cache | None = None,
+    num_decks: int = 2,
+    agents: Any = None,
+) -> tuple[BuryRows, np.ndarray, np.ndarray, list[Start]]:
+    """``k - 1`` more burials for every landlord ``rows`` recorded, from the
+    same policy, beside the one it made.
+
+    For a leave-one-out baseline: a landlord's burials share its pool and
+    the other hands, so the difference between their critic values is the
+    burial's doing alone, where a learned baseline also has to predict
+    how good the hand was. -> (every sample's rows, each row's sample
+    index, each start's hand index, one start per landlord and sample in
+    sample-major order -- sample 0 is the burial already made).
+    """
+    from ..sim.bury import pools_from_rows
+
+    first = rows.ctx[:, 18] > 0.5
+    hand_of = rows.hand[first]
+    pools, ctxs, standings, others = pools_from_rows(rows, num_decks)
+    n = len(hand_of)
+    owner = (np.zeros(n, dtype=np.int64) if agents is None else
+             np.asarray(agents)[hand_of, [starts[h].landlord for h in hand_of]])
+
+    def start_with(s: Start, burial: np.ndarray) -> Start:
+        hands = s.hands.astype(np.int8).copy()
+        pool = s.hands[s.landlord].astype(np.int64) + s.kitty.astype(np.int64)
+        hands[s.landlord] = (pool - burial).astype(np.int8)
+        return Start(hands=hands, kitty=burial.astype(np.int8), landlord=s.landlord,
+                     level_rank=s.level_rank, trump_suit=s.trump_suit)
+
+    all_rows = [rows]
+    sample_of = [np.zeros(len(rows), dtype=np.int64)]
+    out_starts = [starts[h] for h in hand_of]
+    out_hands = [hand_of]
+    for sample in range(1, k):
+        burials: list = [None] * n
+        parts: list[BuryRows] = []
+        for agent, members in _groups(owner):
+            got, r = policy_burials(
+                _pick(bury_net, agent), [pools[j] for j in members],
+                [ctxs[j] for j in members], [standings[j] for j in members], rng, device,
+                others=others[members], record=True, cache=cache, num_decks=num_decks,
+            )
+            for j, b in zip(members, got):
+                burials[j] = b
+            r.hand = hand_of[members][r.hand]
+            parts.append(r)
+        r_all = parts[0] if len(parts) == 1 else BuryRows(**{
+            key: np.concatenate([vars(p)[key] for p in parts]) for key in vars(parts[0])})
+        all_rows.append(r_all)
+        sample_of.append(np.full(len(r_all), sample, dtype=np.int64))
+        out_starts += [start_with(starts[hand_of[j]], burials[j]) for j in range(n)]
+        out_hands.append(hand_of)
+    merged = BuryRows(**{key: np.concatenate([vars(p)[key] for p in all_rows])
+                         for key in vars(rows)})
+    return merged, np.concatenate(sample_of), np.concatenate(out_hands), out_starts
+
+
+def leave_one_out(values: np.ndarray) -> np.ndarray:
+    """float[k, n] -> each entry minus the mean of the other ``k - 1`` in
+    its column."""
+    k = values.shape[0]
+    if k < 2:
+        raise ValueError("a leave-one-out baseline needs at least two samples")
+    return values - (values.sum(axis=0, keepdims=True) - values) / (k - 1)
