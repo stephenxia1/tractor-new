@@ -1243,6 +1243,21 @@ TRACTOR_EVAL_APP=tractor-eval-pop8c-sim modal run --detach modal_eval.py::popula
   --out pop8c-2800-random-sim.jsonl
 ```
 
+**What it changes** (2026-11-14, `evals/2026-11-14/`, random pre-play, paired
+on the same 770 deals a bot, host list -> training's list):
+
+| | win | points a hand | levels a hand |
+| --- | --- | --- | --- |
+| `v5-bury` final, over v18/v28/v34 | -0.002 +/- 0.011 | **+1.67 +/- 1.02** | +0.226 -> +0.256 |
+| `pop8c` step 2800, 8 agents x 4 bots | -0.002 +/- 0.003 | +0.20 +/- 0.31 | -0.011 -> -0.011 |
+
+Smaller than the coverage numbers suggested. The list also gives back the
+throws that are possible but not provably safe, and the agents take them:
+`v5-bury` was blocked about once a hand (6,389 over 6,160 hands), the
+population on 2.4% of its decisions, each paying the engine's penalty.
+Records on the two lists are not like for like; which one later
+benchmarks use is the user's call.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
