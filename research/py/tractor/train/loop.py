@@ -53,7 +53,7 @@ from ..nn.model import ActorCritic, ModelConfig, load_model
 from ..sim.bury import BuryConfig
 from .bury_loop import BuryLearner, BuryTrainConfig
 from .declare_loop import DeclareLearner, DeclareTrainConfig
-from .starts import PrePlayConfig, make_starts
+from .starts import PrePlayConfig, make_starts, set_playout_pool
 from ..telemetry import Spans, memory_snapshot
 from .buffer import RolloutBuffer
 from .evaluate import evaluate, evaluate_against_bots
@@ -491,6 +491,8 @@ def train(
         if cfg.rollout_workers > 1
         else None
     )
+    # Burial play-outs (DeclareTrainConfig.bury_reward "playout") run here too.
+    set_playout_pool(rollout_pool)
     ckpt_dir = Path(cfg.checkpoint_dir)
     prefetched: Any = None
     executor = ThreadPoolExecutor(max_workers=1) if cfg.prefetch_starts else None
@@ -707,6 +709,7 @@ def train(
         # outlives the process that forgot to unlink it.
         if rollout_pool is not None:
             rollout_pool.close()
+        set_playout_pool(None)
         if executor is not None:
             executor.shutdown(wait=True)
 

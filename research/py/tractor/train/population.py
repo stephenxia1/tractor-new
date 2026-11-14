@@ -76,7 +76,7 @@ from .loop import TrainConfig, _prune, reward_mix
 from .parallel import RolloutPool
 from .ppo import PPOConfig, PPOLearner
 from .rollout import DECKS, collect
-from .starts import PrePlayConfig, critic_values, make_starts
+from .starts import PrePlayConfig, critic_values, make_starts, set_playout_pool
 
 __all__ = [
     "PopulationConfig",
@@ -495,6 +495,8 @@ def train_population(
                     hands_per_round=cfg.hands_per_step)
         if cfg.rollout_workers > 1 else None
     )
+    # Burial play-outs (DeclareTrainConfig.bury_reward "playout") run here too.
+    set_playout_pool(rollout_pool)
     cache = Cache()
     nets = [a.net for a in agents]
     amp = agents[0].learner.amp
@@ -653,5 +655,6 @@ def train_population(
     finally:
         if rollout_pool is not None:
             rollout_pool.close()
+        set_playout_pool(None)
 
     return summary

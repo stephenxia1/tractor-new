@@ -314,3 +314,30 @@ def test_playout_values_follow_their_starts() -> None:
     b = playout_values(net, [starts[i] for i in perm], greedy=True, rng=np.random.default_rng(1))
     assert np.allclose(b, a[perm])
     assert np.all(np.abs(a) < 3.0) and np.any(a != 0.0)
+
+
+def test_playout_values_on_a_rollout_pool_match_the_serial_ones() -> None:
+    """The same greedy play-outs on worker processes as in this one."""
+    from ..sim.bury import heuristic_burial
+    from ..train.parallel import RolloutPool
+    from ..train.starts import Start, playout_values
+
+    rng = np.random.default_rng(13)
+    starts = []
+    for _ in range(6):
+        state, _info = generate(rng)
+        pool = (state.hands[state.landlord] + state.kitty).astype(np.int64)
+        burial = heuristic_burial(pool, state.ctx).astype(np.int64)
+        hands = state.hands.astype(np.int8).copy()
+        hands[state.landlord] = (pool - burial).astype(np.int8)
+        starts.append(Start(hands=hands, kitty=burial.astype(np.int8), landlord=state.landlord,
+                            level_rank=state.ctx.level_rank, trump_suit=state.ctx.trump_suit))
+    net = _net(4)
+    serial = playout_values(net, starts, greedy=True, rng=np.random.default_rng(0))
+    workers = RolloutPool(cfg=net.cfg, workers=2, hands_per_round=4)
+    try:
+        parallel = playout_values(net, starts, greedy=True, rng=np.random.default_rng(0),
+                                  pool=workers)
+    finally:
+        workers.close()
+    assert np.allclose(parallel, serial, atol=1e-6), (parallel, serial)

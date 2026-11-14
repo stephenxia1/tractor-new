@@ -3256,13 +3256,27 @@ def _bury_warmstart(checkpoint: str, name: str, warmstart: bool, steps: int,
                                 cache)})
 
     shared = None if critic is None else critic.critic
-    for i in range(steps):
-        t0 = time.perf_counter()
-        table = seating(cfg.seed, i // cfg.reshuffle_every, cfg.agents, _PRE)
-        st = _preplay_step(agents, table, declare_cfg, rng, dev, cache, shared,
-                           update_declare=False)
-        record({"kind": "ppo", "step": i + 1, "seconds": time.perf_counter() - t0,
-                **{k: v for k, v in st.items() if k.startswith("bury/")}})
+    # Play-outs on worker processes, as training's rollout runs: the
+    # single-process collector took ~260 s for a step's 8192 hands.
+    pool = None
+    if bury_reward == "playout":
+        from tractor.train.parallel import RolloutPool
+        from tractor.train.starts import set_playout_pool
+
+        pool = RolloutPool(cfg=agents[0].net.cfg, workers=16, hands_per_round=4096)
+        set_playout_pool(pool)
+    try:
+        for i in range(steps):
+            t0 = time.perf_counter()
+            table = seating(cfg.seed, i // cfg.reshuffle_every, cfg.agents, _PRE)
+            st = _preplay_step(agents, table, declare_cfg, rng, dev, cache, shared,
+                               update_declare=False)
+            record({"kind": "ppo", "step": i + 1, "seconds": time.perf_counter() - t0,
+                    **{k: v for k, v in st.items() if k.startswith("bury/")}})
+    finally:
+        if pool is not None:
+            pool.close()
+            set_playout_pool(None)
     record({"kind": "check", "at": "end",
             **_burial_check(agents, critic, cfg, declare_cfg, check_hands, seed, dev, cache)})
 
