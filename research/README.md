@@ -1258,6 +1258,40 @@ population on 2.4% of its decisions, each paying the engine's penalty.
 Records on the two lists are not like for like; which one later
 benchmarks use is the user's call.
 
+### The burial update, and why the critic caps it (E3, 2026-11-14)
+
+From `pop8c` step 2800, every agent's burial network trained 60-100
+more PPO steps with play, declaration and the shared critic frozen
+(`modal_perf.py::bury_warmstart`; metrics `evals/2026-11-14/e3*-metrics.jsonl`).
+Greedy burials on 2,048 landlords, valued by the critic from the
+landlord's seat (heuristic 0.0762, step 2800 0.0687):
+
+| arm | update | critic value | ladder vs step 2800 as trained | vs heuristic burial |
+| --- | --- | --- | --- | --- |
+| A | imitate the heuristic, then 100 PPO steps (not zero) | 0.076 -> 0.074 | -- | -- |
+| B | as trained (value-head baseline), 100 steps | 0.0740 | -0.001 +/- 0.004 win, -0.13 +/- 0.20 pts | -0.028, -2.05 |
+| C | leave-one-out over 4 burials per landlord, 100 steps | **0.0828** | **+0.007 +/- 0.004, +0.53 +/- 0.20** | -0.019, -1.40 |
+| D | C with the minibatch scaled by 4, 60 steps | 0.0730 | -- | -- |
+| E | D at lr 1e-4 and 2 epochs, 60 steps | 0.0714 | -- | -- |
+
+Ladders: all 8 agents with their own declarations and burials against
+smart-v18/v28/v34, 770 deals, paired (`evals/2026-11-14/pop8c-e3{b,c}-policy.jsonl`).
+C against B directly: +0.008 +/- 0.004 win, +0.65 +/- 0.20 points, 7 of 8
+agents up.
+
+- **The update as trained learns nothing that shows in play.** B's critic
+  value rose, its play did not move. Its baseline is the burial network's
+  value head, which must predict how good the whole hand is, so the
+  advantage is mostly the hand's luck. Every update clipped ~55% of its rows.
+- **Leave-one-out is a real gain** (`--bury-samples 4`, zero): each
+  burial is judged against the same landlord's other three, so the
+  hand's luck cancels.
+- **The critic is the ceiling.** C's burials beat the heuristic by the
+  critic (0.0828 against 0.0762) and lose to it in play. Optimising the
+  critic harder finds its mistakes. A reward from playing each burial out
+  with the frozen play policy would not have them; that is a change to
+  the reward, so it is the user's call.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

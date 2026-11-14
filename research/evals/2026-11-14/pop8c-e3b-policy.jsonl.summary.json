@@ -1,0 +1,167 @@
+{
+  "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt",
+  "deals": 770,
+  "seed": 20260923,
+  "pre_play": "agent-policy",
+  "candidates": "host",
+  "bots": [
+    "smart",
+    "smart-v18",
+    "smart-v28",
+    "smart-v34"
+  ],
+  "ranked": [
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#6",
+      "win": 0.4941558441558442,
+      "win_ci": [
+        0.4816705703407597,
+        0.5066411179709286
+      ],
+      "levels": -0.016233766233766232,
+      "levels_half": 0.02027630477091995,
+      "points": -0.1964285714285714,
+      "points_half": 0.7514400699523068,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#5",
+      "win": 0.49253246753246754,
+      "win_ci": [
+        0.48004773341340584,
+        0.5050172016515292
+      ],
+      "levels": -0.01201298701298701,
+      "levels_half": 0.019512232280889573,
+      "points": 0.007305194805194648,
+      "points_half": 0.7410661545510543,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#0",
+      "win": 0.49188311688311687,
+      "win_ci": [
+        0.4793986355077746,
+        0.5043675982584591
+      ],
+      "levels": 0.012824675324675324,
+      "levels_half": 0.01891458844025665,
+      "points": 0.8295454545454548,
+      "points_half": 0.7068659499279148,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#1",
+      "win": 0.4913961038961039,
+      "win_ci": [
+        0.47891182590418874,
+        0.5038803818880191
+      ],
+      "levels": 0.026785714285714277,
+      "levels_half": 0.019970379527081097,
+      "points": 1.549512987012987,
+      "points_half": 0.7511456876763635,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#3",
+      "win": 0.48733766233766235,
+      "win_ci": [
+        0.4748555401504871,
+        0.4998197845248376
+      ],
+      "levels": -0.020616883116883117,
+      "levels_half": 0.02006505461328727,
+      "points": -0.4237012987012988,
+      "points_half": 0.7322594830154951,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#4",
+      "win": 0.48587662337662335,
+      "win_ci": [
+        0.4733954788297174,
+        0.4983577679235293
+      ],
+      "levels": -0.018668831168831168,
+      "levels_half": 0.02007404768823814,
+      "points": -0.6793831168831169,
+      "points_half": 0.7310503552280535,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#2",
+      "win": 0.45064935064935063,
+      "win_ci": [
+        0.43822419233864096,
+        0.4630745089600603
+      ],
+      "levels": -0.09204545454545454,
+      "levels_half": 0.0206068855435286,
+      "points": -3.3887987012987013,
+      "points_half": 0.7629593862921891,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3b/checkpoints/final.pt#7",
+      "win": 0.44366883116883116,
+      "win_ci": [
+        0.4312621994469179,
+        0.4560754628907444
+      ],
+      "levels": -0.11136363636363637,
+      "levels_half": 0.019415281984484348,
+      "points": -4.0600649350649345,
+      "points_half": 0.7436656153738723,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    }
+  ]
+}

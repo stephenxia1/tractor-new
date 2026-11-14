@@ -1,0 +1,167 @@
+{
+  "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt",
+  "deals": 770,
+  "seed": 20260923,
+  "pre_play": "agent-policy",
+  "candidates": "host",
+  "bots": [
+    "smart",
+    "smart-v18",
+    "smart-v28",
+    "smart-v34"
+  ],
+  "ranked": [
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#5",
+      "win": 0.5170454545454546,
+      "win_ci": [
+        0.504566585530628,
+        0.5295243235602811
+      ],
+      "levels": 0.03474025974025974,
+      "levels_half": 0.020034867845171837,
+      "points": 1.6891233766233766,
+      "points_half": 0.7570091915863137,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#0",
+      "win": 0.4987012987012987,
+      "win_ci": [
+        0.4862152140697017,
+        0.5111873833328957
+      ],
+      "levels": 0.024999999999999998,
+      "levels_half": 0.01923439549313,
+      "points": 1.5779220779220777,
+      "points_half": 0.7160924645443744,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#6",
+      "win": 0.4967532467532468,
+      "win_ci": [
+        0.48426738324820406,
+        0.5092391102582895
+      ],
+      "levels": -0.005032467532467534,
+      "levels_half": 0.020541600689534936,
+      "points": 0.4099025974025976,
+      "points_half": 0.7523308505663285,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#1",
+      "win": 0.49188311688311687,
+      "win_ci": [
+        0.4793986355077746,
+        0.5043675982584591
+      ],
+      "levels": 0.02646103896103896,
+      "levels_half": 0.01999977831580132,
+      "points": 1.332792207792208,
+      "points_half": 0.7572948713051558,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#3",
+      "win": 0.4900974025974026,
+      "win_ci": [
+        0.47761372490210874,
+        0.5025810802926964
+      ],
+      "levels": -0.008441558441558437,
+      "levels_half": 0.0201234573873886,
+      "points": 0.019480519480519543,
+      "points_half": 0.7400850392009473,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#4",
+      "win": 0.4896103896103896,
+      "win_ci": [
+        0.4771269587559631,
+        0.5020938204648161
+      ],
+      "levels": -0.005032467532467527,
+      "levels_half": 0.01952846184100884,
+      "points": -0.037337662337662336,
+      "points_half": 0.7257481665568829,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#2",
+      "win": 0.4599025974025974,
+      "win_ci": [
+        0.4474566858459589,
+        0.47234850895923597
+      ],
+      "levels": -0.07435064935064935,
+      "levels_half": 0.02038785915357645,
+      "points": -2.81737012987013,
+      "points_half": 0.7578305293555965,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3c/checkpoints/final.pt#7",
+      "win": 0.4470779220779221,
+      "win_ci": [
+        0.434661933266664,
+        0.4594939108891801
+      ],
+      "levels": -0.11055194805194807,
+      "levels_half": 0.02002236288948794,
+      "points": -3.9772727272727275,
+      "points_half": 0.7523959397922518,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    }
+  ]
+}
