@@ -280,6 +280,10 @@ def load_checkpoint(
             want = sum(1 for p in net.parameters() if p.requires_grad)
             group["params"] = list(group["params"]) + list(range(have, want))
         learner.opt.load_state_dict(state)
+        # A loaded optimiser state brings back the learning rate it was
+        # saved with; the run's config decides, so a resume can change it.
+        for group in learner.opt.param_groups:
+            group["lr"] = learner.cfg.lr
     return int(blob.get("step", 0))
 
 

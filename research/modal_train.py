@@ -316,7 +316,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            compile: bool = False, cuda_graphs: bool = False,
            rollout_forwards: str = "", fixed_shapes: bool = False,
            target_kl: float = 0.0, bury_samples: int = 1,
-           bury_lr: float = 0.0, bury_epochs: int = 0) -> None:
+           bury_lr: float = 0.0, bury_epochs: int = 0,
+           lr: float = 0.0, minibatch: int = 0) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -415,6 +416,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             # `length_buckets` 4 took a 1024-hand update from 9.7 s to
             # 7.9 s on an L40S with the same losses and KL (modal_perf.py).
             "ppo": {"epochs": epochs, "length_buckets": length_buckets,
+                    # The play learner's step (PPOConfig.lr, .minibatch); 0
+                    # keeps the defaults (3e-4, 256). A resume takes these,
+                    # not the rate its saved optimiser state carries.
+                    **({"lr": lr} if lr else {}),
+                    **({"minibatch": minibatch} if minibatch else {}),
                     # The update through torch.compile on fixed shapes
                     # (PPOConfig.compile): a third off an update, ~4 min
                     # of compiling at the start.

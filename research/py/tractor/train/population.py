@@ -403,6 +403,8 @@ def load_agents(agents: list[_Agent], blob: dict) -> int:
     for agent, saved in zip(agents, blob["agents"]):
         load_model(agent.net, saved["model"])
         agent.learner.opt.load_state_dict(saved["optimizer"])
+        for group in agent.learner.opt.param_groups:
+            group["lr"] = agent.learner.cfg.lr  # the run's, not the checkpoint's
         if agent.declare is not None and saved.get("declare") is not None:
             check_saved("declaration", saved["declare"], agent.declare.net.cfg)
             agent.declare.net.load_state_dict(saved["declare"]["model"])
