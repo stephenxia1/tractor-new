@@ -124,14 +124,24 @@ def _keep_scores(pool: np.ndarray, ctx: Ctx) -> np.ndarray:
     return score
 
 
+def heuristic_picks(
+    pool: np.ndarray, ctx: Ctx, kitty_size: int = KITTY_SIZE
+) -> np.ndarray:
+    """int64[kitty_size]: the heuristic's burial as a pick sequence, the
+    card it least wants to keep first."""
+    score = _keep_scores(pool, ctx)
+    cards = np.repeat(np.arange(NUM_TYPES), pool.astype(np.int64))
+    order = np.argsort(score[cards], kind="stable")
+    return cards[order[:kitty_size]]
+
+
 def heuristic_burial(
     pool: np.ndarray, ctx: Ctx, kitty_size: int = KITTY_SIZE
 ) -> np.ndarray:
     """int8[54]: the ``kitty_size`` lowest-scoring cards of ``pool``."""
-    score = _keep_scores(pool, ctx)
-    cards = np.repeat(np.arange(NUM_TYPES), pool.astype(np.int64))
-    order = np.argsort(score[cards], kind="stable")
-    return np.bincount(cards[order[:kitty_size]], minlength=NUM_TYPES).astype(np.int8)
+    return np.bincount(
+        heuristic_picks(pool, ctx, kitty_size), minlength=NUM_TYPES
+    ).astype(np.int8)
 
 
 def random_burial(
@@ -543,6 +553,101 @@ def bury_context(
     return out
 
 
+def _step_inputs(
+    static: np.ndarray, pool: np.ndarray, buried: np.ndarray, ctxs: Sequence[Ctx],
+    standings: Sequence[tuple[int, int]], step: int, num_decks: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The burial network's inputs at pick ``step``: (cards, ctx, mask)."""
+    held = pool - buried
+    cards = np.concatenate(
+        (static, (held / num_decks)[..., None], (buried / num_decks)[..., None],
+         (pool / num_decks)[..., None]),
+        axis=2,
+    ).astype(np.float32)
+    ctx = np.stack([
+        bury_context(ctxs[i].level_rank, ctxs[i].trump_suit, step,
+                     standings[i][0], standings[i][1])
+        for i in range(len(ctxs))
+    ])
+    return cards, ctx, held > 0
+
+
+def pools_from_rows(
+    rows: "BuryRows", num_decks: int = 2
+) -> tuple[np.ndarray, list[Ctx], list[tuple[int, int]], np.ndarray]:
+    """The landlords behind a batch of recorded burials, from their first
+    picks: (pools int8[n, 54], trump contexts, standings, other hands
+    float32[n, 3 * 54]) -- the arguments ``policy_burials`` was called
+    with, so the same landlords can be buried again another way."""
+    from ..nn.bury_net import BURY_STEPS
+
+    first = np.nonzero(rows.ctx[:, 18] > 0.5)[0]
+    pools = np.rint(rows.cards[first, :, -1] * num_decks).astype(np.int8)
+    ctx = rows.ctx[first]
+    level = ctx[:, 0:13].argmax(axis=1)
+    trump = ctx[:, 13:18].argmax(axis=1)
+    tier = ctx[:, 18 + BURY_STEPS : 18 + BURY_STEPS + 5].argmax(axis=1)
+    rel_block = ctx[:, 18 + BURY_STEPS + 5 : 18 + BURY_STEPS + 9]
+    rel = np.where(rel_block.max(axis=1) > 0.5, rel_block.argmax(axis=1), -1)
+    ctxs = [Ctx(int(level[i]), int(trump[i])) for i in range(len(first))]
+    standings = [(int(tier[i]), int(rel[i])) for i in range(len(first))]
+    return pools, ctxs, standings, rows.privileged[first].astype(np.float32)
+
+
+@dataclass
+class ImitationRows:
+    """Every pick of a teacher's burials, the teacher's earlier picks
+    already made: the burial network's inputs, and the teacher's cards
+    still to bury -- any one of them is a correct next pick."""
+
+    cards: np.ndarray  # float32[R, 54, BURY_CARD_DIM]
+    ctx: np.ndarray  # float32[R, BURY_CTX_DIM]
+    mask: np.ndarray  # bool[R, 54]
+    privileged: np.ndarray  # float32[R, BURY_PRIV_DIM]
+    target: np.ndarray  # bool[R, 54]
+
+    def __len__(self) -> int:
+        return len(self.target)
+
+
+def imitation_rows(
+    pools: Sequence[np.ndarray],
+    ctxs: Sequence[Ctx],
+    standings: Sequence[tuple[int, int]],
+    others: np.ndarray | None = None,
+    cache: Cache | None = None,
+    num_decks: int = 2,
+) -> ImitationRows:
+    """The heuristic's burials (``heuristic_picks``) as rows to imitate,
+    built exactly as ``policy_burials`` builds its own."""
+    from ..nn.bury_net import BURY_STEPS
+
+    cache = cache or Cache()
+    n = len(pools)
+    pool = np.stack([np.asarray(p, dtype=np.float32) for p in pools])
+    picks = np.stack([heuristic_picks(np.asarray(pools[i]), ctxs[i]) for i in range(n)])
+    static = np.stack([cache.static_card_features(c, num_decks) for c in ctxs])
+    priv = (
+        np.zeros((n, 3 * NUM_TYPES), dtype=np.float32)
+        if others is None else np.asarray(others, dtype=np.float32).reshape(n, -1)
+    )
+    buried = np.zeros_like(pool)
+    parts: dict[str, list[np.ndarray]] = {k: [] for k in
+        ("cards", "ctx", "mask", "privileged", "target")}
+    for step in range(BURY_STEPS):
+        cards, ctx, mask = _step_inputs(static, pool, buried, ctxs, standings, step, num_decks)
+        left = np.zeros_like(pool)
+        for j in range(step, BURY_STEPS):
+            np.add.at(left, (np.arange(n), picks[:, j]), 1.0)
+        parts["cards"].append(cards)
+        parts["ctx"].append(ctx)
+        parts["mask"].append(mask)
+        parts["privileged"].append(priv)
+        parts["target"].append(left > 0)
+        np.add.at(buried, (np.arange(n), picks[:, step]), 1.0)
+    return ImitationRows(**{k: np.concatenate(v) for k, v in parts.items()})
+
+
 def policy_burials(
     net: Any,
     pools: Sequence[np.ndarray],
@@ -577,18 +682,7 @@ def policy_burials(
     parts: dict[str, list[np.ndarray]] = {k: [] for k in
         ("cards", "ctx", "mask", "privileged", "action", "logp", "value", "hand")}
     for step in range(BURY_STEPS):
-        held = pool - buried
-        cards = np.concatenate(
-            (static, (held / num_decks)[..., None], (buried / num_decks)[..., None],
-             (pool / num_decks)[..., None]),
-            axis=2,
-        ).astype(np.float32)
-        ctx = np.stack([
-            bury_context(ctxs[i].level_rank, ctxs[i].trump_suit, step,
-                         standings[i][0], standings[i][1])
-            for i in range(n)
-        ])
-        mask = held > 0
+        cards, ctx, mask = _step_inputs(static, pool, buried, ctxs, standings, step, num_decks)
         with torch.no_grad():
             _logits, lp, v = net(
                 torch.from_numpy(cards).to(device), torch.from_numpy(ctx).to(device),

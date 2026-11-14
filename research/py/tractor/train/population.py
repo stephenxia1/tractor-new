@@ -224,6 +224,7 @@ def _preplay_step(
     device: torch.device,
     cache: Cache,
     shared: Any = None,
+    update_declare: bool = True,
 ) -> dict[str, float]:
     """One pre-play step for every agent, on one shared deal.
 
@@ -231,6 +232,8 @@ def _preplay_step(
     with every seat declaring and every landlord burying by its own
     agent, each seat is valued by its own critic, and each agent's
     declaration and burial learners update on their own rows.
+    ``update_declare=False`` holds the declaration policies fixed, for an
+    experiment on burial alone.
     """
     n = cfg.hands_per_step
     seat_of = hand_agents(table, n)
@@ -260,7 +263,7 @@ def _preplay_step(
             if len(idx):
                 per_agent[k].update(a.bury.update(bury.subset(idx), ret[idx]))
     rows = pre_rows.declare
-    if len(rows):
+    if update_declare and len(rows):
         owner = seat_of[rows.hand, rows.seat]
         ret = values[rows.hand, rows.seat].astype(np.float32) * cfg.reward_scale
         for k, a in enumerate(agents):

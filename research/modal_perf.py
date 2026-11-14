@@ -3083,3 +3083,200 @@ def sample_burials(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
                    hands: int = 256, seed: int = 7) -> None:
     call = sample_burials_a10g.spawn(checkpoint, hands, seed)
     print(f"spawned {call.object_id}; result -> /vol/bench/burials-*.json")
+
+
+
+def _burial_check(agents, critic, cfg, declare_cfg, hands, seed, dev, cache) -> dict:
+    """On ``hands`` landlords dealt and declared as training does: each
+    agent's greedy burial against the heuristic's, valued by the shared
+    critic from the landlord's seat (the burial policy's reward), and how
+    many of the eight cards the two share. Policy and heuristic are
+    compared on the same hands; a later call deals afresh."""
+    import numpy as np
+
+    import tractor.train.starts as S
+    from tractor.rules.cards import Ctx
+    from tractor.sim.bury import heuristic_burial, policy_burials, pools_from_rows
+    from tractor.train.population import _PRE, hand_agents, seating
+
+    rng = np.random.default_rng([seed, 0xC4EC])
+    seat_of = hand_agents(seating(cfg.seed, 0, cfg.agents, _PRE), hands)
+    nets = [a.net for a in agents]
+    starts, pre_rows, _st = S.make_starts(
+        rng, hands, nets, [a.declare.net for a in agents], dev, pre=declare_cfg.pre,
+        record=True, cache=cache, bury_net=[a.bury.net for a in agents], agents=seat_of)
+    rows = pre_rows.bury
+    first = rows.ctx[:, 18] > 0.5
+    hand_of = rows.hand[first]
+    rp, rc, rs, ro = pools_from_rows(rows)
+    landlord = np.array([s.landlord for s in starts])
+    owner = seat_of[np.arange(hands), landlord]
+
+    greedy: list = [None] * hands
+    for k, a in enumerate(agents):
+        js = [j for j in range(len(rp)) if owner[hand_of[j]] == k]
+        if not js:
+            continue
+        g, _ = policy_burials(a.bury.net, [rp[j] for j in js], [rc[j] for j in js],
+                              [rs[j] for j in js], rng, dev, greedy=True, others=ro[js])
+        for j, b in zip(js, g):
+            greedy[hand_of[j]] = b.astype(np.int64)
+
+    def start_with(s, burial):
+        hands_ = s.hands.astype(np.int8).copy()
+        pool = s.hands[s.landlord].astype(np.int64) + s.kitty.astype(np.int64)
+        hands_[s.landlord] = (pool - burial).astype(np.int8)
+        return S.Start(hands=hands_, kitty=burial.astype(np.int8), landlord=s.landlord,
+                       level_rank=s.level_rank, trump_suit=s.trump_suit)
+
+    heur = []
+    for s in starts:
+        pool = s.hands[s.landlord].astype(np.int64) + s.kitty.astype(np.int64)
+        heur.append(heuristic_burial(pool, Ctx(int(s.level_rank), int(s.trump_suit)))
+                    .astype(np.int64))
+    v_pol = S.critic_values(nets, [start_with(s, b) for s, b in zip(starts, greedy)], dev,
+                            agents=seat_of, shared=critic.critic)
+    v_heu = S.critic_values(nets, [start_with(s, b) for s, b in zip(starts, heur)], dev,
+                            agents=seat_of, shared=critic.critic)
+    idx = np.arange(hands)
+    vp, vh = v_pol[idx, landlord], v_heu[idx, landlord]
+    overlap = [int(np.minimum(g, h).sum()) / 8 for g, h in zip(greedy, heur)]
+    return {"policy_value": float(vp.mean()), "heuristic_value": float(vh.mean()),
+            "policy_ahead": float((vp > vh).mean()), "overlap": float(np.mean(overlap)),
+            "hands": float(hands)}
+
+
+def _bury_warmstart(checkpoint: str, name: str, warmstart: bool, steps: int,
+                    imitate_hands: int, imitate_epochs: int, imitate_lr: float,
+                    check_hands: int, seed: int, device: str = "cuda") -> dict:
+    """E3: can the population's learned burial at least match the heuristic?
+
+    From a population checkpoint, with play, declaration and the shared
+    critic all held fixed: optionally fit every agent's burial network to
+    the heuristic's burials first (``imitate``, on landlords dealt and
+    declared as training deals them), then ``steps`` pre-play steps that
+    train burial alone by PPO on the critic's value, the reward as the
+    user chose it. Both arms start from fresh burial optimisers, so the
+    warm start is the only difference between them. Writes
+    ``/vol/<name>/checkpoints/final.pt`` -- the input checkpoint with the
+    burial networks replaced, nothing else touched -- and
+    ``/vol/<name>/metrics.jsonl``. The ladder decides: ``agent-policy``
+    on the result, paired with the input's ``agent-heur`` record, which
+    still holds since nothing it plays has changed.
+    """
+    import json
+    import os
+    import time
+
+    import numpy as np
+    import torch
+
+    import tractor.train.starts as S
+    from tractor.nn.features import Cache
+    from tractor.sim.bury import BuryConfig, imitation_rows, pools_from_rows
+    from tractor.train.bury_loop import imitate
+    from tractor.train.declare_loop import DeclareTrainConfig
+    from tractor.train.population import (
+        _PRE, PopulationConfig, _preplay_step, build_agents, build_critic, hand_agents,
+        load_agents, load_critic, seating,
+    )
+
+    dev = torch.device(device)
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = PopulationConfig(**blob["config"])
+    bury_cfg = BuryConfig(rounds=cfg.bury_rounds, consider=cfg.bury_consider,
+                          evaluator=cfg.bury_evaluator, worlds=cfg.bury_worlds)
+    declare_cfg = DeclareTrainConfig(**{
+        **cfg.declare,
+        "pre": S.PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial="policy"),
+    })
+    agents = build_agents(cfg, dev, declare_cfg)
+    critic = build_critic(cfg, dev)
+    load_critic(critic, blob)
+    step = load_agents(agents, blob)
+    del blob
+    for a in agents:
+        a.bury.opt = torch.optim.AdamW(a.bury.net.parameters(), lr=a.bury.cfg.lr)
+    cache = Cache()
+    out_dir = f"{VOLUME}/{name}"
+    os.makedirs(f"{out_dir}/checkpoints", exist_ok=True)
+    metrics_path = f"{out_dir}/metrics.jsonl"
+    log: list = []
+
+    def record(row: dict) -> None:
+        row = {"time": time.time(), **row}
+        log.append(row)
+        with open(metrics_path, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        print(json.dumps(row), flush=True)
+        volume.commit()
+
+    meta = {"checkpoint": checkpoint, "step": step, "warmstart": warmstart, "steps": steps,
+            "imitate_hands": imitate_hands, "imitate_epochs": imitate_epochs,
+            "imitate_lr": imitate_lr, "seed": seed}
+    record({"kind": "start", **meta})
+    record({"kind": "check", "at": "start",
+            **_burial_check(agents, critic, cfg, declare_cfg, check_hands, seed, dev, cache)})
+
+    rng = np.random.default_rng([cfg.seed, step, seed])
+    if warmstart:
+        t0 = time.perf_counter()
+        seat_of = hand_agents(seating(cfg.seed, 1, cfg.agents, _PRE), imitate_hands)
+        _starts, pre_rows, _st = S.make_starts(
+            rng, imitate_hands, [a.net for a in agents], [a.declare.net for a in agents],
+            dev, pre=declare_cfg.pre, record=True, cache=cache,
+            bury_net=[a.bury.net for a in agents], agents=seat_of)
+        pools, ctxs, standings, others = pools_from_rows(pre_rows.bury)
+        rows = imitation_rows(pools, ctxs, standings, others, cache)
+        for k, a in enumerate(agents):
+            st = imitate(a.bury.net, rows, dev, epochs=imitate_epochs, lr=imitate_lr,
+                         seed=seed + k)
+            record({"kind": "imitate", "agent": k, **st})
+        record({"kind": "check", "at": "after imitation",
+                "seconds": time.perf_counter() - t0,
+                **_burial_check(agents, critic, cfg, declare_cfg, check_hands, seed, dev,
+                                cache)})
+
+    shared = None if critic is None else critic.critic
+    for i in range(steps):
+        t0 = time.perf_counter()
+        table = seating(cfg.seed, i // cfg.reshuffle_every, cfg.agents, _PRE)
+        st = _preplay_step(agents, table, declare_cfg, rng, dev, cache, shared,
+                           update_declare=False)
+        record({"kind": "ppo", "step": i + 1, "seconds": time.perf_counter() - t0,
+                **{k: v for k, v in st.items() if k.startswith("bury/")}})
+    record({"kind": "check", "at": "end",
+            **_burial_check(agents, critic, cfg, declare_cfg, check_hands, seed, dev, cache)})
+
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    for k, a in enumerate(agents):
+        blob["agents"][k]["bury"]["model"] = {
+            n: t.detach().cpu() for n, t in a.bury.net.state_dict().items()}
+        blob["agents"][k]["bury"]["optimizer"] = a.bury.opt.state_dict()
+    blob["e3"] = meta
+    path = f"{out_dir}/checkpoints/final.pt"
+    torch.save(blob, path)
+    volume.commit()
+    return {"checkpoint": path, "log": log}
+
+
+@app.function(image=image, gpu="H100", volumes={VOLUME: volume}, timeout=4 * 3600,
+              cpu=20.0, memory=131072)
+def bury_warmstart_h100(checkpoint: str, name: str, warmstart: bool, steps: int,
+                        imitate_hands: int, imitate_epochs: int, imitate_lr: float,
+                        check_hands: int, seed: int) -> dict:
+    return _bury_warmstart(checkpoint, name, warmstart, steps, imitate_hands,
+                           imitate_epochs, imitate_lr, check_hands, seed)
+
+
+@app.local_entrypoint()
+def bury_warmstart(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
+                   name: str = "pop8c-e3a", warmstart: bool = True, steps: int = 100,
+                   imitate_hands: int = 8192, imitate_epochs: int = 8,
+                   imitate_lr: float = 1e-3, check_hands: int = 2048, seed: int = 0) -> None:
+    """E3, one arm: ``--warmstart`` (arm A) or ``--no-warmstart`` (arm B,
+    the control). Returns at once; the result lands in /vol/<name>/."""
+    call = bury_warmstart_h100.spawn(checkpoint, name, warmstart, steps, imitate_hands,
+                                     imitate_epochs, imitate_lr, check_hands, seed)
+    print(f"spawned {call.object_id}: /vol/{name}/checkpoints/final.pt, "
+          f"/vol/{name}/metrics.jsonl")

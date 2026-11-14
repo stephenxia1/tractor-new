@@ -152,3 +152,67 @@ def test_policy_burials_are_legal_and_blind_to_hidden_hands() -> None:
     g1, _ = policy_burials(net, ps, cs, standings, np.random.default_rng(3), greedy=True)
     g2, _ = policy_burials(net, ps, cs, standings, np.random.default_rng(4), greedy=True)
     assert all(np.array_equal(x, y) for x, y in zip(g1, g2))
+
+
+def test_the_heuristics_picks_are_its_burial() -> None:
+    """``heuristic_picks`` is ``heuristic_burial`` as a sequence."""
+    from ..sim.bury import heuristic_burial, heuristic_picks
+
+    for pool, ctx, _l in _pools(20, 31):
+        picks = heuristic_picks(pool, ctx)
+        assert len(picks) == 8
+        assert np.array_equal(np.bincount(picks, minlength=NUM_TYPES), heuristic_burial(pool, ctx))
+
+
+def test_recorded_burials_give_back_their_landlords() -> None:
+    """``pools_from_rows`` recovers what ``policy_burials`` was called with."""
+    from ..nn.bury_net import BuryNet
+    from ..sim.bury import policy_burials, pools_from_rows
+
+    torch.manual_seed(6)
+    net = BuryNet().eval()
+    pools = _pools(7, 41)
+    ps = [p for p, _c, _l in pools]
+    cs = [c for _p, c, _l in pools]
+    standings = [(0, -1), (1, 0), (2, 1), (3, 2), (4, 3), (1, -1), (2, 2)]
+    others = np.random.default_rng(3).integers(0, 3, (7, 3, NUM_TYPES)).astype(np.float32)
+    _b, rows = policy_burials(net, ps, cs, standings, np.random.default_rng(1),
+                              others=others, record=True)
+    got_pools, got_ctxs, got_standings, got_others = pools_from_rows(rows)
+    assert np.array_equal(got_pools, np.stack(ps))
+    assert [(c.level_rank, c.trump_suit) for c in got_ctxs] == [
+        (c.level_rank, c.trump_suit) for c in cs]
+    assert got_standings == standings
+    assert np.array_equal(got_others, others.reshape(7, -1))
+
+
+def test_imitation_teaches_the_heuristics_burial() -> None:
+    """Rows built as ``policy_burials`` builds its own, every target a
+    held card; after imitating them the greedy policy buries nearly the
+    heuristic's cards on the same landlords."""
+    from ..nn.bury_net import BuryNet
+    from ..sim.bury import heuristic_burial, imitation_rows, policy_burials
+    from ..train.bury_loop import imitate
+
+    pools = _pools(48, 51)
+    ps = [p for p, _c, _l in pools]
+    cs = [c for _p, c, _l in pools]
+    standings = [(1, 0)] * len(ps)
+    rows = imitation_rows(ps, cs, standings)
+    assert len(rows) == 8 * len(ps)
+    assert not np.any(rows.target & ~rows.mask)
+    first = rows.target[: len(ps)].sum(axis=1)
+    want = np.array([int((heuristic_burial(p, c) > 0).sum()) for p, c in zip(ps, cs)])
+    assert np.array_equal(first, want)
+
+    torch.manual_seed(7)
+    net = BuryNet()
+    stats = imitate(net, rows, epochs=60, minibatch=128, lr=1e-3)
+    assert stats["imitate/top_pick_in_set"] > 0.9, stats
+    greedy, _ = policy_burials(net.eval(), ps, cs, standings, np.random.default_rng(0),
+                               greedy=True)
+    # Cards in common with the heuristic's burial, out of 8. A whole burial
+    # matches only when all eight picks do, so this is the stabler measure.
+    overlap = np.mean([int(np.minimum(g, heuristic_burial(p, c)).sum()) / 8
+                       for g, p, c in zip(greedy, ps, cs)])
+    assert overlap > 0.85, overlap

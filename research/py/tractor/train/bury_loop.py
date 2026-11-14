@@ -26,9 +26,9 @@ import torch
 import torch.nn.functional as F
 
 from ..nn.bury_net import BuryNet
-from ..sim.bury import BuryRows
+from ..sim.bury import BuryRows, ImitationRows
 
-__all__ = ["BuryTrainConfig", "BuryLearner"]
+__all__ = ["BuryTrainConfig", "BuryLearner", "imitate"]
 
 
 @dataclass(frozen=True)
@@ -108,3 +108,57 @@ class BuryLearner:
             "bury/rows": float(n),
             "bury/return_mean": float(np.mean(returns)),
         }
+
+
+def imitate(
+    net: BuryNet,
+    rows: ImitationRows,
+    device: Any = "cpu",
+    epochs: int = 4,
+    minibatch: int = 1024,
+    lr: float = 3e-4,
+    max_grad_norm: float = 0.5,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Fit the burial policy to a teacher's burials (``imitation_rows``).
+
+    A burial is a set, so at each pick any of the teacher's cards still
+    unburied is right: the loss is -log of the probability the policy
+    puts on that set, not on one card in an arbitrary order. A warm start
+    only -- the value head is left alone, and the optimiser is the
+    caller's to discard. -> the last epoch's loss and how often the
+    policy's own top pick was one of the teacher's cards.
+    """
+    dev = torch.device(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.0)
+    cards = torch.from_numpy(rows.cards).to(dev)
+    ctx = torch.from_numpy(rows.ctx).to(dev)
+    mask = torch.from_numpy(rows.mask).to(dev)
+    priv = torch.from_numpy(rows.privileged).to(dev)
+    target = torch.from_numpy(rows.target).to(dev)
+    if bool((target & ~mask).any()):
+        raise ValueError("a teacher's card is not among the held cards")
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    n = len(rows)
+    net.train()
+    loss_sum = hit_sum = 0.0
+    for _ in range(epochs):
+        loss_sum = hit_sum = 0.0
+        order = torch.randperm(n, generator=gen).to(dev)
+        for lo in range(0, n, minibatch):
+            idx = order[lo : lo + minibatch]
+            _logits, logp_all, _v = net(cards[idx], ctx[idx], mask[idx], priv[idx])
+            logp_all = logp_all.float()
+            on_set = torch.where(target[idx], logp_all, torch.full_like(logp_all, -1e9))
+            loss = -torch.logsumexp(on_set, dim=1).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
+            opt.step()
+            top = logp_all.argmax(dim=1)
+            hit = target[idx].gather(1, top[:, None]).float().mean()
+            loss_sum += float(loss.detach()) * len(idx)
+            hit_sum += float(hit) * len(idx)
+    net.eval()
+    return {"imitate/loss": loss_sum / max(n, 1), "imitate/top_pick_in_set": hit_sum / max(n, 1),
+            "imitate/rows": float(n)}
