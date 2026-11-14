@@ -289,3 +289,28 @@ def test_a_resumed_burial_learner_keeps_the_configured_rate() -> None:
     assert new.opt.param_groups[0]["lr"] == 3e-4
     new.set_lr()
     assert all(g["lr"] == 1e-4 for g in new.opt.param_groups)
+
+
+def test_playout_values_follow_their_starts() -> None:
+    """``playout_values``: the landlord team's margin for each start, kept
+    with its start -- greedy play of a permuted list gives the permuted
+    values -- and in range (|margin| / 400 can pass 1 only by the kitty)."""
+    from ..sim.bury import heuristic_burial
+    from ..train.starts import Start, playout_values
+
+    rng = np.random.default_rng(12)
+    starts = []
+    for _ in range(6):
+        state, _info = generate(rng)
+        pool = (state.hands[state.landlord] + state.kitty).astype(np.int64)
+        burial = heuristic_burial(pool, state.ctx).astype(np.int64)
+        hands = state.hands.astype(np.int8).copy()
+        hands[state.landlord] = (pool - burial).astype(np.int8)
+        starts.append(Start(hands=hands, kitty=burial.astype(np.int8), landlord=state.landlord,
+                            level_rank=state.ctx.level_rank, trump_suit=state.ctx.trump_suit))
+    net = _net(3)
+    a = playout_values(net, starts, greedy=True, rng=np.random.default_rng(0))
+    perm = [3, 0, 5, 1, 4, 2]
+    b = playout_values(net, [starts[i] for i in perm], greedy=True, rng=np.random.default_rng(1))
+    assert np.allclose(b, a[perm])
+    assert np.all(np.abs(a) < 3.0) and np.any(a != 0.0)

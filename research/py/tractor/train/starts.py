@@ -530,3 +530,54 @@ def leave_one_out(values: np.ndarray) -> np.ndarray:
     if k < 2:
         raise ValueError("a leave-one-out baseline needs at least two samples")
     return values - (values.sum(axis=0, keepdims=True) - values) / (k - 1)
+
+
+def playout_values(
+    play_net: Any,
+    starts: list[Start],
+    device: Any = "cpu",
+    agents: Any = None,
+    shared: Any = None,
+    chunk: int = 1024,
+    rng: np.random.Generator | None = None,
+    buffer: Any = None,
+    greedy: bool = False,
+) -> np.ndarray:
+    """float64[n]: each start played to the end by the play policy, as
+    training plays it (sampled moves), and the landlord's team's margin in
+    the critic's units -- the sum of the landlord seat's dense rewards,
+    which ``rollout._credit_trick`` splits so that a team's credits sum to
+    the margin the game scores, kitty bonus included. What the privileged
+    critic estimates, measured once instead of estimated.
+
+    ``agents``, int64[n, 4], seats a population's networks (``play_net`` a
+    list), with ``shared`` its critic. ``buffer``, a ``RolloutBuffer`` of
+    at least ``chunk * 100`` rows, is reused across chunks when given.
+    """
+    from .buffer import RolloutBuffer
+    from .rollout import collect
+
+    nets = play_net if isinstance(play_net, (list, tuple)) else [play_net]
+    cfg = nets[0].cfg
+    rng = rng or np.random.default_rng()
+    chunk = max(1, min(int(chunk), len(starts)))
+    if buffer is None or buffer.capacity < chunk * 100:
+        buffer = RolloutBuffer(chunk * 100, cfg)
+    out = np.zeros(len(starts), dtype=np.float64)
+    for lo in range(0, len(starts), chunk):
+        part = starts[lo : lo + chunk]
+        buffer.reset()
+        seat_agents = None if agents is None else np.asarray(agents)[lo : lo + len(part)]
+        stats = collect(
+            nets if agents is not None else nets[0], rng, buffer, len(part), device,
+            starts=part, agents=seat_agents, critic=shared, level_weight=0.0,
+            pool=len(part), greedy=greedy,
+        )
+        if int(stats["hands"]) != len(part):
+            raise RuntimeError(f"played {stats['hands']} of {len(part)} hands")
+        n = len(buffer)
+        episode = buffer.episode[:n] - int(buffer.episode[:n].min())
+        landlord = np.array([s.landlord for s in part], dtype=np.int64)
+        mine = buffer.seat[:n] == landlord[episode]
+        np.add.at(out, lo + episode[mine], buffer.reward_points[:n][mine].astype(np.float64))
+    return out

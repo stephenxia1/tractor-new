@@ -318,7 +318,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            target_kl: float = 0.0, bury_samples: int = 1,
            bury_lr: float = 0.0, bury_epochs: int = 0,
            lr: float = 0.0, minibatch: int = 0,
-           bury_scale_minibatch: bool = True) -> None:
+           bury_scale_minibatch: bool = True, bury_reward: str = "critic",
+           bury_landlords: int = 0) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -452,7 +453,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             # default with k samples: k times the optimiser steps (E3 arm C,
             # which beat the heuristic by the critic; arm D scaled it).
             "declare": {"hands_per_step": declare_hands, "bury_samples": bury_samples,
-                        "bury_scale_minibatch": bury_scale_minibatch},
+                        "bury_scale_minibatch": bury_scale_minibatch,
+                        # The burial's return: "critic" (as designed) or
+                        # "playout" (played to the end); see
+                        # DeclareTrainConfig.bury_reward.
+                        "bury_reward": bury_reward, "bury_landlords": bury_landlords},
             # The burial learner (BuryTrainConfig); 0 keeps its default.
             "bury_train": {k: v for k, v in (("lr", bury_lr), ("epochs", bury_epochs)) if v},
             "prefetch_starts": prefetch_starts,

@@ -3152,7 +3152,8 @@ def _bury_warmstart(checkpoint: str, name: str, warmstart: bool, steps: int,
                     imitate_hands: int, imitate_epochs: int, imitate_lr: float,
                     check_hands: int, seed: int, device: str = "cuda",
                     bury_samples: int = 1, bury_lr: float = 0.0,
-                    bury_epochs: int = 0) -> dict:
+                    bury_epochs: int = 0, bury_scale_minibatch: bool = False,
+                    bury_reward: str = "critic", bury_landlords: int = 0) -> dict:
     """E3: can the population's learned burial at least match the heuristic?
 
     From a population checkpoint, with play, declaration and the shared
@@ -3194,6 +3195,10 @@ def _bury_warmstart(checkpoint: str, name: str, warmstart: bool, steps: int,
         **cfg.declare,
         "pre": S.PrePlayConfig(random_burial_frac=0.0, bury=bury_cfg, burial="policy"),
         "bury_samples": bury_samples,
+        # Off by default here: arm C, the arm the ladders validated, ran unscaled
+        # (D and E scaled it).
+        "bury_scale_minibatch": bury_scale_minibatch,
+        "bury_reward": bury_reward, "bury_landlords": bury_landlords,
     })
     agents = build_agents(cfg, dev, declare_cfg)
     critic = build_critic(cfg, dev)
@@ -3223,6 +3228,8 @@ def _bury_warmstart(checkpoint: str, name: str, warmstart: bool, steps: int,
 
     meta = {"checkpoint": checkpoint, "step": step, "warmstart": warmstart, "steps": steps,
             "bury_samples": bury_samples, "bury_lr": bury_lr, "bury_epochs": bury_epochs,
+            "bury_scale_minibatch": bury_scale_minibatch, "bury_reward": bury_reward,
+            "bury_landlords": bury_landlords,
             "imitate_hands": imitate_hands, "imitate_epochs": imitate_epochs,
             "imitate_lr": imitate_lr, "seed": seed}
     record({"kind": "start", **meta})
@@ -3276,11 +3283,15 @@ def _bury_warmstart(checkpoint: str, name: str, warmstart: bool, steps: int,
 def bury_warmstart_h100(checkpoint: str, name: str, warmstart: bool, steps: int,
                         imitate_hands: int, imitate_epochs: int, imitate_lr: float,
                         check_hands: int, seed: int, bury_samples: int = 1,
-                        bury_lr: float = 0.0, bury_epochs: int = 0) -> dict:
+                        bury_lr: float = 0.0, bury_epochs: int = 0,
+                        bury_scale_minibatch: bool = False, bury_reward: str = "critic",
+                        bury_landlords: int = 0) -> dict:
     return _bury_warmstart(checkpoint, name, warmstart, steps, imitate_hands,
                            imitate_epochs, imitate_lr, check_hands, seed,
                            bury_samples=bury_samples, bury_lr=bury_lr,
-                           bury_epochs=bury_epochs)
+                           bury_epochs=bury_epochs,
+                           bury_scale_minibatch=bury_scale_minibatch,
+                           bury_reward=bury_reward, bury_landlords=bury_landlords)
 
 
 @app.local_entrypoint()
@@ -3288,13 +3299,16 @@ def bury_warmstart(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
                    name: str = "pop8c-e3a", warmstart: bool = True, steps: int = 100,
                    imitate_hands: int = 8192, imitate_epochs: int = 8,
                    imitate_lr: float = 1e-3, check_hands: int = 2048, seed: int = 0,
-                   bury_samples: int = 1, bury_lr: float = 0.0, bury_epochs: int = 0) -> None:
+                   bury_samples: int = 1, bury_lr: float = 0.0, bury_epochs: int = 0,
+                   bury_scale_minibatch: bool = False, bury_reward: str = "critic",
+                   bury_landlords: int = 0) -> None:
     """E3, one arm: ``--warmstart`` (arm A) or ``--no-warmstart`` (arm B,
     the control); ``--bury-samples 4`` for the leave-one-out baseline
     (arm C, zero). Returns at once; the result lands in /vol/<name>/.
     Give each concurrent arm its own TRACTOR_PERF_APP."""
     call = bury_warmstart_h100.spawn(checkpoint, name, warmstart, steps, imitate_hands,
                                      imitate_epochs, imitate_lr, check_hands, seed,
-                                     bury_samples, bury_lr, bury_epochs)
+                                     bury_samples, bury_lr, bury_epochs,
+                                     bury_scale_minibatch, bury_reward, bury_landlords)
     print(f"spawned {call.object_id}: /vol/{name}/checkpoints/final.pt, "
           f"/vol/{name}/metrics.jsonl")

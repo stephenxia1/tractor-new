@@ -28,6 +28,7 @@ from ..nn.declare import DeclareNet
 from ..nn.features import Cache
 from .starts import (
     DeclareRows, PrePlayConfig, burial_samples, critic_values, leave_one_out, make_starts,
+    playout_values,
 )
 
 __all__ = ["DeclareTrainConfig", "DeclareLearner"]
@@ -59,6 +60,16 @@ class DeclareTrainConfig:
     # optimiser steps one burial per landlord did, each on k times the rows.
     # E3 arm C without it: half of every update's rows hit the PPO clip.
     bury_scale_minibatch: bool = True
+    # What a burial's return is, with bury_samples > 1. "critic": the
+    # privileged critic's value of the play start (the design every run
+    # so far used). "playout": the start played to the end by the frozen
+    # play policy, the landlord's team's actual margin in the critic's
+    # units -- unbiased where the critic is not (E3: burials the critic
+    # rated above the heuristic's lost to it in play), noisier, and k
+    # hands of play per landlord. bury_landlords > 0 caps the landlords a
+    # step's burial update uses, to bound that cost.
+    bury_reward: str = "critic"
+    bury_landlords: int = 0
 
 
 class DeclareLearner:
@@ -175,16 +186,27 @@ def bury_update_loo(
     (sample 0). For a population, ``agents`` routes each landlord to its
     agent, ``bury`` and ``learners`` are per agent and ``shared`` is the
     shared critic. -> the update's statistics (averaged over agents)."""
+    if cfg.bury_reward not in ("critic", "playout"):
+        raise ValueError(f"bury_reward is critic or playout, not {cfg.bury_reward!r}")
+    if cfg.bury_landlords and cfg.bury_landlords > 0:
+        hands = np.unique(rows.hand)
+        if len(hands) > cfg.bury_landlords:
+            keep = rng.choice(hands, size=cfg.bury_landlords, replace=False)
+            rows = rows.subset(np.nonzero(np.isin(rows.hand, keep))[0])
     nets = [b.net for b in learners] if learners is not None else bury.net
     merged, sample_of, hand_of, more = burial_samples(
         nets, starts, rows, cfg.bury_samples, rng, device, cache, agents=agents)
     n = len(more) // cfg.bury_samples
-    v_more = critic_values(play_net, more[n:], device, agents=(
-        None if agents is None else np.asarray(agents)[hand_of[n:]]), shared=shared)
     landlord = np.array([s.landlord for s in more], dtype=np.int64)
     v = np.empty(len(more), dtype=np.float64)
-    v[:n] = values[hand_of[:n], landlord[:n]]
-    v[n:] = v_more[np.arange(len(more) - n), landlord[n:]]
+    if cfg.bury_reward == "playout":
+        v[:] = playout_values(play_net, more, device, agents=(
+            None if agents is None else np.asarray(agents)[hand_of]), shared=shared, rng=rng)
+    else:
+        v_more = critic_values(play_net, more[n:], device, agents=(
+            None if agents is None else np.asarray(agents)[hand_of[n:]]), shared=shared)
+        v[:n] = values[hand_of[:n], landlord[:n]]
+        v[n:] = v_more[np.arange(len(more) - n), landlord[n:]]
     table = v.reshape(cfg.bury_samples, n)
     adv = leave_one_out(table).reshape(-1)
     # Each row's landlord and sample -> its column in ``table``.
