@@ -275,3 +275,17 @@ def test_extra_burials_share_their_landlords_hand() -> None:
                 assert np.array_equal(st.hands[seat], orig.hands[seat])
     assert set(merged.hand.tolist()) == set(range(5))
     assert np.all(merged.mask[np.arange(len(merged)), merged.action])
+
+
+def test_a_resumed_burial_learner_keeps_the_configured_rate() -> None:
+    """A saved optimiser state carries its learning rate; ``set_lr`` puts
+    the config's back, so a resume can change it."""
+    from ..nn.bury_net import BuryNet
+    from ..train.bury_loop import BuryLearner, BuryTrainConfig
+
+    old = BuryLearner(BuryNet(), BuryTrainConfig(lr=3e-4))
+    new = BuryLearner(BuryNet(), BuryTrainConfig(lr=1e-4, epochs=2))
+    new.opt.load_state_dict(old.opt.state_dict())
+    assert new.opt.param_groups[0]["lr"] == 3e-4
+    new.set_lr()
+    assert all(g["lr"] == 1e-4 for g in new.opt.param_groups)

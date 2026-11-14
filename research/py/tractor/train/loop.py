@@ -51,7 +51,7 @@ from ..nn.declare import DeclareConfig, DeclareNet
 from ..nn.features import Cache
 from ..nn.model import ActorCritic, ModelConfig, load_model
 from ..sim.bury import BuryConfig
-from .bury_loop import BuryLearner
+from .bury_loop import BuryLearner, BuryTrainConfig
 from .declare_loop import DeclareLearner, DeclareTrainConfig
 from .starts import PrePlayConfig, make_starts
 from ..telemetry import Spans, memory_snapshot
@@ -214,6 +214,9 @@ class TrainConfig:
     # the sets that go together.
     declare_model: dict = field(default_factory=dict)
     bury_model: dict = field(default_factory=dict)
+    # The burial learner's settings (``bury_loop.BuryTrainConfig``); empty is
+    # its defaults, what every run before 2026-11-14 trained with.
+    bury_train: dict = field(default_factory=dict)
     ppo: dict = field(default_factory=dict)
 
 
@@ -412,11 +415,13 @@ def train(
         )
         if cfg.bury_policy:
             bury_net = BuryNet(BuryNetConfig(**cfg.bury_model)).to(device)
-            bury_learner = BuryLearner(bury_net, device=device)
+            bury_learner = BuryLearner(
+                bury_net, BuryTrainConfig(**cfg.bury_train), device=device)
             if blob.get("bury") is not None:
                 check_saved("burial", blob["bury"], bury_net.cfg)
                 bury_net.load_state_dict(blob["bury"]["model"])
                 bury_learner.opt.load_state_dict(blob["bury"]["optimizer"])
+                bury_learner.set_lr()  # the config's, not the checkpoint's
             bury_net.eval()
         declare_cfg = DeclareTrainConfig(**{
             **cfg.declare,

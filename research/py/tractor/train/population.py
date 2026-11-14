@@ -68,7 +68,7 @@ from ..sim.bury import BuryConfig
 from ..sim.state import NUM_SEATS
 from ..telemetry import Spans, memory_snapshot
 from .buffer import DeviceRows, RolloutBuffer
-from .bury_loop import BuryLearner
+from .bury_loop import BuryLearner, BuryTrainConfig
 from .critic_learner import CriticLearner, CriticTrainConfig
 from .declare_loop import DeclareLearner, DeclareTrainConfig
 from .gae import compute_gae
@@ -387,7 +387,8 @@ def build_agents(
             )
             if cfg.bury_policy:
                 agent.bury = BuryLearner(
-                    BuryNet(BuryNetConfig(**cfg.bury_model)).to(device), device=device
+                    BuryNet(BuryNetConfig(**cfg.bury_model)).to(device),
+                    BuryTrainConfig(**cfg.bury_train), device=device,
                 )
         agents.append(agent)
     return agents
@@ -410,6 +411,7 @@ def load_agents(agents: list[_Agent], blob: dict) -> int:
             check_saved("burial", saved["bury"], agent.bury.net.cfg)
             agent.bury.net.load_state_dict(saved["bury"]["model"])
             agent.bury.opt.load_state_dict(saved["bury"]["optimizer"])
+            agent.bury.set_lr()  # the config's, not the checkpoint's
     return int(blob["step"])
 
 

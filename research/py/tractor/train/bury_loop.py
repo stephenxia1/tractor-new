@@ -58,6 +58,12 @@ class BuryLearner:
         self.opt = torch.optim.AdamW(net.parameters(), lr=self.cfg.lr)
         self.amp = bool(self.cfg.bf16) and self.device.type == "cuda"
 
+    def set_lr(self) -> None:
+        """The config's learning rate on every parameter group: a loaded
+        optimiser state brings back the rate it was saved with."""
+        for group in self.opt.param_groups:
+            group["lr"] = self.cfg.lr
+
     def update(
         self, rows: BuryRows, returns: np.ndarray, advantages: np.ndarray | None = None,
         minibatch: int | None = None,
