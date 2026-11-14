@@ -60,7 +60,7 @@ def main(argv: list[str]) -> int:
         code = 0
         for app_id in ids:
             print(f"stopping {name} ({app_id})", flush=True)
-            code |= subprocess.run(["modal", "app", "stop", app_id]).returncode
+            code |= subprocess.run(["modal", "app", "stop", "--yes", app_id]).returncode
         return code
     print(__doc__)
     return 2
