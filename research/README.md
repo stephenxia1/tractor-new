@@ -1292,6 +1292,25 @@ agents up.
   with the frozen play policy would not have them; that is a change to
   the reward, so it is the user's call.
 
+**Arm F2: the burial's return played out (2026-11-14, the user approved
+the test).** C's update with `--bury-reward playout`: each of the 4
+burials is played to the end by the frozen play policy and returns the
+landlord team's actual margin (`train/starts.py::playout_values`, on the
+rollout's worker pool), 2,048 landlords a step, 100 steps, ~74 s a step.
+Ladder, paired as above (`evals/2026-11-14/pop8c-e3f2-policy.jsonl`):
+
+| F2 against | win | points |
+| --- | --- | --- |
+| C (critic return) | **+0.007 +/- 0.004** | **+0.44 +/- 0.20** |
+| B (as trained) | +0.016 +/- 0.004 | +1.09 +/- 0.20 |
+| step 2800 as trained | +0.015 +/- 0.003 | +0.96 +/- 0.19 |
+| heuristic burial | -0.012 +/- 0.003 | -0.96 +/- 0.19 |
+
+The gap to the heuristic halves (-0.026 as trained, -0.019 with
+leave-one-out, -0.012 played out), with a quarter of C's landlords a
+step. `zero2` took the play-out return from step 900
+(`--bury-reward playout --bury-landlords 512`).
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

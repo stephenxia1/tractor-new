@@ -1,0 +1,167 @@
+{
+  "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt",
+  "deals": 770,
+  "seed": 20260923,
+  "pre_play": "agent-policy",
+  "candidates": "host",
+  "bots": [
+    "smart",
+    "smart-v18",
+    "smart-v28",
+    "smart-v34"
+  ],
+  "ranked": [
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#0",
+      "win": 0.511525974025974,
+      "win_ci": [
+        0.4990431652321822,
+        0.5240087828197658
+      ],
+      "levels": 0.045779220779220774,
+      "levels_half": 0.019286813106928685,
+      "points": 2.0665584415584415,
+      "points_half": 0.709330242488105,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#6",
+      "win": 0.5086038961038961,
+      "win_ci": [
+        0.49611961811198096,
+        0.5210881740958113
+      ],
+      "levels": 0.007142857142857142,
+      "levels_half": 0.02018993134774019,
+      "points": 0.5560064935064934,
+      "points_half": 0.7428317415356263,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#5",
+      "win": 0.5081168831168831,
+      "win_ci": [
+        0.49563240174154083,
+        0.5206013644922253
+      ],
+      "levels": 0.032629870129870134,
+      "levels_half": 0.019376128922254654,
+      "points": 1.6387987012987013,
+      "points_half": 0.7178276130849675,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#4",
+      "win": 0.5056818181818182,
+      "win_ci": [
+        0.4931964976380536,
+        0.5181671387255828
+      ],
+      "levels": 0.032467532467532464,
+      "levels_half": 0.019432259830914785,
+      "points": 1.1899350649350646,
+      "points_half": 0.7062175210908659,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#1",
+      "win": 0.5001623376623376,
+      "win_ci": [
+        0.48767621156994767,
+        0.5126484637547276
+      ],
+      "levels": 0.04529220779220778,
+      "levels_half": 0.01954616308011266,
+      "points": 2.3985389610389607,
+      "points_half": 0.7354209205332961,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#3",
+      "win": 0.49188311688311687,
+      "win_ci": [
+        0.4793986355077746,
+        0.5043675982584591
+      ],
+      "levels": -0.013311688311688316,
+      "levels_half": 0.020216985880654226,
+      "points": -0.44318181818181834,
+      "points_half": 0.7378538016235605,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#7",
+      "win": 0.46396103896103896,
+      "win_ci": [
+        0.4515073885764715,
+        0.47641468934560643
+      ],
+      "levels": -0.06477272727272726,
+      "levels_half": 0.019465173559395577,
+      "points": -2.546266233766234,
+      "points_half": 0.7355761980548617,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    },
+    {
+      "checkpoint": "/vol/pop8c-e3f2/checkpoints/final.pt#2",
+      "win": 0.4636363636363636,
+      "win_ci": [
+        0.45118330182772626,
+        0.476089425445001
+      ],
+      "levels": -0.0689935064935065,
+      "levels_half": 0.02033977138370621,
+      "points": -2.604707792207792,
+      "points_half": 0.7568434699002551,
+      "hands": 6160,
+      "bots": [
+        "smart",
+        "smart-v18",
+        "smart-v28",
+        "smart-v34"
+      ]
+    }
+  ]
+}
