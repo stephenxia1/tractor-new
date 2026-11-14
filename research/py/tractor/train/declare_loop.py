@@ -55,6 +55,10 @@ class DeclareTrainConfig:
     # 2026-11-14). k > 1: k burials of the same landlord, each valued by
     # the critic, each judged against the mean of the other k - 1.
     bury_samples: int = 1
+    # With k > 1, the burial minibatch grows k-fold, so an update takes the
+    # optimiser steps one burial per landlord did, each on k times the rows.
+    # E3 arm C without it: half of every update's rows hit the PPO clip.
+    bury_scale_minibatch: bool = True
 
 
 class DeclareLearner:
@@ -190,14 +194,18 @@ def bury_update_loo(
     a = (adv[idx] * cfg.reward_scale).astype(np.float32)
     stats_extra = {"bury/loo_spread": float(table.std(axis=0).mean() * cfg.reward_scale),
                    "bury/samples": float(cfg.bury_samples)}
+    mb = None
+    if cfg.bury_scale_minibatch:
+        base = (learners[0] if learners is not None else bury).cfg.minibatch
+        mb = base * cfg.bury_samples
     if learners is None:
-        return {**bury.update(merged, ret, a), **stats_extra}
+        return {**bury.update(merged, ret, a, minibatch=mb), **stats_extra}
     owner = np.asarray(agents)[merged.hand, [starts[int(h)].landlord for h in merged.hand]]
     per = []
     for k, learner in enumerate(learners):
         sel = np.nonzero(owner == k)[0]
         if len(sel):
-            per.append(learner.update(merged.subset(sel), ret[sel], a[sel]))
+            per.append(learner.update(merged.subset(sel), ret[sel], a[sel], minibatch=mb))
     keys = {key for p in per for key in p}
     return {**{key: float(np.mean([p[key] for p in per if key in p])) for key in keys},
             **stats_extra}

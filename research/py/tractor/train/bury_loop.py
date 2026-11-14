@@ -59,13 +59,17 @@ class BuryLearner:
         self.amp = bool(self.cfg.bf16) and self.device.type == "cuda"
 
     def update(
-        self, rows: BuryRows, returns: np.ndarray, advantages: np.ndarray | None = None
+        self, rows: BuryRows, returns: np.ndarray, advantages: np.ndarray | None = None,
+        minibatch: int | None = None,
     ) -> dict[str, float]:
         """One PPO update. ``returns[i]`` is row ``i``'s return, which the
         value head fits. ``advantages``, when given, replace return minus
         value head as the policy's signal -- a leave-one-out baseline over
-        several burials of the same landlord (``starts.burial_samples``)."""
+        several burials of the same landlord (``starts.burial_samples``).
+        ``minibatch`` overrides the config's, so k burials per landlord can
+        take as many optimiser steps as one did."""
         cfg = self.cfg
+        mb = int(minibatch or cfg.minibatch)
         dev = self.device
         cards = torch.from_numpy(rows.cards).to(dev)
         ctx = torch.from_numpy(rows.ctx).to(dev)
@@ -84,8 +88,8 @@ class BuryLearner:
         count = 0
         for _ in range(cfg.epochs):
             order = torch.randperm(n, device=dev)
-            for lo in range(0, n, cfg.minibatch):
-                idx = order[lo : lo + cfg.minibatch]
+            for lo in range(0, n, mb):
+                idx = order[lo : lo + mb]
                 with torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
                                     enabled=self.amp):
                     _logits, logp_all, v = self.net(cards[idx], ctx[idx], mask[idx], priv[idx])
