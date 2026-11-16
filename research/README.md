@@ -1335,12 +1335,22 @@ Own declarations and burials against smart-v18/v28/v34, 770 deals a bot:
 | 1000 | -- | 20260923 | 0.516 | +0.057 | +2.5 |
 | 1000 | 8 worlds | 20260923 | **0.556** | **+0.125** | **+4.4** |
 | 1000 | 8 worlds | **20261114** | **0.572** | **+0.165** | **+6.2** |
+| 3000 | -- | 20260923 | 0.556 | +0.135 | +6.0 |
+| 3000 | 8 worlds | 20260923 | 0.563 | +0.161 | +7.3 |
+| 3000 | 8 worlds | 20261114 | 0.580 | +0.197 | +8.0 |
+| 3000 | 8 worlds, confident 0.99 | 20260923 | **0.582** | **+0.202** | **+8.5** |
+| 3000 | 8 worlds, confident 0.99 | **20261114** | **0.597** | **+0.223** | **+9.1** |
 
 Play only (random pre-play for both sides): 0.513 / +1.5 points at step
 500, 0.531 / +3.4 at step 1000. Search (`eval/search.py`: worlds dealt
 under the public constraints, the policy and the critic) is zero too;
 it added +0.050, +0.034 and +0.041 win at steps 500, 750 and 1000
-(paired). For comparison, v5-bury -- not zero, its v4 parent played
+(paired). By step 3000 the policy is confident enough that search at the default
+threshold (skip a decision when one move holds 0.9 of the policy) adds
+only +0.008 win; searching every decision under 0.99 adds +0.026 +/-
+0.014 win and +2.53 +/- 0.87 points over the plain policy, paired. The
+run continued to step 4000 and declined from its peak (0.528 at step
+4000; `evals/2026-11-15/`). For comparison, v5-bury -- not zero, its v4 parent played
 from heuristic-seeded burials -- reached 0.566 with its own pre-play
 and no search. Records: `evals/2026-11-14/zero2-*`.
 
