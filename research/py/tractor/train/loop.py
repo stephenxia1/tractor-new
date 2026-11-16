@@ -217,6 +217,11 @@ class TrainConfig:
     # The burial learner's settings (``bury_loop.BuryTrainConfig``); empty is
     # its defaults, what every run before 2026-11-14 trained with.
     bury_train: dict = field(default_factory=dict)
+    # Expert iteration (``train/distill.py``): after each PPO update,
+    # ``steps`` minibatches of cross-entropy toward search's choices on the
+    # shards matching ``paths``, with an optimiser of its own (``lr``,
+    # ``minibatch``, ``coef``). Empty is off.
+    distill: dict = field(default_factory=dict)
     ppo: dict = field(default_factory=dict)
 
 
@@ -480,6 +485,16 @@ def train(
         )
 
     buffer = RolloutBuffer(cfg.buffer_capacity, model_cfg)
+    distiller = None
+    if cfg.distill:
+        from .distill import Distiller, load_rows
+
+        distiller = Distiller(
+            net, load_rows(cfg.distill["paths"]), device,
+            lr=float(cfg.distill.get("lr", 1e-5)),
+            minibatch=int(cfg.distill.get("minibatch", 512)),
+            coef=float(cfg.distill.get("coef", 1.0)),
+        )
     # Started before the first step and closed in the `finally` below,
     # so worker start-up is paid once for the run and not once a step.
     rollout_pool = (
@@ -595,6 +610,9 @@ def train(
             with spans.span("update"):
                 net.train()
                 metrics = learner.update(buffer)
+            if distiller is not None:
+                with spans.span("distill"):
+                    metrics.update(distiller.step(int(cfg.distill.get("steps", 4)), rng))
 
             # Before the metrics row is assembled, so that the evaluation's
             # own span and its scores belong to the iteration that produced

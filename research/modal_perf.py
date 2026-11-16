@@ -3326,3 +3326,71 @@ def bury_warmstart(checkpoint: str = "/vol/pop8c/milestones/step_0002800.pt",
                                      bury_scale_minibatch, bury_reward, bury_landlords)
     print(f"spawned {call.object_id}: /vol/{name}/checkpoints/final.pt, "
           f"/vol/{name}/metrics.jsonl")
+
+
+def _distill_gen(checkpoint: str, name: str, shard: int, hands: int, seed: int,
+                 worlds: int, top_k: int, confident: float) -> dict:
+    """One shard of expert-iteration data (``train/distill.py``): ``hands``
+    hands dealt and declared and buried by the checkpoint's own pre-play
+    policies, played by its policy, every decision where search acts
+    labelled with search's choice. -> /vol/distill/<name>/shard_<k>.npz."""
+    import os
+    import time
+
+    import numpy as np
+    import torch
+
+    import tractor.train.starts as S
+    from tractor.eval.search import SearchConfig
+    from tractor.nn.arch import bury_net_from, declare_net_from
+    from tractor.nn.features import Cache
+    from tractor.nn.model import ActorCritic, ModelConfig, load_model
+    from tractor.train.distill import generate
+
+    dev = torch.device("cuda")
+    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    cfg = ModelConfig(**blob["model_config"])
+    net = ActorCritic(cfg).to(dev)
+    load_model(net, blob["model"])
+    net.eval()
+    declare_net = declare_net_from(blob["declare"]).to(dev).eval()
+    bury_net = bury_net_from(blob["bury"]).to(dev).eval()
+    step = int(blob.get("step", 0))
+    del blob
+    rng = np.random.default_rng([seed, shard])
+    cache = Cache()
+    t0 = time.perf_counter()
+    pre = S.PrePlayConfig(random_burial_frac=0.0, burial="policy")
+    starts, _rows, _st = S.make_starts(rng, hands, net, declare_net, dev, pre=pre,
+                                       cache=cache, bury_net=bury_net)
+    rows, stats = generate(net, starts, SearchConfig(worlds=worlds, top_k=top_k,
+                                                     confident=confident),
+                           rng, dev, cfg, cache)
+    out_dir = f"{VOLUME}/distill/{name}"
+    os.makedirs(out_dir, exist_ok=True)
+    rows.save(f"{out_dir}/shard_{shard:03d}.npz")
+    volume.commit()
+    return {"checkpoint": checkpoint, "step": step, "shard": shard, "hands": hands,
+            "rows": len(rows), "seconds": time.perf_counter() - t0, **stats}
+
+
+@app.function(image=image, gpu="A10G", volumes={VOLUME: volume}, timeout=6 * 3600,
+              cpu=4.0, memory=32768)
+def distill_gen_a10g(checkpoint: str, name: str, shard: int, hands: int, seed: int,
+                     worlds: int, top_k: int, confident: float) -> dict:
+    return _distill_gen(checkpoint, name, shard, hands, seed, worlds, top_k, confident)
+
+
+@app.local_entrypoint()
+def distill_gen(checkpoint: str, name: str, shards: int = 8, hands: int = 250,
+                seed: int = 0, worlds: int = 8, top_k: int = 3,
+                confident: float = 0.99) -> None:
+    """Expert-iteration data: ``shards`` A10Gs, ``hands`` each. Waits for
+    them all and prints each shard's statistics; the shards land in
+    /vol/distill/<name>/."""
+    import json
+
+    calls = [distill_gen_a10g.spawn(checkpoint, name, k, hands, seed, worlds, top_k,
+                                    confident) for k in range(shards)]
+    for call in calls:
+        print(json.dumps(call.get()), flush=True)

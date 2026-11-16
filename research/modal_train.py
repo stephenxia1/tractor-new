@@ -319,7 +319,9 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_lr: float = 0.0, bury_epochs: int = 0,
            lr: float = 0.0, minibatch: int = 0,
            bury_scale_minibatch: bool = True, bury_reward: str = "critic",
-           bury_landlords: int = 0) -> None:
+           bury_landlords: int = 0, distill_paths: str = "", distill_coef: float = 1.0,
+           distill_lr: float = 3e-5, distill_steps: int = 2,
+           distill_minibatch: int = 512) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -464,6 +466,11 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             "bury_evaluator": bury_evaluator,
             "bury_policy": bury_policy,
             "restart_schedule": restart_schedule,
+            # Expert iteration (train/distill.py): shards of search-labelled
+            # positions from modal_perf.py::distill_gen; empty paths is off.
+            "distill": ({"paths": distill_paths, "coef": distill_coef, "lr": distill_lr,
+                         "steps": distill_steps, "minibatch": distill_minibatch}
+                        if distill_paths else {}),
         },
     )
     print(f"submitted {name}: call {call.object_id}")
