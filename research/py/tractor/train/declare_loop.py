@@ -70,6 +70,11 @@ class DeclareTrainConfig:
     # step's burial update uses, to bound that cost.
     bury_reward: str = "critic"
     bury_landlords: int = 0
+    # A declaration's return. "critic": the seat's privileged critic value
+    # at play start (the design every run so far used). "playout": the
+    # start played to the end once by the frozen play policy, the seat's
+    # team's actual margin in the critic's units. Single agent only.
+    declare_reward: str = "critic"
 
 
 class DeclareLearner:
@@ -113,7 +118,17 @@ class DeclareLearner:
         rows = pre_rows.declare
         if len(rows) == 0:
             return {**stats, "declare/rows": 0.0}
-        ret = values[rows.hand, rows.seat].astype(np.float32) * cfg.reward_scale
+        if cfg.declare_reward == "playout":
+            margin = playout_values(play_net, starts, self.device, rng=rng)
+            landlord = np.array([s.landlord for s in starts], dtype=np.int64)
+            same = (np.arange(4)[None, :] % 2) == (landlord[:, None] % 2)
+            seat_values = np.where(same, margin[:, None], -margin[:, None])
+            ret = seat_values[rows.hand, rows.seat].astype(np.float32) * cfg.reward_scale
+            stats["declare/playout_margin_mean"] = float(np.abs(margin).mean())
+        elif cfg.declare_reward == "critic":
+            ret = values[rows.hand, rows.seat].astype(np.float32) * cfg.reward_scale
+        else:
+            raise ValueError(f"declare_reward is critic or playout, not {cfg.declare_reward!r}")
         return {
             **stats,
             **self.update(rows, ret),

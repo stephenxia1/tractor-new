@@ -321,7 +321,7 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_scale_minibatch: bool = True, bury_reward: str = "critic",
            bury_landlords: int = 0, distill_paths: str = "", distill_coef: float = 1.0,
            distill_lr: float = 3e-5, distill_steps: int = 2,
-           distill_minibatch: int = 512) -> None:
+           distill_minibatch: int = 512, declare_reward: str = "critic") -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -459,7 +459,10 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
                         # The burial's return: "critic" (as designed) or
                         # "playout" (played to the end); see
                         # DeclareTrainConfig.bury_reward.
-                        "bury_reward": bury_reward, "bury_landlords": bury_landlords},
+                        "bury_reward": bury_reward, "bury_landlords": bury_landlords,
+                        # A declaration's return: "critic" (as designed) or
+                        # "playout" (DeclareTrainConfig.declare_reward).
+                        "declare_reward": declare_reward},
             # The burial learner (BuryTrainConfig); 0 keeps its default.
             "bury_train": {k: v for k, v in (("lr", bury_lr), ("epochs", bury_epochs)) if v},
             "prefetch_starts": prefetch_starts,
