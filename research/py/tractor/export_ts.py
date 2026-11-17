@@ -9,9 +9,10 @@ float16, concatenated) and ``OUT_DIR/weights-zero.json``: the three
 networks' configs and, for each tensor, its shape and element offset
 into the .bin. Names are the checkpoint's state-dict keys under the
 prefixes ``actor.`` (the play network's history encoder, query encoder
-and candidate scorer: everything the policy's logits need), ``declare.``
-and ``bury.``. The critics and auxiliary heads are left out; the bot
-never reads them.
+and candidate scorer: everything the policy's logits need), ``critic.``
+(the play network's privileged critic, which search reads at its leaves),
+``declare.`` and ``bury.``. The declaration and burial critics and the
+actor's auxiliary heads are left out; the bot never reads them.
 
 Only v5 networks are supported (GELU, the plain declaration MLP, the
 ``nn.TransformerEncoder`` burial net), because that is what the TS port
@@ -41,7 +42,7 @@ from .nn.bury_net import BuryNet, BuryNetConfig
 from .nn.declare import DeclareConfig, DeclareNet
 from .nn.model import ActorCritic, ModelConfig
 
-ACTOR_PARTS = ("actor.history.", "actor.query.", "actor.scorer.")
+ACTOR_PARTS = ("actor.history.", "actor.query.", "actor.scorer.", "critic.")
 FORMAT = 1
 
 
@@ -49,6 +50,8 @@ def _check_v5(model_cfg: dict, declare_cfg: dict, bury_cfg: dict) -> None:
     mc = ModelConfig(**model_cfg)
     if mc.ffn != "gelu":
         raise ValueError(f"the TS port implements GELU play networks, not {mc.ffn!r}")
+    if mc.critic_kind != "flat":
+        raise ValueError(f"the TS port implements the flat critic, not {mc.critic_kind!r}")
     dc = DeclareConfig(**declare_cfg)
     if dc.residual or dc.ffn != "gelu":
         raise ValueError(f"the TS port implements the plain declaration MLP, not {dc}")

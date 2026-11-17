@@ -1,0 +1,110 @@
+name: zero-weights
+
+# Fetches the zero PPO agent's checkpoint from the Modal volume, exports the
+# weights the app's `rl-zero` bot reads, checks them against PyTorch, and
+# pushes them to the `zero-weights` branch. It also copies the best
+# checkpoints into a draft release, so the trained models do not exist on
+# Modal alone.
+#
+# Uses only Modal's storage API (`modal volume get`), with the token in the
+# MODAL_TOKEN_ID / MODAL_TOKEN_SECRET repository secrets; it starts no
+# Modal compute. Runs when this file changes on a research branch (manual
+# dispatch needs the file on main). This repository is public, so the logs
+# are too: nothing here prints a secret.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["rl-research", "claude/**"]
+    paths:
+      - .github/workflows/zero-weights.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zero-weights
+  cancel-in-progress: false
+
+env:
+  APP_CKPT: zero2-dst2/milestones/step_0005000.pt
+  # The best checkpoints of the zero run and its continuations
+  # (research/README.md, "Holding the peak, and expert iteration").
+  BACKUPS: >-
+    zero2-dst2/milestones/step_0005000.pt
+    zero2-c1e4/milestones/step_0005000.pt
+    zero2-lr1e4/milestones/step_0004000.pt
+    zero2/milestones/step_0003000.pt
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Modal, numpy and CPU torch
+        run: |
+          pip install --quiet modal numpy
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+      - name: List the volume
+        run: |
+          modal volume ls tractor-rl zero2-dst2/milestones
+      - name: Download the checkpoints
+        run: |
+          mkdir -p ckpt
+          for p in $BACKUPS; do
+            out="ckpt/$(echo "$p" | sed 's#/milestones/#-#')"
+            if modal volume get tractor-rl "$p" "$out"; then
+              ls -la "$out"
+            else
+              echo "::warning::could not fetch $p"
+            fi
+          done
+          test -s "ckpt/zero2-dst2-step_0005000.pt"
+      - name: Export the app weights
+        run: |
+          cd research/py
+          python -m tractor.export_ts ../../ckpt/zero2-dst2-step_0005000.pt ../../packages/engine/src/rl/zero
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install the npm workspace
+        run: npm ci --include=dev
+      - name: Play features and network against PyTorch
+        run: |
+          cd research
+          npx tsx src/zeroParity.ts --decisions 600 --seed 31 --logits > "$RUNNER_TEMP/play.jsonl"
+          python py/test_zero_parity.py "$RUNNER_TEMP/play.jsonl" --checkpoint ../ckpt/zero2-dst2-step_0005000.pt
+      - name: Declarations and burials against PyTorch
+        run: |
+          cd research
+          npx tsx src/zeroPrePlayParity.ts --weights ../packages/engine/src/rl/zero --hands 120 > "$RUNNER_TEMP/preplay.jsonl"
+          python py/test_zero_preplay_parity.py check "$RUNNER_TEMP/preplay.jsonl" ../ckpt/zero2-dst2-step_0005000.pt
+      - name: Whole hands against smart-v34
+        run: |
+          cd research
+          npx tsx src/zeroMatch.ts --hands 24 --opponent smart-v34
+      - name: Push the weights to the zero-weights branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B zero-weights
+          git add -f packages/engine/src/rl/zero/weights-zero.bin packages/engine/src/rl/zero/weights-zero.json
+          git commit -m "rl-zero weights: zero2-dst2 step 5000" \
+            -m "Exported by .github/workflows/zero-weights.yml from tractor-rl:$APP_CKPT at ${GITHUB_SHA}."
+          git push --force origin zero-weights
+      - name: Back up the checkpoints to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="checkpoints-$(date -u +%Y%m%d-%H%M)"
+          gh release create "$tag" ckpt/*.pt --draft --target "$GITHUB_SHA" \
+            --title "Zero checkpoints ($tag)" \
+            --notes "Copies of the zero PPO run's best checkpoints from the Modal volume tractor-rl: $BACKUPS. Draft, so visible only to collaborators."
