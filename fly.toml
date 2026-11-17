@@ -32,4 +32,7 @@ primary_region = "sjc"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  memory_mb = 256
+  # 512 since rl-zero: its play network holds 44 MB of float32 weights,
+  # and a local all-Zero table took the server process from 116 MB idle
+  # to 193 MB, beside npm's own ~58 MB -- too close to 256.
+  memory_mb = 512

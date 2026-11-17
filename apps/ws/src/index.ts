@@ -3,6 +3,8 @@ import { WebSocketServer, type WebSocket } from 'ws';
 // Installs the `rl-v2` bot. Side-effect import: it reads its weights
 // from disk, so it is deliberately not part of the engine barrel.
 import '@tractor/engine/rl/v2/register';
+// Installs the `rl-zero` bot (the PPO agent trained from zero), likewise.
+import '@tractor/engine/rl/zero/register';
 
 import {
   decodeClient,

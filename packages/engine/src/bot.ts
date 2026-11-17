@@ -93,7 +93,8 @@ export type BotType =
   | 'rl-dmc'         // DMC self-play, three Q-nets (landlord / defender / attacker)
   | 'rl-v2'          // DMC self-play, points-target net with history attention + CTDE critic
   | 'rl-v2-search'   // rl-v2 + determinized search, worlds weighted by the belief head
-  | 'rl-v2-search-u';// rl-v2 + determinized search, uniform worlds (the A/B control)
+  | 'rl-v2-search-u'// rl-v2 + determinized search, uniform worlds (the A/B control)
+  | 'rl-zero';       // PPO self-play from scratch: own declarations, burials and play, no heuristic data
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
   'lowball',
@@ -132,6 +133,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'rl-v2',
   'rl-v2-search',
   'rl-v2-search-u',
+  'rl-zero',
 ];
 
 // User-facing subset shown in the lobby dropdown. Only the latest
@@ -151,6 +153,7 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   // to undefined and then dereferences -- taking the process, and every
   // in-memory room, down with it. Deploy the server first.
   'rl-v2',
+  'rl-zero',
 ];
 
 export function botTypeLabel(t: BotType): string {
@@ -223,6 +226,8 @@ export function botTypeLabel(t: BotType): string {
       return 'RL (experimental)';
     case 'rl-v2':
       return 'RL (neural)';
+    case 'rl-zero':
+      return 'Zero (self-taught)';
     case 'rl-v2-search':
       return 'RL (neural + search)';
     case 'rl-v2-search-u':
@@ -322,6 +327,19 @@ function pickBotActionUnguarded(
   // decision about whether to declare now, given only the cards
   // revealed to them so far. Non-smart bots wait until dealing is done
   // — they have no concept of partial-hand strategy.
+  // rl-zero makes every decision itself, including whether to declare
+  // while the cards are still coming, so it goes before the dealing guard.
+  if (type === 'rl-zero') {
+    if (_rlZeroAgent === null) {
+      throw new Error(
+        "bot 'rl-zero' has no implementation registered: import " +
+        "'@tractor/engine/rl/zero/register' once at startup. It is a separate " +
+        'module because it reads a 22 MB weights file from disk, and this one ' +
+        'is bundled into the browser.',
+      );
+    }
+    return _rlZeroAgent(state, seat);
+  }
   if (state.phase === 'dealing') {
     const isSmart = type === 'smart' || type.startsWith('smart-v');
     if (!isSmart) return { kind: 'wait' };
@@ -491,6 +509,17 @@ let _rlV2SearchUniformAgent: ((s: GameState, seat: Seat) => BotAction) | null = 
 
 export function registerV2Agent(agent: (s: GameState, seat: Seat) => BotAction): void {
   _rlV2Agent = agent;
+}
+
+// ---------- Strategy: rl-zero (PPO, trained from zero) ----------------------
+// The research track's best bot trained without heuristic knowledge: its
+// declarations, burials and play are all its own networks. Injected for
+// the same reason as rl-v2 (its weights load with `node:fs`):
+// `import '@tractor/engine/rl/zero/register'`.
+let _rlZeroAgent: ((s: GameState, seat: Seat) => BotAction) | null = null;
+
+export function registerZeroAgent(agent: (s: GameState, seat: Seat) => BotAction): void {
+  _rlZeroAgent = agent;
 }
 
 // The searching variants differ only in how worlds are sampled, which is
