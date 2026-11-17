@@ -1,0 +1,253 @@
+{
+ "bury_config": {
+  "d": 16,
+  "ffn": "gelu",
+  "heads": 2,
+  "layers": 1,
+  "value_width": 16
+ },
+ "declare_config": {
+  "depth": 2,
+  "ffn": "gelu",
+  "residual": false,
+  "width": 16
+ },
+ "elements": 9789,
+ "format": 1,
+ "model_config": {
+  "belief_d": 32,
+  "critic_d": 32,
+  "critic_d_ff": 64,
+  "critic_heads": 2,
+  "critic_history_d": 0,
+  "critic_history_layers": 0,
+  "critic_kind": "flat",
+  "critic_layers": 1,
+  "d_ff": 64,
+  "d_model": 32,
+  "ffn": "gelu",
+  "head_d": 32,
+  "max_candidates": 128,
+  "max_history": 128,
+  "n_heads": 2,
+  "n_layers_history": 1,
+  "n_layers_query": 1,
+  "scalar_d": 16
+ },
+ "source": "random:tiny",
+ "step": 0,
+ "tensors": {
+  "bury.card_embed": {
+   "offset": 0,
+   "shape": [
+    54,
+    16
+   ]
+  },
+  "bury.card_in.bias": {
+   "offset": 864,
+   "shape": [
+    16
+   ]
+  },
+  "bury.card_in.weight": {
+   "offset": 880,
+   "shape": [
+    16,
+    31
+   ]
+  },
+  "bury.ctx_in.bias": {
+   "offset": 1376,
+   "shape": [
+    16
+   ]
+  },
+  "bury.ctx_in.weight": {
+   "offset": 1392,
+   "shape": [
+    16,
+    35
+   ]
+  },
+  "bury.encoder.layers.0.linear1.bias": {
+   "offset": 1952,
+   "shape": [
+    32
+   ]
+  },
+  "bury.encoder.layers.0.linear1.weight": {
+   "offset": 1984,
+   "shape": [
+    32,
+    16
+   ]
+  },
+  "bury.encoder.layers.0.linear2.bias": {
+   "offset": 2496,
+   "shape": [
+    16
+   ]
+  },
+  "bury.encoder.layers.0.linear2.weight": {
+   "offset": 2512,
+   "shape": [
+    16,
+    32
+   ]
+  },
+  "bury.encoder.layers.0.norm1.bias": {
+   "offset": 3024,
+   "shape": [
+    16
+   ]
+  },
+  "bury.encoder.layers.0.norm1.weight": {
+   "offset": 3040,
+   "shape": [
+    16
+   ]
+  },
+  "bury.encoder.layers.0.norm2.bias": {
+   "offset": 3056,
+   "shape": [
+    16
+   ]
+  },
+  "bury.encoder.layers.0.norm2.weight": {
+   "offset": 3072,
+   "shape": [
+    16
+   ]
+  },
+  "bury.encoder.layers.0.self_attn.in_proj_bias": {
+   "offset": 3088,
+   "shape": [
+    48
+   ]
+  },
+  "bury.encoder.layers.0.self_attn.in_proj_weight": {
+   "offset": 3136,
+   "shape": [
+    48,
+    16
+   ]
+  },
+  "bury.encoder.layers.0.self_attn.out_proj.bias": {
+   "offset": 3904,
+   "shape": [
+    16
+   ]
+  },
+  "bury.encoder.layers.0.self_attn.out_proj.weight": {
+   "offset": 3920,
+   "shape": [
+    16,
+    16
+   ]
+  },
+  "bury.norm.bias": {
+   "offset": 4176,
+   "shape": [
+    16
+   ]
+  },
+  "bury.norm.weight": {
+   "offset": 4192,
+   "shape": [
+    16
+   ]
+  },
+  "bury.score.bias": {
+   "offset": 4208,
+   "shape": [
+    1
+   ]
+  },
+  "bury.score.weight": {
+   "offset": 4209,
+   "shape": [
+    1,
+    16
+   ]
+  },
+  "bury.value_head.0.bias": {
+   "offset": 4225,
+   "shape": [
+    16
+   ]
+  },
+  "bury.value_head.0.weight": {
+   "offset": 4241,
+   "shape": [
+    16,
+    178
+   ]
+  },
+  "bury.value_head.2.bias": {
+   "offset": 7089,
+   "shape": [
+    16
+   ]
+  },
+  "bury.value_head.2.weight": {
+   "offset": 7105,
+   "shape": [
+    16,
+    16
+   ]
+  },
+  "bury.value_head.4.bias": {
+   "offset": 7361,
+   "shape": [
+    1
+   ]
+  },
+  "bury.value_head.4.weight": {
+   "offset": 7362,
+   "shape": [
+    1,
+    16
+   ]
+  },
+  "declare.actor.0.bias": {
+   "offset": 7378,
+   "shape": [
+    16
+   ]
+  },
+  "declare.actor.0.weight": {
+   "offset": 7394,
+   "shape": [
+    16,
+    121
+   ]
+  },
+  "declare.actor.2.bias": {
+   "offset": 9330,
+   "shape": [
+    16
+   ]
+  },
+  "declare.actor.2.weight": {
+   "offset": 9346,
+   "shape": [
+    16,
+    16
+   ]
+  },
+  "declare.actor.4.bias": {
+   "offset": 9602,
+   "shape": [
+    11
+   ]
+  },
+  "declare.actor.4.weight": {
+   "offset": 9613,
+   "shape": [
+    11,
+    16
+   ]
+  }
+ }
+}
