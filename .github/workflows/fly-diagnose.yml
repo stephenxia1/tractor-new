@@ -1,0 +1,67 @@
+name: fly-diagnose
+
+# Read-only checks on the deployed game: the Fly app's status, recent logs
+# and secret names (never values), whether the web app is reachable, which
+# server URL its bundle points at, and whether the server accepts a
+# websocket from each web origin. Runs on manual dispatch, or when this
+# file changes on rl-research.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["rl-research"]
+    paths:
+      - .github/workflows/fly-diagnose.yml
+
+permissions:
+  contents: read
+
+env:
+  WS: tractor-ws-stephenxia.fly.dev
+  ORIGINS: >-
+    https://tractor-new-gubmu73d2-stephenxia1s-projects.vercel.app
+    https://tractor-new.vercel.app
+    https://tractor-new-stephenxia1s-projects.vercel.app
+    https://tractor-new-git-main-stephenxia1s-projects.vercel.app
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Fly status
+        continue-on-error: true
+        run: flyctl status
+      - name: Secret names (values are never shown)
+        continue-on-error: true
+        run: flyctl secrets list
+      - name: Recent server logs
+        continue-on-error: true
+        run: flyctl logs --no-tail | tail -60
+      - name: Health
+        run: curl -sS -m 15 "https://$WS/health"; echo
+      - name: Web pages and the server URL their bundle uses
+        continue-on-error: true
+        run: |
+          for o in $ORIGINS; do
+            code=$(curl -s -o page.html -w '%{http_code}' -m 20 "$o/")
+            echo "== $o -> HTTP $code"
+            # The bundle's server address: any ws(s) URL in the page or its scripts.
+            grep -o 'wss\?://[^"'"'"' ]*' page.html | sort -u | head -3
+            for js in $(grep -o '/_next/static/[^"]*\.js' page.html | sort -u | head -40); do
+              curl -s -m 20 "$o$js" | grep -o 'wss\?://[a-zA-Z0-9.:/_-]*' | sort -u
+            done | sort -u | head -5
+          done
+      - name: Websocket handshake from each origin
+        run: |
+          for o in "" $ORIGINS; do
+            line=$(curl -s -i -m 10 -o - \
+              -H "Connection: Upgrade" -H "Upgrade: websocket" \
+              -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+              ${o:+-H "Origin: $o"} "https://$WS/ws" | head -1)
+            echo "origin ${o:-<none>} -> ${line}"
+          done
