@@ -1,0 +1,68 @@
+name: fly-deploy
+
+# Deploys the ws server (apps/ws, with the engine and its bots) to Fly.io,
+# so the game server ships from main the way the web app ships from main
+# on Vercel. The lobby lists bots from the web build, and a server that
+# does not know a listed bot crashes when one is picked, so the two should
+# deploy together.
+#
+# Needs the repository secret FLY_API_TOKEN: a deploy token for the app in
+# fly.toml (Fly dashboard -> the app -> Tokens, or
+# `fly tokens create deploy -a tractor-ws-stephenxia`).
+#
+# Runs on a push to main that touches the server, on manual dispatch, and
+# on a push to rl-research whose head commit says [fly-deploy] -- that last
+# one deploys the server from the research branch before main moves, so
+# the server knows a new bot before the lobby offers it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "rl-research"]
+    paths:
+      - apps/ws/**
+      - packages/engine/**
+      - packages/protocol/**
+      - Dockerfile
+      - .dockerignore
+      - fly.toml
+      - package-lock.json
+      - .github/workflows/fly-deploy.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # On rl-research, only for a commit whose message asks for it.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[fly-deploy]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the Fly token is configured
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::error::Add FLY_API_TOKEN as a repository secret (a deploy token for the app in fly.toml)."
+            exit 1
+          fi
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Check the server answers
+        run: |
+          app=$(sed -n 's/^app *= *"\(.*\)"/\1/p' fly.toml)
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS "https://$app.fly.dev/health"; then echo; exit 0; fi
+            sleep 10
+          done
+          echo "::error::https://$app.fly.dev/health did not answer"
+          exit 1

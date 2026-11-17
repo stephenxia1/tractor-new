@@ -156,6 +156,9 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   // in-memory room, down with it. Deploy the server first.
   'rl-v2',
   'rl-zero',
+  // A searched move takes seconds and runs on the server's event loop,
+  // so every room waits while it thinks; offered anyway (2026-11-17).
+  'rl-zero-search',
 ];
 
 export function botTypeLabel(t: BotType): string {
