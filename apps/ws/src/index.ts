@@ -772,10 +772,7 @@ const http = createServer((req, res) => {
   res.end();
 });
 
-// ALLOWED_ORIGINS is a Fly secret; ALLOWED_ORIGINS_EXTRA (fly.toml [env])
-// adds origins beside it without having to know or rewrite the secret.
-const ALLOWED_ORIGINS = [process.env.ALLOWED_ORIGINS ?? '', process.env.ALLOWED_ORIGINS_EXTRA ?? '']
-  .join(',')
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? '')
   .split(',')
   .map((s) => s.trim())
   .filter((s) => s.length > 0);
