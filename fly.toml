@@ -13,6 +13,9 @@ primary_region = "sjc"
   # Comma-separated list of allowed browser origins. Leave unset during
   # local testing; set to your Vercel domain(s) in production.
   # ALLOWED_ORIGINS = "https://your-app.vercel.app"
+  # Origins allowed beside the ALLOWED_ORIGINS secret: the web app's
+  # Vercel production domain, which the secret did not list (2026-11-17).
+  ALLOWED_ORIGINS_EXTRA = "https://tractor-new.vercel.app"
 
 [http_service]
   internal_port = 8787
