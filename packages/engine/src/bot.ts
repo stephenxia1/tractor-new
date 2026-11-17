@@ -94,7 +94,8 @@ export type BotType =
   | 'rl-v2'          // DMC self-play, points-target net with history attention + CTDE critic
   | 'rl-v2-search'   // rl-v2 + determinized search, worlds weighted by the belief head
   | 'rl-v2-search-u'// rl-v2 + determinized search, uniform worlds (the A/B control)
-  | 'rl-zero';       // PPO self-play from scratch: own declarations, burials and play, no heuristic data
+  | 'rl-zero'        // PPO self-play from scratch: own declarations, burials and play, no heuristic data
+  | 'rl-zero-search';// rl-zero + determinized search over its policy and privileged critic
 
 export const BOT_TYPES: ReadonlyArray<BotType> = [
   'lowball',
@@ -134,6 +135,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'rl-v2-search',
   'rl-v2-search-u',
   'rl-zero',
+  'rl-zero-search',
 ];
 
 // User-facing subset shown in the lobby dropdown. Only the latest
@@ -228,6 +230,8 @@ export function botTypeLabel(t: BotType): string {
       return 'RL (neural)';
     case 'rl-zero':
       return 'Zero (self-taught)';
+    case 'rl-zero-search':
+      return 'Zero + search (slower)';
     case 'rl-v2-search':
       return 'RL (neural + search)';
     case 'rl-v2-search-u':
@@ -339,6 +343,15 @@ function pickBotActionUnguarded(
       );
     }
     return _rlZeroAgent(state, seat);
+  }
+  if (type === 'rl-zero-search') {
+    if (_rlZeroSearchAgent === null) {
+      throw new Error(
+        "bot 'rl-zero-search' has no implementation registered: import " +
+        "'@tractor/engine/rl/zero/register' once at startup.",
+      );
+    }
+    return _rlZeroSearchAgent(state, seat);
   }
   if (state.phase === 'dealing') {
     const isSmart = type === 'smart' || type.startsWith('smart-v');
@@ -520,6 +533,14 @@ let _rlZeroAgent: ((s: GameState, seat: Seat) => BotAction) | null = null;
 
 export function registerZeroAgent(agent: (s: GameState, seat: Seat) => BotAction): void {
   _rlZeroAgent = agent;
+}
+
+// rl-zero with its play decisions searched (rl/zero/search.ts): the
+// research evaluation's strongest setting, at a few seconds a searched move.
+let _rlZeroSearchAgent: ((s: GameState, seat: Seat) => BotAction) | null = null;
+
+export function registerZeroSearchAgent(agent: (s: GameState, seat: Seat) => BotAction): void {
+  _rlZeroSearchAgent = agent;
 }
 
 // The searching variants differ only in how worlds are sampled, which is

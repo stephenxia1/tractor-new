@@ -27,6 +27,8 @@ function arg(name: string, fallback: string): string {
 
 const hands = Number(arg('hands', '10'));
 const opponent = arg('opponent', 'smart-v34') as BotType;
+// `rl-zero` or `rl-zero-search`.
+const bot = arg('bot', 'rl-zero') as BotType;
 const weightsDir = arg('weights', '');
 const seed0 = Number(arg('seed', '1'));
 
@@ -52,13 +54,13 @@ async function main(): Promise<void> {
   await import('@tractor/engine/rl/zero/register');
 
   const timing: Record<string, number[]> = { declare: [], bury: [], play: [] };
-  const typeOf = (seat: number): BotType => (seat % 2 === 0 ? 'rl-zero' : opponent);
+  const typeOf = (seat: number): BotType => (seat % 2 === 0 ? bot : opponent);
   // The ws server asks every bot at every broadcast; so does this.
   const ask = (state: GameState, seat: Seat): BotAction => {
     const t0 = performance.now();
     const a = pickBotAction(state, seat, typeOf(seat));
     const ms = performance.now() - t0;
-    if (typeOf(seat) === 'rl-zero') {
+    if (typeOf(seat) === bot) {
       if (state.phase === 'play' && a.kind === 'play_cards') timing.play!.push(ms);
       else if (state.phase === 'kitty_replace' && a.kind === 'replace_kitty') timing.bury!.push(ms);
       else if (state.phase === 'dealing' || state.phase === 'declare_lockout') timing.declare!.push(ms);
@@ -142,6 +144,8 @@ async function main(): Promise<void> {
   console.log(`declare: ${stat(timing.declare!)}`);
   console.log(`bury:    ${stat(timing.bury!)}`);
   console.log(`play:    ${stat(timing.play!)}`);
+  const slow = timing.play!.filter((ms) => ms > 400);
+  console.log(`play decisions over 400 ms (searched): ${slow.length} of ${timing.play!.length}`);
   console.log(`final levels ${JSON.stringify(state.teamLevels)} (zero is team of seats 0 and 2)`);
   const mem = process.memoryUsage();
   console.log(`memory: rss ${(mem.rss / 1e6).toFixed(0)} MB, heap ${(mem.heapUsed / 1e6).toFixed(0)} MB, external+arrays ${((mem.external + mem.arrayBuffers) / 1e6).toFixed(0)} MB`);

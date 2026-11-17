@@ -73,13 +73,13 @@ export type ZeroObs = {
 
 // --- weights, gathered once per ZeroWeights ------------------------------
 
-type Lin = {
+export type Lin = {
   readonly w: Float32Array;
   readonly b: Float32Array | null;
   readonly inDim: number;
   readonly outDim: number;
 };
-type Norm = { readonly w: Float32Array; readonly b: Float32Array };
+export type Norm = { readonly w: Float32Array; readonly b: Float32Array };
 
 type CausalBlock = { norm1: Norm; qkv: Lin; proj: Lin; norm2: Norm; fc1: Lin; fc2: Lin };
 type QueryBlock = {
@@ -103,6 +103,9 @@ type HistoryCache = {
   readonly values: Float32Array[];
   readonly memKeys: Float32Array[]; // per query layer, maxHistory x d
   readonly memValues: Float32Array[];
+  // The encoder's output (after its final norm, before the query block's
+  // memory norm): what the critic reads as `history_enc`.
+  readonly encoded: Float32Array; // maxHistory x d
 };
 
 type Net = {
@@ -279,11 +282,11 @@ function prepare(w: ZeroWeights): Net {
 
 // --- kernels -------------------------------------------------------------
 
-/** y[r, :] = W x[r, :] + b for `rows` rows. Four rows against two outputs
+/** y[r, :] = W x[r, :] + b for `rows` rows. Four rows against four outputs
  *  at a time; every (row, output) sums over the input in index order
  *  whichever block it falls in, so the result does not depend on how the
  *  rows are grouped. */
-function linear(
+export function linear(
   x: Float32Array,
   xOff: number,
   rows: number,
@@ -303,35 +306,47 @@ function linear(
     const y2 = y1 + m;
     const y3 = y2 + m;
     let o = 0;
-    for (; o + 2 <= m; o += 2) {
+    // Four rows against four outputs: each weight and input is read once
+    // per sixteen products.
+    for (; o + 4 <= m; o += 4) {
       const wa = o * n;
       const wb = wa + n;
-      let a0 = 0;
-      let a1 = 0;
-      let a2 = 0;
-      let a3 = 0;
-      let b0 = 0;
-      let b1 = 0;
-      let b2 = 0;
-      let b3 = 0;
+      const wc = wb + n;
+      const wd = wc + n;
+      let a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+      let b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+      let c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+      let d0 = 0, d1 = 0, d2 = 0, d3 = 0;
       for (let i = 0; i < n; i++) {
-        const u = w[wa + i]!;
-        const v = w[wb + i]!;
         const p0 = x[x0 + i]!;
         const p1 = x[x1 + i]!;
         const p2 = x[x2 + i]!;
         const p3 = x[x3 + i]!;
+        const u = w[wa + i]!;
         a0 += u * p0;
         a1 += u * p1;
         a2 += u * p2;
         a3 += u * p3;
+        const v = w[wb + i]!;
         b0 += v * p0;
         b1 += v * p1;
         b2 += v * p2;
         b3 += v * p3;
+        const q = w[wc + i]!;
+        c0 += q * p0;
+        c1 += q * p1;
+        c2 += q * p2;
+        c3 += q * p3;
+        const z = w[wd + i]!;
+        d0 += z * p0;
+        d1 += z * p1;
+        d2 += z * p2;
+        d3 += z * p3;
       }
       const ba = b === null ? 0 : b[o]!;
       const bb = b === null ? 0 : b[o + 1]!;
+      const bc = b === null ? 0 : b[o + 2]!;
+      const bd = b === null ? 0 : b[o + 3]!;
       y[y0 + o] = a0 + ba;
       y[y1 + o] = a1 + ba;
       y[y2 + o] = a2 + ba;
@@ -340,6 +355,14 @@ function linear(
       y[y1 + o + 1] = b1 + bb;
       y[y2 + o + 1] = b2 + bb;
       y[y3 + o + 1] = b3 + bb;
+      y[y0 + o + 2] = c0 + bc;
+      y[y1 + o + 2] = c1 + bc;
+      y[y2 + o + 2] = c2 + bc;
+      y[y3 + o + 2] = c3 + bc;
+      y[y0 + o + 3] = d0 + bd;
+      y[y1 + o + 3] = d1 + bd;
+      y[y2 + o + 3] = d2 + bd;
+      y[y3 + o + 3] = d3 + bd;
     }
     for (; o < m; o++) {
       const wa = o * n;
@@ -365,18 +388,27 @@ function linear(
     const x0 = xOff + r * n;
     const y0 = yOff + r * m;
     let o = 0;
-    for (; o + 2 <= m; o += 2) {
+    // One row against four outputs.
+    for (; o + 4 <= m; o += 4) {
       const wa = o * n;
       const wb = wa + n;
+      const wc = wb + n;
+      const wd = wc + n;
       let a0 = 0;
       let b0 = 0;
+      let c0 = 0;
+      let d0 = 0;
       for (let i = 0; i < n; i++) {
         const p0 = x[x0 + i]!;
         a0 += w[wa + i]! * p0;
         b0 += w[wb + i]! * p0;
+        c0 += w[wc + i]! * p0;
+        d0 += w[wd + i]! * p0;
       }
       y[y0 + o] = a0 + (b === null ? 0 : b[o]!);
       y[y0 + o + 1] = b0 + (b === null ? 0 : b[o + 1]!);
+      y[y0 + o + 2] = c0 + (b === null ? 0 : b[o + 2]!);
+      y[y0 + o + 3] = d0 + (b === null ? 0 : b[o + 3]!);
     }
     for (; o < m; o++) {
       const wa = o * n;
@@ -387,7 +419,7 @@ function linear(
   }
 }
 
-function layerNorm(
+export function layerNorm(
   x: Float32Array,
   xOff: number,
   rows: number,
@@ -437,21 +469,21 @@ function erf(x: number): number {
   return x >= 0 ? 1 - r : r - 1;
 }
 
-function geluInPlace(x: Float32Array, n: number): void {
+export function geluInPlace(x: Float32Array, n: number): void {
   for (let i = 0; i < n; i++) {
     const v = x[i]!;
     x[i] = 0.5 * v * (1 + erf(v * Math.SQRT1_2));
   }
 }
 
-function addInPlace(x: Float32Array, y: Float32Array, n: number): void {
+export function addInPlace(x: Float32Array, y: Float32Array, n: number): void {
   for (let i = 0; i < n; i++) x[i] = x[i]! + y[i]!;
 }
 
 /** One attention head row: out[0:dh] = softmax(q.k / sqrt(dh)) v over the
  *  key rows listed. Keys come from up to two sources: a single extra row
  *  (the cross-attention sink) and a contiguous block. */
-function attendRow(
+export function attendRow(
   q: Float32Array,
   qOff: number,
   dh: number,
@@ -515,6 +547,7 @@ function newCache(net: Net): HistoryCache {
     values: net.histBlocks.map(per),
     memKeys: net.queryBlocks.map(per),
     memValues: net.queryBlocks.map(per),
+    encoded: per(),
   };
 }
 
@@ -614,6 +647,7 @@ function advanceHistory(net: Net, c: HistoryCache, hist: Float32Array, hOff: num
   }
   // Encoded output, then the memory norm the query block applies to it.
   layerNorm(x, 0, rows, d, net.histNorm, h, 0);
+  c.encoded.set(h.subarray(0, rows * d), start * d);
   layerNorm(h, 0, rows, d, net.memNorm, x, 0);
   for (let l = 0; l < net.queryBlocks.length; l++) {
     const blk = net.queryBlocks[l]!;
@@ -846,6 +880,25 @@ export function actorLogits(w: ZeroWeights, obs: ZeroObs, opts: ActorOptions = {
   const out = new Float32Array(obs.numCandidates);
   scoreCandidates(net, obs, summary, out);
   return out;
+}
+
+/** The history encoder's output for `history` (`historyLen` tokens, the
+ *  most recent max_history kept): float32[n x d_model], a copy. The same
+ *  rows the Python `HistoryEncoder` returns as `history_enc` for the real
+ *  positions; uses and extends the stream cache like `actorLogits`. */
+export function encodeHistory(
+  w: ZeroWeights,
+  history: Float32Array,
+  historyLen: number,
+  opts: ActorOptions = {},
+): { readonly encoded: Float32Array; readonly n: number; readonly d: number } {
+  const net = prepare(w);
+  if (history.length < historyLen * HISTORY_DIM) throw new Error('zero net: history too short');
+  const n = Math.min(historyLen, net.maxHistory);
+  const hOff = (historyLen - n) * HISTORY_DIM;
+  const [c, start] = pickCache(net, history, hOff, n, opts.cache !== false);
+  advanceHistory(net, c, history, hOff, start, n);
+  return { encoded: c.encoded.slice(0, n * net.d), n, d: net.d };
 }
 
 /** Drop every cached history stream (tests; a weights reload). */

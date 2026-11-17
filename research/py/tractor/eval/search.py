@@ -231,8 +231,17 @@ def search_move(
     cache: Cache,
     cfg: ModelConfig,
     device: Any,
+    worlds: list[World] | None = None,
+    details: dict | None = None,
 ) -> tuple[int, bool]:
-    """``(index into moves, searched)`` for the seat to act in ``state``."""
+    """``(index into moves, searched)`` for the seat to act in ``state``.
+
+    ``worlds`` replaces the sampled worlds, and ``details`` (a dict) is
+    filled with the candidates searched, the per-world scores and their
+    means: both for checking another implementation against this one
+    (research/py/test_zero_search_parity.py). Neither changes a search
+    that does not pass them.
+    """
     order = np.argsort(-log_prior, kind="stable")
     best = int(order[0])
     if len(moves) <= 1 or float(np.exp(log_prior[best])) >= search.confident:
@@ -246,7 +255,8 @@ def search_move(
     start = len(state.tricks)
     stop = start + 1 + search.extra_tricks
 
-    worlds = [sample_world(state, seat, rng) for _ in range(search.worlds)]
+    if worlds is None:
+        worlds = [sample_world(state, seat, rng) for _ in range(search.worlds)]
     sims: list[PlayState] = []
     for world in worlds:
         for i in top:
@@ -301,5 +311,7 @@ def search_move(
         scores[k] = settled + future[k]
 
     mean = scores.reshape(len(worlds), len(top)).mean(axis=0)
+    if details is not None:
+        details.update(top=top, scores=scores.copy(), mean=mean.copy())
     # Ties go to the policy's preference, which is `top`'s order.
     return top[int(np.argmax(mean))], True

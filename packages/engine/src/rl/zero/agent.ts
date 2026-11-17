@@ -23,11 +23,17 @@ import { zeroDeclare } from './declare';
 import { encodePosition, packCandidates } from './features';
 import { actorLogits } from './net';
 import { plane, positionFor } from './position';
+import { DEFAULT_SEARCH, mulberry32, positionSeed, searchMove, type SearchConfig } from './search';
 import { loadZeroWeights, type ZeroWeights } from './weights';
 
 export type ZeroAgentOptions = {
   /** Directory holding weights-zero.{bin,json}. Defaults to this module's. */
   readonly weightsDir?: string;
+  /** Search play decisions (search.ts) rather than play the policy's
+   *  greedy move. Pre-play is the networks' either way. */
+  readonly search?: SearchConfig | null;
+  /** Mixed into each decision's world-sampling seed. */
+  readonly seed?: number;
 };
 
 const WAIT: BotAction = { kind: 'wait' };
@@ -66,11 +72,19 @@ export function makeZeroAgent(opts: ZeroAgentOptions = {}): (state: GameState, s
         if (candidates.length === 0) throw new Error(`rl-zero: seat ${seat} has no candidate move`);
         if (candidates.length === 1) return { kind: 'play_cards', cards: candidates[0]!.cards };
         const moves = candidates.map((c) => plane(c.cards));
+        const pos = positionFor(state, seat, myKitty);
         const logits = actorLogits(w, {
-          ...encodePosition(positionFor(state, seat, myKitty)),
+          ...encodePosition(pos),
           candidates: packCandidates(moves),
           numCandidates: moves.length,
         });
+        if (opts.search) {
+          const { index } = searchMove(w, state, seat, candidates.map((c) => c.cards), logits, {
+            config: opts.search,
+            rng: mulberry32(positionSeed(opts.seed ?? 0, pos)),
+          });
+          return { kind: 'play_cards', cards: candidates[index]!.cards };
+        }
         let best = 0;
         for (let i = 1; i < logits.length; i++) if (logits[i]! > logits[best]!) best = i;
         return { kind: 'play_cards', cards: candidates[best]!.cards };
@@ -91,4 +105,11 @@ export function makeZeroAgent(opts: ZeroAgentOptions = {}): (state: GameState, s
     lastBySeat.set(seat, action);
     return action;
   };
+}
+
+/** `rl-zero-search`: the same agent, its play decisions searched. */
+export function makeZeroSearchAgent(
+  opts: Omit<ZeroAgentOptions, 'search'> & { readonly search?: SearchConfig } = {},
+): (state: GameState, seat: Seat) => BotAction {
+  return makeZeroAgent({ ...opts, search: opts.search ?? DEFAULT_SEARCH });
 }
