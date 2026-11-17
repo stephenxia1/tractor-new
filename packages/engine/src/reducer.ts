@@ -675,7 +675,7 @@ function advanceTrick(state: GameState): ApplyResult {
 // compares structurally: a follower beats the current winner only if
 // their play has the same component shape multiset and each component
 // out-ranks a distinct one in the current winner.
-function resolveTrick(
+export function resolveTrick(
   trick: ActiveTrick,
   ctx: TrumpContext,
   n: number,
