@@ -1358,6 +1358,69 @@ and no search. Records: `evals/2026-11-14/zero2-*`.
 on v6, lr 3e-4 crossed the KL guard within a pass, and at the lower
 rates that kept it inside the guard it learned little. Stopped at step 1950.
 
+### Holding the peak, and expert iteration (2026-11-15 to 17)
+
+**A lower learning rate holds the peak.** `zero2-lr1e4` resumed `zero2`
+at step 3000 with lr 1e-4 and reached 0.562 / +6.9 points at step 4000.
+That is +0.034 win over `zero2` at step 4000, paired, and +0.017 +/-
+0.007 pooled over the milestones from 3250 to 4000. Continuing it to
+step 5000 at 1e-4 (`zero2-c1e4`) holds the level: 0.571 / +7.8, and
+0.582 / +9.3 play only. Lowering lr to 5e-5 (`zero2-c5e5`) adds nothing:
+0.554 / +6.5 at step 5000. Two other arms from step 4000 also showed
+nothing:
+- **A play-out return for declarations** (`zero2-dpo`, the user approved
+  the test): −0.002 +/- 0.009 win at 4250 and 4500; stopped.
+- **v6 networks on `zero2`'s recipe** (`zero3`): reached 0.517 at step
+  750, then collapsed to 0.360 at step 1000 in KL bursts; stopped.
+
+**Expert iteration** (`train/distill.py`). Search is a policy-improvement
+operator built only from the policy, the critic and the rules, so
+training the policy toward search's choices is zero, as AlphaZero's
+search targets are.
+- **Labels.** `modal_perf.py::distill_gen` plays hands from
+  `zero2-lr1e4` step 4000's own deals, declarations and burials, sampling
+  moves as training does. Wherever search would act (more than one move,
+  none above 0.99) it labels the position with search's choice: 8
+  worlds, top 3. That gave 126k positions from about 7,500 hands. Search acted
+  on ~28% of decisions and overruled the policy's top move on ~60% of
+  those.
+- **Update.** After each PPO update, a cross-entropy step on the actor
+  alone toward those labels, with its own AdamW optimiser
+  (`--distill-paths`).
+
+Two arms from `zero2-lr1e4` step 4000 to 5000, paired with `zero2-c1e4`
+over the milestones from 4250 to 5000:
+
+| arm | distillation | win | points |
+| --- | --- | --- | --- |
+| `zero2-dst` | lr 3e-5, 2 minibatches of 512 a step | +0.000 +/- 0.007 | +0.43 +/- 0.43 |
+| `zero2-dst2` | lr 1e-4, 8 minibatches of 512 a step | +0.001 +/- 0.007 | **+0.75 +/- 0.43** |
+
+`zero2-dst2`'s agreement with search rose from 0.43 to 0.46. Its step
+5000 scores 0.579 / +0.225 / +9.0, the best plain result, and 0.583 /
++8.8 play only. The policy gain shows most with search on top, where
+search's labels and the policy now agree on more positions:
+
+| search 8 worlds, confident 0.99 | seed | win | levels | points |
+| --- | --- | --- | --- | --- |
+| `zero2-lr1e4` step 4000 | 20260923 | 0.597 | +0.229 | +9.5 |
+| `zero2-lr1e4` step 4000 | 20261114 | 0.592 | +0.224 | +9.1 |
+| `zero2-c1e4` step 5000 | 20260923 | 0.592 | +0.229 | +9.4 |
+| `zero2-c1e4` step 5000 | 20261114 | 0.598 | +0.221 | +9.5 |
+| `zero2-dst2` step 5000 | 20260923 | **0.607** | **+0.259** | **+10.0** |
+| `zero2-dst2` step 5000 | **20261114** | **0.610** | **+0.266** | **+10.8** |
+
+Over both seeds `zero2-dst2` with search beats `zero2-c1e4` with search
+by **+0.014 +/- 0.010 win and +0.99 +/- 0.65 points** a hand, paired
+(9,240 hands), and `zero2-lr1e4` with search by +0.014 +/- 0.010 and
++1.15 +/- 0.66. It is the strongest zero bot so far. Search adds +0.028
++/- 0.014 win and +1.06 +/- 0.93 points over its own plain policy.
+
+A second round is running: fresh labels from `zero2-dst2` step 5000
+(`/vol/distill/dst2-5000`) train `zero2-dst3` to step 6000, against a
+plain-PPO control from the same checkpoint (`zero2-d2c`). Records:
+`evals/2026-11-16/`.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
