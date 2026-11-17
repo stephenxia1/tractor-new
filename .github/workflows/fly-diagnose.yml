@@ -52,14 +52,14 @@ jobs:
             echo "== $o -> HTTP $code"
             # The bundle's server address: any ws(s) URL in the page or its scripts.
             grep -o 'wss\?://[^"'"'"' ]*' page.html | sort -u | head -3
-            for js in $(grep -o '/_next/static/[^"]*\.js' page.html | sort -u | head -40); do
-              curl -s -m 20 "$o$js" | grep -o 'wss\?://[a-zA-Z0-9.:/_-]*' | sort -u
+            for js in $(grep -o '/_next/static/[^"\\]*\.js' page.html | sort -u | head -60); do
+              curl -s -m 20 "$o$js" | grep -o 'wss\?://[a-zA-Z0-9.:/_-]*\|[a-zA-Z0-9.-]*fly\.dev[a-zA-Z0-9/_-]*' | sort -u
             done | sort -u | head -5
           done
       - name: Websocket handshake from each origin
         run: |
           for o in "" $ORIGINS; do
-            line=$(curl -s -i -m 10 -o - \
+            line=$(curl -s -i --http1.1 -m 10 -o - \
               -H "Connection: Upgrade" -H "Upgrade: websocket" \
               -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
               ${o:+-H "Origin: $o"} "https://$WS/ws" | head -1)
