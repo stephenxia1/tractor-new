@@ -18,11 +18,10 @@ permissions:
 
 env:
   WS: tractor-ws-stephenxia.fly.dev
+  # Only origins known to be this project's (from its own Vercel
+  # deployment records); never guessed domains, which may be other people's.
   ORIGINS: >-
     https://tractor-new-gubmu73d2-stephenxia1s-projects.vercel.app
-    https://tractor-new.vercel.app
-    https://tractor-new-stephenxia1s-projects.vercel.app
-    https://tractor-new-git-main-stephenxia1s-projects.vercel.app
 
 jobs:
   diagnose:
