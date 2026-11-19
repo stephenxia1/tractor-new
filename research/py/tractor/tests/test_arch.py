@@ -66,6 +66,15 @@ def test_the_v5_networks_keep_their_parameter_layouts() -> None:
         assert got == layouts[name], name
 
 
+def _same(got: torch.Tensor, want: torch.Tensor, what: str = "") -> None:
+    """Bit for bit on the torch that wrote the fixture. Another torch's
+    kernels may round the last place differently -- measured with torch
+    2.15: 7e-8 in a logit, 3e-10 in a value -- which no change to this
+    code explains, so a difference is allowed at that scale and no more."""
+    if not torch.equal(got, want):
+        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6, msg=what or None)
+
+
 def test_the_v5_networks_compute_exactly_what_they_did() -> None:
     fx = torch.load(FIXTURES / "legacy_outputs.torch", weights_only=False)
 
@@ -76,12 +85,12 @@ def test_the_v5_networks_compute_exactly_what_they_did() -> None:
     with torch.no_grad():
         out, value = net(obs, ac["priv"])
         _o, value0 = net(obs._replace(history_len=torch.zeros_like(obs.history_len)), ac["priv"])
-    assert torch.equal(out.logits, ac["logits"])
-    assert torch.equal(value, ac["value"])
-    assert torch.equal(out.value, ac["own_value"])
-    assert torch.equal(out.outcome_logits, ac["outcome"])
-    assert torch.equal(out.belief_logits, ac["belief"])
-    assert torch.equal(value0, ac["value_empty"])
+    _same(out.logits, ac["logits"])
+    _same(value, ac["value"])
+    _same(out.value, ac["own_value"])
+    _same(out.outcome_logits, ac["outcome"])
+    _same(out.belief_logits, ac["belief"])
+    _same(value0, ac["value_empty"])
 
     for key, cls, cfg_cls in (("declare", DeclareNet, DeclareConfig),
                               ("bury", BuryNet, BuryNetConfig)):
@@ -91,7 +100,7 @@ def test_the_v5_networks_compute_exactly_what_they_did() -> None:
         with torch.no_grad():
             got = small(*part["inputs"])
         for a, b in zip(got, part["outputs"]):
-            assert torch.equal(a, b), key
+            _same(a, b, key)
 
 
 def test_a_checkpoint_without_saved_configs_rebuilds_as_v5() -> None:

@@ -268,15 +268,45 @@ def test_behaviour_logprob_is_computed_in_the_learners_precision() -> None:
 
     idx = np.arange(min(len(buf), 96))
     obs, privileged, batch = buf.as_torch(idx, "cpu")
-    _loss, parts = learner.losses(obs, privileged, batch)
 
-    kl = abs(float(parts["approx_kl"]))
-    clipped = float(parts["clip_fraction"])
-    # Exact, not approximate: the same computation run twice over the
-    # same rows gives the same answer, so any deviation is the two
-    # halves disagreeing about precision.
-    assert kl < 1e-9, f"approx_kl {kl:.3e} at identical weights"
-    assert clipped == 0.0, f"{clipped:.1%} of rows clipped before any step"
+    def row_logp(i: int, amp: bool) -> float:
+        one = type(obs)(*[t[i : i + 1] for t in obs])
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
+            out, _value = net(one, privileged[i : i + 1])
+        return float(out.log_probs.float()[0, int(buf.action[i])])
+
+    def batch_logp(amp: bool) -> torch.Tensor:
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
+            out, _value = net(obs, privileged)
+        act = torch.from_numpy(buf.action[idx]).long().unsqueeze(1)
+        return out.log_probs.float().gather(1, act).squeeze(1)
+
+    # Some platforms' bfloat16 kernels round a row differently by batch
+    # size: measured with torch 2.15 on a CPU with AMX, the same row
+    # alone and inside this 96-row batch differ by up to 0.12 in
+    # log-probability. There the ratio at identical weights cannot be 1
+    # for any implementation, so the precision question is asked row by
+    # row at the rollout's own batch shape (one hand: one row a round).
+    invariant = bool(torch.equal(
+        batch_logp(True), torch.tensor([row_logp(int(i), True) for i in idx])
+    ))
+    if invariant:
+        _loss, parts = learner.losses(obs, privileged, batch)
+        kl = abs(float(parts["approx_kl"]))
+        clipped = float(parts["clip_fraction"])
+        # Exact, not approximate: the same computation run twice over
+        # the same rows gives the same answer, so any deviation is the
+        # two halves disagreeing about precision.
+        assert kl < 1e-9, f"approx_kl {kl:.3e} at identical weights"
+        assert clipped == 0.0, f"{clipped:.1%} of rows clipped before any step"
+    else:
+        stored = buf.logp[idx]
+        bf16 = np.array([row_logp(int(i), True) for i in idx], dtype=np.float32)
+        fp32 = np.array([row_logp(int(i), False) for i in idx], dtype=np.float32)
+        # Collection ran in the learner's precision: reproduced exactly...
+        assert np.array_equal(stored, bf16), float(np.abs(stored - bf16).max())
+        # ...and not by float32, so the check above can tell them apart.
+        assert not np.array_equal(stored, fp32)
 
 
 def test_a_nonfinite_loss_never_reaches_the_weights() -> None:
