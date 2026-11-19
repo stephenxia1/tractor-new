@@ -1472,8 +1472,15 @@ Four processes on four cores ran at 210-225 ms each (12 x 4): it scales
 with cores. `torch.compile` made the forward slower on the CPU (78.9
 against 71.2 ms a batch, after 87 s of compiling) and was dropped; bf16
 no longer pays once the exact savings are in, and int8 breaks the
-policy. ONNX was not tried: the forward is matrix-multiply bound and its
-token compaction depends on the data.
+policy. ONNX Runtime (1.32, CPU, one thread, full graph optimisation)
+loses to torch on the very same graph: the training forward exported
+whole (`torch.onnx.export`, dynamic batch) scored 40 real batches of 48
+worlds at 1,329 ms a batch against torch's 601 (logits within 4e-4,
+argmax 1,920 of 1,920), where search's own forward takes 118. An export
+with the history trimmed to the batch's longest, which search's forward
+relies on, fails: the model fixes the history at 128 positions. The
+forward's data-dependent compaction and prefix sharing would have to be
+rebuilt as many small graphs, each starting 2.2x behind.
 
 Where the factor of six comes from, all of it exact: the query block runs
 only the seven fixed tokens and the held card types (the others are

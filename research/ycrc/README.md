@@ -86,6 +86,31 @@ The platform check came out at -0.001 +/- 0.001 win against the Modal
 records. **Before 4b, decide the label width**: 12 x 4 as planned, or
 8 x 3, which played as well for two thirds of the cost.
 
+**All of 4b, 4c and §5's milestone evaluations in one command**, as a
+chain of Slurm jobs (`round2.sh`; job ids in `$TRACTOR_ROOT/round2-jobs.txt`):
+
+```bash
+research/ycrc/round2.sh --gpu <gpu partition> --cpu <cpu partition>              # 12 x 4 labels
+research/ycrc/round2.sh --gpu <gpu partition> --cpu <cpu partition> --worlds 8 --top-k 3   # or 8 x 3
+```
+
+It submits the six label shards (CPU), `zero2-d2c` at once, `zero2-dst3`
+once every shard has succeeded (`afterok`), and, once each arm's training
+job has finished, that arm's milestones: policy at 5250 / 5500 / 5750 /
+6000, random pre-play at 5500 / 6000, and step 6000 + search (8 x 3,
+0.99) on both seeds, 19 jobs in all. Evaluations run on the CPU partition
+with `--procs 16`; `--eval-on gpu` puts them on GPUs. `--dry-run` prints
+the `sbatch` lines and submits nothing. If a job fails, the jobs waiting
+on it stay pending (`DependencyNeverSatisfied`): `scancel` them, fix, and
+resubmit that part by hand from the commands below.
+
+Expect more labels than round 1: `zero2-dst2` is far less sure of itself
+than the policy round 1 labelled (search acts on 64-66% of its decisions,
+against 29% for `zero2-lr1e4` step 4000), so a hand gives ~41 rows, not
+~17: ~300k rows, ~9 GB of float16 for the six shards (held in the
+training job's memory, which has 96 GB). A test shard of 16 hands at
+12 x 4 took 50 s on 4 cores in a cloud session.
+
 **4b. Labels** from the 12 x 4 search, six shards of 1,250 hands. On a
 CPU partition, 32 cores a shard (about 10 minutes each, §5b):
 
