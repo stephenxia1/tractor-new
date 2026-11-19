@@ -8,7 +8,10 @@ One line per (checkpoint, pre-play, bot), then the mean over smart-v18 /
 v28 / v34 -- the three fair search bots the README tables average.
 `--paired` takes two files measured on the same seed and deal count and
 prints B - A hand for hand, bot by bot; given several A/B pairs (one per
-seed, say) it prints each and then every paired hand pooled. Same seed means the
+seed, say) it prints each and then every paired hand pooled. Levels are
+paired deal by deal when both files keep `per_deal_levels` (records from
+2026-11-19 on); otherwise they come from the two standard errors as if
+independent, marked `u`, which overstates the error. Same seed means the
 same deals, so the difference is valid for any two runs; it is tightest
 when both sides also start play from the same positions (two
 `--pre-play random` files), and wider when pre-play differs (two burial
@@ -81,9 +84,10 @@ def table(rows: list[dict]) -> None:
 
 def paired(a: list[dict], b: list[dict], pooled: tuple[list, list] | None = None) -> None:
     by_bot = {r["bot"]: r for r in a}
-    print(f"{'bot':10} {'A':>6} {'B':>6} {'B - A win':>16} {'B - A points':>16}")
+    print(f"{'bot':10} {'A':>6} {'B':>6} {'B - A win':>16} {'B - A levels':>18} {'B - A points':>16}")
     pooled_w: list[float] = []
     pooled_p: list[float] = []
+    pooled_l: list[tuple[float, float, bool]] = []  # (difference, variance, paired)
     for rb in sorted(b, key=lambda r: r["bot"]):
         ra = by_bot.get(rb["bot"])
         if ra is None:
@@ -94,20 +98,47 @@ def paired(a: list[dict], b: list[dict], pooled: tuple[list, list] | None = None
             raise SystemExit(f"{rb['bot']}: different seed or deal count, not pairable")
         dw = [y - x for x, y in zip(ra["per_hand_wins"], rb["per_hand_wins"])]
         dp = [y - x for x, y in zip(ra["per_deal_points"], rb["per_deal_points"])]
+        lev = _levels(ra, rb)
         if rb["bot"] in FAIR:
             pooled_w += dw
             pooled_p += dp
+            pooled_l.append(lev)
         mw, hw = mean_ci(dw)
         mp, hp = mean_ci(dp)
         print(f"{rb['bot']:10} {ra['winrate']:6.3f} {rb['winrate']:6.3f} "
-              f"{mw:+8.3f}±{hw:.3f} {mp:+9.2f}±{hp:.2f}")
+              f"{mw:+8.3f}±{hw:.3f} {_fmt_levels(*lev)} {mp:+9.2f}±{hp:.2f}")
     if pooled_w:
         mw, hw = mean_ci(pooled_w)
         mp, hp = mean_ci(pooled_p)
-        print(f"{'v18-v34':10} {'':6} {'':6} {mw:+8.3f}±{hw:.3f} {mp:+9.2f}±{hp:.2f}")
+        print(f"{'v18-v34':10} {'':6} {'':6} {mw:+8.3f}±{hw:.3f} "
+              f"{_fmt_levels(*_pool_levels(pooled_l))} {mp:+9.2f}±{hp:.2f}")
     if pooled is not None:
         pooled[0].extend(pooled_w)
         pooled[1].extend(pooled_p)
+        pooled[2].extend(pooled_l)
+
+
+def _levels(ra: dict, rb: dict) -> tuple[float, float, bool]:
+    """B - A levels per deal with its variance: paired by deal when both
+    records keep ``per_deal_levels`` (from 2026-11-19), else from the two
+    standard errors as if independent, which overstates the error."""
+    if "per_deal_levels" in ra and "per_deal_levels" in rb:
+        d = [y - x for x, y in zip(ra["per_deal_levels"], rb["per_deal_levels"])]
+        m = sum(d) / len(d)
+        return m, sum((x - m) ** 2 for x in d) / (len(d) - 1) / len(d), True
+    return (rb["levels"] - ra["levels"],
+            ra["levels_stderr"] ** 2 + rb["levels_stderr"] ** 2, False)
+
+
+def _pool_levels(rows: list[tuple[float, float, bool]]) -> tuple[float, float, bool]:
+    """Equal-weight mean over bots (each has the same number of deals)."""
+    n = len(rows)
+    return (sum(d for d, _v, _p in rows) / n, sum(v for _d, v, _p in rows) / n**2,
+            all(p for _d, _v, p in rows))
+
+
+def _fmt_levels(d: float, var: float, paired_: bool) -> str:
+    return f"{d:+8.3f}±{Z * math.sqrt(var):.3f}{'' if paired_ else 'u':1}"
 
 
 def main() -> None:
@@ -123,7 +154,7 @@ def main() -> None:
         if len(args.files) < 2 or len(args.files) % 2:
             raise SystemExit("--paired takes A/B pairs of files")
         pairs = list(zip(args.files[0::2], args.files[1::2]))
-        everything: tuple[list, list] = ([], [])
+        everything: tuple[list, list, list] = ([], [], [])
         for fa, fb in pairs:
             if len(pairs) > 1:
                 print(f"A = {fa}\nB = {fb}")
@@ -133,7 +164,9 @@ def main() -> None:
         if len(pairs) > 1 and everything[0]:
             mw, hw = mean_ci(everything[0])
             mp, hp = mean_ci(everything[1])
+            dl, vl, pl = _pool_levels(everything[2])
             print(f"pooled over {len(pairs)} pairs, fair bots: B - A win {mw:+.3f}±{hw:.3f}, "
+                  f"levels {dl:+.3f}±{Z * math.sqrt(vl):.3f}{'' if pl else ' (unpaired)'}, "
                   f"points {mp:+.2f}±{hp:.2f} ({len(everything[0])} hands)")
     else:
         table([r for f in args.files for r in load(f)])

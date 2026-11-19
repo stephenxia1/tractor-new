@@ -502,8 +502,12 @@ def test_shard_subsets_merge_to_the_whole_match() -> None:
         net, "lowball", shard_subset=[k], raw=True, **kw), 600) for k in (0, 1)]
     merged = {**parts[0]["halves"], **parts[1]["halves"]}
     again = summarise_hands(merged, parts[0]["searched"] + parts[1]["searched"], per_hand=True)
-    for key in ("winrate", "levels", "points", "per_hand_wins", "per_deal_points", "hands"):
+    for key in ("winrate", "levels", "points", "per_hand_wins", "per_deal_points",
+                "per_deal_levels", "hands"):
         assert again[key] == whole[key], key
+    # The per-deal lists average to the record's own figures.
+    assert abs(sum(whole["per_deal_levels"]) / len(whole["per_deal_levels"]) - whole["levels"]) < 1e-12
+    assert abs(sum(whole["per_deal_points"]) / len(whole["per_deal_points"]) - whole["points"]) < 1e-9
 
 
 def test_sim_candidates_are_the_rollouts_list() -> None:

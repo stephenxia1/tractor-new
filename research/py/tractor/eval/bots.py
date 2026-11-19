@@ -840,9 +840,10 @@ def summarise_hands(merged: dict, searched: float, per_hand: bool = False) -> di
     if per_hand:
         # In deal order, half 0 then half 1, so two measurements taken
         # at the same seed line up hand for hand and can be differenced.
-        _levels, points, wins, _taken, _attacked = _paired(merged)
+        levels, points, wins, _taken, _attacked = _paired(merged)
         stats["per_hand_wins"] = wins.tolist()
         stats["per_deal_points"] = points.tolist()
+        stats["per_deal_levels"] = levels.tolist()
     return stats
 
 
