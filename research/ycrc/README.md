@@ -177,6 +177,19 @@ use seed 20260923 by default), and report win rate, levels and points
 together. Copy records into `research/evals/<date>/` and commit them to
 `rl-research`.
 
+Round 2's report once `round2.sh`'s records are in (`zero2-dst3` against
+`zero2-d2c`, each milestone and then pooled, as round 1 was reported;
+then step 6000 with search over both seeds):
+
+```bash
+E=$TRACTOR_ROOT/evals
+python research/scripts/tab_evals.py --paired \
+  $(for s in 5250 5500 5750 6000; do echo $E/zero2-d2c-$s-policy.jsonl $E/zero2-dst3-$s-policy.jsonl; done)
+python research/scripts/tab_evals.py --paired \
+  $E/zero2-d2c-6000-policy-search8-c99.jsonl $E/zero2-dst3-6000-policy-search8-c99.jsonl \
+  $E/zero2-d2c-6000-policy-search8-c99-seed2.jsonl $E/zero2-dst3-6000-policy-search8-c99-seed2.jsonl
+```
+
 ## 5b. Labels on CPUs, and continuous expert iteration
 
 Search runs on CPUs now (`eval/fastnet.py`; methodology in
