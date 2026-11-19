@@ -76,6 +76,9 @@ from ..nn.model import (
     ObsBatch,
     history_bucket,
     static_shapes,
+    pick_actions,
+    pick_entropy,
+    play_log_prob,
 )
 from .gae import num_rows
 from .graphs import StepGraphs
@@ -450,8 +453,22 @@ def _minibatches(
     return [out[i] for i in perm]
 
 
+def _check_picks(obs: ObsBatch) -> None:
+    """Card mode's ``check_actions``: every step's recovered action legal."""
+    actions = pick_actions(obs.candidates, obs.candidate_mask)
+    legal = obs.candidate_mask.gather(2, actions.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    if not bool(legal[actions >= 0].all()):
+        raise ValueError(
+            "a stored pick sequence takes an illegal action; the rollout and the "
+            "learner disagree about the pick masks"
+        )
+
+
 def _check_legal(obs: ObsBatch, batch: dict[str, Tensor]) -> None:
     """``PPOConfig.check_actions``, run eagerly beside a compiled loss."""
+    if obs.candidate_mask.dim() == 3:
+        _check_picks(obs)
+        return
     action = batch["action"].to(obs.candidate_mask.device, torch.int64).reshape(-1, 1)
     legal = obs.candidate_mask.gather(1, action)
     if not bool(legal.all()):
@@ -599,7 +616,15 @@ class PPOLearner:
 
         # ``check`` is False where the caller has checked every row already
         # (``_update_on_device``): the check reads back to the host.
-        if check and cfg.check_actions and not torch.compiler.is_compiling():
+        cards = obs.candidate_mask.dim() == 3
+        if cards:
+            # Card-by-card play (E7): the action at each step is recovered
+            # from the stored prefixes; a play's log-probability is the sum
+            # of its steps'.
+            actions = pick_actions(obs.candidates, obs.candidate_mask)
+        if check and cfg.check_actions and not torch.compiler.is_compiling() and cards:
+            _check_picks(obs)
+        elif check and cfg.check_actions and not torch.compiler.is_compiling():
             legal = obs.candidate_mask.gather(1, action)
             if not bool(legal.all()):
                 bad = int((~legal).sum())
@@ -621,7 +646,10 @@ class PPOLearner:
         # trained apart (``train.critic_learner``): no value term here.
         value = None if value is None else value.float()
 
-        new_logp = log_probs.gather(1, action).squeeze(1)
+        if cards:
+            new_logp = play_log_prob(log_probs, actions)
+        else:
+            new_logp = log_probs.gather(1, action).squeeze(1)
         log_ratio = new_logp - old_logp
         # Bounded before the exp; see ``_MAX_LOG_RATIO`` for why the
         # bound cannot touch a legitimate row. The count is reported so
@@ -646,7 +674,10 @@ class PPOLearner:
         value_loss = (
             returns.new_zeros(()) if value is None else F.mse_loss(value, returns)
         )
-        entropy = masked_entropy(log_probs, obs.candidate_mask).mean()
+        entropy = (
+            pick_entropy(log_probs, obs.candidate_mask) if cards
+            else masked_entropy(log_probs, obs.candidate_mask)
+        ).mean()
 
         target, weight = belief_target(obs, privileged.float())
         belief_loss = belief_cross_entropy(out.belief_log_probs.float(), target, weight)
@@ -929,7 +960,17 @@ class PPOLearner:
         size = max(1, int(cfg.minibatch))
         m = int(selected.size)
         lengths = np.asarray(buffer.history_len)
-        if cfg.check_actions:
+        if cfg.check_actions and rows.t["candidate_mask"].dim() == 3:
+            sel = torch.from_numpy(selected).to(dev)
+            prefix, mask = rows.t["candidates"][sel], rows.t["candidate_mask"][sel]
+            actions = pick_actions(prefix, mask)
+            legal = mask.gather(2, actions.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+            if not bool(legal[actions >= 0].all()):
+                raise ValueError(
+                    "a stored pick sequence takes an illegal action; the rollout "
+                    "and the learner disagree about the pick masks"
+                )
+        elif cfg.check_actions:
             sel = torch.from_numpy(selected).to(dev)
             legal = rows.t["candidate_mask"][sel, rows.t["action"][sel]]
             if not bool(legal.all()):

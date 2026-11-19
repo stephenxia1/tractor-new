@@ -52,7 +52,14 @@ from ..nn.features import (
     MAX_HISTORY,
     NUM_PLANES,
 )
-from ..nn.model import NUM_PRIVILEGED_ROWS, ModelConfig, ObsBatch
+from ..nn.model import (
+    MAX_PICKS,
+    NUM_PICK_ACTIONS,
+    NUM_PRIVILEGED_ROWS,
+    PICK_SUBMIT,
+    ModelConfig,
+    ObsBatch,
+)
 from ..rules.cards import NUM_TYPES
 
 __all__ = [
@@ -138,6 +145,21 @@ _check_layout()
 # The two ObsBatch fields that are not float32: everything else is
 # promoted after the move to the device.
 _OBS_NON_FLOAT = frozenset({"history_len", "candidate_mask"})
+
+
+def _check_play_steps(steps: int, mask: np.ndarray) -> None:
+    """Card mode's row check: ``steps`` (the stored ``action``) is the
+    number of pick steps, 1..MAX_PICKS; every step before it has a legal
+    action, the last allows SUBMIT, and none after it allows anything."""
+    if not 1 <= steps <= MAX_PICKS:
+        raise ValueError(f"a play of {steps} steps is outside 1..{MAX_PICKS}")
+    legal_any = mask.any(axis=-1)
+    if not legal_any[:steps].all():
+        raise ValueError(f"a play of {steps} steps has a step with no legal action")
+    if legal_any[steps:].any():
+        raise ValueError(f"a play of {steps} steps has legal actions after its end")
+    if not bool(mask[steps - 1, PICK_SUBMIT]):
+        raise ValueError(f"a play of {steps} steps does not end on a legal SUBMIT")
 
 
 def obs_batch_from_arrays(
@@ -377,8 +399,15 @@ class RolloutBuffer:
         self.unseen = alloc((c, NUM_TYPES), dtype=np.float16)
         self.planes = alloc((c, NUM_PLANES, NUM_TYPES), dtype=np.float16)
         self.cards = alloc((c, NUM_TYPES, D_CARD), dtype=np.float16)
-        self.candidates = alloc((c, k, NUM_TYPES), dtype=np.float16)
-        self.candidate_mask = alloc((c, k), dtype=bool)
+        if cfg.cards_mode:
+            # Card-by-card play (E7): the cards picked before each step
+            # and each step's legal actions; ``action`` holds the number
+            # of steps, SUBMIT included (see ``ModelConfig.action_space``).
+            self.candidates = alloc((c, MAX_PICKS, NUM_TYPES), dtype=np.float16)
+            self.candidate_mask = alloc((c, MAX_PICKS, NUM_PICK_ACTIONS), dtype=bool)
+        else:
+            self.candidates = alloc((c, k, NUM_TYPES), dtype=np.float16)
+            self.candidate_mask = alloc((c, k), dtype=bool)
         self.privileged = alloc(
             (c, NUM_PRIVILEGED_ROWS, NUM_TYPES), dtype=np.float16
         )
@@ -450,6 +479,7 @@ class RolloutBuffer:
         reward_points: float = 0.0,
         reward_level: float = 0.0,
         done: bool = False,
+        pending_play: bool = False,
     ) -> int:
         """Append one decision and return the row index it landed in.
 
@@ -466,6 +496,11 @@ class RolloutBuffer:
         index a legal candidate slot, and a non-finite float in any of
         the reduced fields. Both are cheap to catch here and impossible
         to attribute to a row once the buffer has been reduced over.
+
+        ``pending_play`` (card mode only): the play is still being picked
+        and its steps, masks and ``action`` are written into the row
+        afterwards -- the rollout pool's workers add a row before the
+        parent has chosen. The learner's own check then covers it.
         """
         if self._n >= self.capacity:
             raise RuntimeError(
@@ -495,14 +530,20 @@ class RolloutBuffer:
                 f"history_len {length} outside 0..{self.history.shape[1]}"
             )
         slot = int(action)
-        if not 0 <= slot < self.candidates.shape[1]:
-            raise ValueError(
-                f"action {slot} outside 0..{self.candidates.shape[1] - 1}"
-            )
-        if not bool(np.asarray(candidate_mask)[slot]):
-            # An illegal action in the buffer is a poisoned gradient that
-            # looks like ordinary data, so it is refused at the door.
-            raise ValueError(f"action {slot} is not a legal candidate slot")
+        if pending_play and not self.cfg.cards_mode:
+            raise ValueError("pending_play is for card mode only")
+        if self.cfg.cards_mode:
+            if not pending_play:
+                _check_play_steps(slot, np.asarray(candidate_mask))
+        else:
+            if not 0 <= slot < self.candidates.shape[1]:
+                raise ValueError(
+                    f"action {slot} outside 0..{self.candidates.shape[1] - 1}"
+                )
+            if not bool(np.asarray(candidate_mask)[slot]):
+                # An illegal action in the buffer is a poisoned gradient that
+                # looks like ordinary data, so it is refused at the door.
+                raise ValueError(f"action {slot} is not a legal candidate slot")
         for name, number in zip(
             _ADDED_SCALARS, (logp, value, reward, reward_points, reward_level)
         ):
@@ -721,22 +762,29 @@ class RolloutBuffer:
             return
 
         action = self.action[:n]
-        low, high = int(action.min()), int(action.max())
-        slots = self.candidate_mask.shape[1]
-        if low < 0 or high >= slots:
-            row = int(np.argmax((action < 0) | (action >= slots)))
-            raise ValueError(
-                f"{source}: row {row} stores action {int(action[row])}, "
-                f"outside 0..{slots - 1}"
-            )
-        legal = self.candidate_mask[np.arange(n), action]
-        if not legal.all():
-            row = int(np.argmax(~legal))
-            raise ValueError(
-                f"{source}: row {row} stores action {int(action[row])}, "
-                f"which is not a legal candidate slot "
-                f"({int(self.candidate_mask[row].sum())} slots are legal)"
-            )
+        if self.cfg.cards_mode:
+            for row in range(n):
+                try:
+                    _check_play_steps(int(action[row]), self.candidate_mask[row])
+                except ValueError as exc:
+                    raise ValueError(f"{source}: row {row}: {exc}") from None
+        else:
+            low, high = int(action.min()), int(action.max())
+            slots = self.candidate_mask.shape[1]
+            if low < 0 or high >= slots:
+                row = int(np.argmax((action < 0) | (action >= slots)))
+                raise ValueError(
+                    f"{source}: row {row} stores action {int(action[row])}, "
+                    f"outside 0..{slots - 1}"
+                )
+            legal = self.candidate_mask[np.arange(n), action]
+            if not legal.all():
+                row = int(np.argmax(~legal))
+                raise ValueError(
+                    f"{source}: row {row} stores action {int(action[row])}, "
+                    f"which is not a legal candidate slot "
+                    f"({int(self.candidate_mask[row].sum())} slots are legal)"
+                )
 
         for name in self.fields:
             stored = getattr(self, name)

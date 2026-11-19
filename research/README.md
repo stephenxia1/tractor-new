@@ -1421,6 +1421,33 @@ A second round is running: fresh labels from `zero2-dst2` step 5000
 plain-PPO control from the same checkpoint (`zero2-d2c`). Records:
 `evals/2026-11-16/`.
 
+### Card-by-card play, E7 (built 2026-11-19, not yet trained)
+
+The user's design, in `E7.md`: every play chosen card by card in
+ascending type order, then SUBMIT, so the network is no longer limited
+to a capped list of 128 moves or the simulator's one hard-coded follow
+past 1,024 fills. One play is one PPO action (the sum of its picks'
+log-probabilities). It ships with the Large SwiGLU networks (`--arch
+v7`: actor 38.1M, critic 14.8M, declaration 12.7M, burial 11.0M) and is
+to be trained from scratch (`--action-space cards`).
+
+- `sim/picks.py` decides which next pick is legal. It agrees exactly
+  with brute force over `rules/follow.py::is_legal_follow` on 4,338
+  simulated follow positions and 2,338 synthetic heavy ones, with no
+  dead ends (`tests/test_picks.py`).
+- The serial collector, the worker pool (with and without overlap), the
+  learner and both evaluators run in card mode. At the rollout's
+  weights the learner recovers each play's stored log-probability to
+  1e-6 (`tests/test_cards_mode.py`).
+- A CPU smoke run of v7 card mode for 2 steps, through `tractor.cluster
+  train` with declaration and burial phases, peaks at 6 GB. Its
+  checkpoint evaluates through `tractor.cluster eval`.
+- Card mode does not yet support compiled or graph-captured forwards,
+  distillation, search, or the app's TypeScript port. The loop refuses
+  the first three at launch.
+
+The launch command for Bouchet is in `ycrc/README.md` §6.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

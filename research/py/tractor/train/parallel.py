@@ -59,7 +59,7 @@ import torch
 
 from ..gen.episode import deal_sizes, generate
 from ..nn.features import POINTS_PER_DECK, Cache
-from ..nn.model import ModelConfig
+from ..nn.model import MAX_PICKS, PICK_SUBMIT, ModelConfig
 from .buffer import RolloutBuffer, obs_batch_from_arrays
 from ..nn.model import relative_seat_agents
 from .rollout import (
@@ -74,6 +74,7 @@ from .rollout import (
     check_agents,
     routed_step,
 )
+from .pick_rollout import _picker, actor_encode, score_step
 from .shared import SharedBuffer, copy_ranges, partition
 from .starts import pack_start, start_state
 
@@ -109,7 +110,7 @@ def _command(rep_q: Any, poll_s: float) -> tuple:
 
 _STAT_KEYS = (
     "hands", "decisions", "candidate_total", "forced", "truncated",
-    "unenumerated",
+    "unenumerated", "forced_steps",
 )
 
 
@@ -167,6 +168,34 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                     in_flight.append(hand)
                     started += 1
 
+            def advance(cur: list, r: int, rules: Any) -> None:
+                # Card mode: record each step's mask and prefix, taking
+                # forced steps here, until a step offers a choice (whose
+                # index the parent reads from ``action``) or the play
+                # submits (``action`` -1).
+                picked, k = cur[0], cur[2]
+                while True:
+                    if k >= MAX_PICKS:
+                        raise RuntimeError("a play did not submit within MAX_PICKS steps")
+                    m = rules.mask(picked, cur[1])
+                    window.candidate_mask[r, k] = m
+                    window.candidates[r, k] = picked
+                    legal = int(m.sum())
+                    if legal == 0:
+                        raise RuntimeError(f"no legal pick at step {k}")
+                    if legal != 1:
+                        break
+                    a = int(np.argmax(m))
+                    k += 1
+                    stats["forced_steps"] += 1
+                    if a == PICK_SUBMIT:
+                        cur[3] = True
+                        break
+                    picked[a] += 1
+                    cur[1] = a
+                cur[2] = k
+                window.action[r] = -1 if cur[3] else k
+
             def send(h: int) -> tuple[list, int]:
                 packed = [_pack(hand, cache, cfg) for hand in pools[h]]
                 first_local = len(window)
@@ -188,6 +217,7 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                         value=0.0,
                         seat=decision.seat,
                         episode=hand.episode,
+                        pending_play=cfg.cards_mode,
                     )
                     hand.trick_rows.append(row)
                     hand.last_row[decision.seat] = row
@@ -195,8 +225,37 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                 # contiguous run and the parent needs two numbers. An
                 # empty half still reports, so the parent's lockstep per
                 # half stays whole.
+                if cfg.cards_mode:
+                    # [picked, last, step, submitted] per decision.
+                    cursors[h] = [
+                        [np.zeros(54, dtype=np.int8), -1, 0, False] for _ in packed
+                    ]
+                    for i, decision in enumerate(packed):
+                        advance(cursors[h][i], first_local + i, decision.rules)
                 req_q.put(("batch", wid, h, start + first_local, len(packed)))
                 return packed, first_local
+
+            def pick(h: int, actions: np.ndarray) -> None:
+                # The parent's picks for this half's live plays, one per
+                # row of the batch (-1 for rows already submitted).
+                packed, first_local = pending[h]
+                for i, decision in enumerate(packed):
+                    cur = cursors[h][i]
+                    if cur[3]:
+                        continue
+                    a = int(actions[i])
+                    r = first_local + i
+                    if a < 0 or not window.candidate_mask[r, cur[2], a]:
+                        raise RuntimeError(f"illegal pick {a} at step {cur[2]}")
+                    cur[2] += 1
+                    if a == PICK_SUBMIT:
+                        cur[3] = True
+                        window.action[r] = -1
+                        continue
+                    cur[0][a] += 1
+                    cur[1] = a
+                    advance(cur, r, decision.rules)
+                req_q.put(("picked", wid, h))
 
             def step(h: int, packed: list, first_local: int) -> None:
                 finished: list[int] = []
@@ -210,7 +269,10 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                     stats["truncated"] += int(moves.truncated)
                     stats["unenumerated"] += int(moves.unenumerated)
 
-                    cards = decision.candidates[slot].astype(np.int8)
+                    if cfg.cards_mode:
+                        cards = cursors[h][i][0].copy()
+                    else:
+                        cards = decision.candidates[slot].astype(np.int8)
                     before = len(hand.state.tricks)
                     hand.state.step(cards)
                     if len(hand.state.tricks) > before:
@@ -226,12 +288,18 @@ def _worker(wid: int, spec: Any, start: int, stop: int, req_q: Any,
                 req_q.put(("done", wid, len(window), stats))
                 continue
             pending = []
+            cursors: list = [None] * halves
             for h in range(halves):
                 refill(h)
-                pending.append(send(h))
+                pending.append(None)
+                pending[h] = send(h)
             h = 0
             while True:
-                if _command(rep_q, poll_s)[0] != "go":
+                cmd = _command(rep_q, poll_s)
+                while cmd[0] == "pick":
+                    pick(cmd[1], cmd[2])
+                    cmd = _command(rep_q, poll_s)
+                if cmd[0] != "go":
                     return  # the parent is shutting the round down
                 step(h, *pending[h])
                 refill(h)
@@ -378,6 +446,9 @@ class RolloutPool:
         seating = check_agents(agents, n_hands, nets)
         if critic is not None and seating is None:
             raise ValueError("a shared critic needs the seating to know who is who")
+        cards_mode = self.cfg.cards_mode
+        if cards_mode and critic is not None:
+            raise ValueError("card-mode rollout with a shared critic is not supported yet")
         workers = self.workers
         pool_total = int(pool) if pool else 128
         per_worker_pool = max(1, pool_total // workers)
@@ -395,6 +466,8 @@ class RolloutPool:
         totals = dict.fromkeys(_STAT_KEYS, 0)
         n_forwards = 0
         batch_total = 0
+        pick_rounds = 0
+        scored_steps = 0
         buf = self._shared.buffer
 
         try:
@@ -429,24 +502,29 @@ class RolloutPool:
                 dtype=torch.bfloat16,
                 enabled=amp,
             ):
+                def absorb(msg: tuple) -> None:
+                    # A worker's report: a finished round or a batch.
+                    if msg[0] == "done":
+                        _tag, wid, n_rows, stats = msg
+                        ends[wid] = n_rows
+                        live.discard(wid)
+                        for key in totals:
+                            totals[key] += int(stats[key])
+                        for w_half in waiting:
+                            w_half.pop(wid, None)
+                    elif msg[0] == "batch":
+                        _tag, wid, h, first, count = msg
+                        waiting[h][wid] = (first, count)
+                    else:
+                        raise RuntimeError(f"unexpected worker message {msg[0]!r}")
+
                 while live:
                     # Every live worker reports each half before it moves
                     # on, so waiting for all of them is safe and makes
                     # the batch as wide as that half. It is lockstep per
                     # half.
                     while len(waiting[half]) < len(live):
-                        msg = self._receive()
-                        if msg[0] == "done":
-                            _tag, wid, rows, stats = msg
-                            ends[wid] = rows
-                            live.discard(wid)
-                            for key in totals:
-                                totals[key] += int(stats[key])
-                            for w_half in waiting:
-                                w_half.pop(wid, None)
-                        else:
-                            _tag, wid, h, first, count = msg
-                            waiting[h][wid] = (first, count)
+                        absorb(self._receive())
                     if not live:
                         break
                     pending = waiting[half]
@@ -491,15 +569,29 @@ class RolloutPool:
                         owner = np.zeros(len(rows), dtype=np.int64)
                     else:
                         owner = seating[hand_idx, seats]
-                    slots, chosen_logp, values = routed_step(
-                        nets, owner, gather, temperature, greedy, rng, spans,
-                        lengths=buf.history_len[rows], chunks=chunks,
-                        critic=critic, forwards=forwards,
-                        seat_agents=(
-                            None if critic is None
-                            else relative_seat_agents(seating[hand_idx], seats)
-                        ),
-                    )
+                    if cards_mode:
+                        order = sorted(pending)
+                        spans_of = {}
+                        offset = 0
+                        for w in order:
+                            spans_of[w] = (offset, pending[w][1])
+                            offset += pending[w][1]
+                        slots, chosen_logp, values, n_rounds, n_scored = self._pick_round(
+                            nets, owner, gather, rows, spans_of, half, absorb,
+                            temperature, greedy, rng, spans,
+                        )
+                        pick_rounds += n_rounds
+                        scored_steps += n_scored
+                    else:
+                        slots, chosen_logp, values = routed_step(
+                            nets, owner, gather, temperature, greedy, rng, spans,
+                            lengths=buf.history_len[rows], chunks=chunks,
+                            critic=critic, forwards=forwards,
+                            seat_agents=(
+                                None if critic is None
+                                else relative_seat_agents(seating[hand_idx], seats)
+                            ),
+                        )
                     with _span(spans, "writeback"):
                         buf.action[rows] = slots
                         buf.logp[rows] = chosen_logp
@@ -549,10 +641,87 @@ class RolloutPool:
             "unenumerated": totals["unenumerated"],
             "forwards": n_forwards,
             "mean_batch": batch_total / max(n_forwards, 1),
+            **({
+                "forced_steps": float(totals["forced_steps"]),
+                "scored_steps": float(scored_steps),
+                "pick_rounds": float(pick_rounds),
+            } if cards_mode else {}),
             "seconds": elapsed,
             "workers": float(workers),
             "rows": float(rows_written),
         }
+
+    # --- card-by-card plays (E7) -------------------------------------------
+
+    def _pick_round(self, nets, owner, gather, rows, spans_of, half, absorb,
+                    temperature, greedy, rng, spans):
+        """Every row's play, one pick at a time, with the workers holding
+        the rules. -> ``(steps, logp, value, sub-rounds, scored steps)``.
+
+        Each worker has written, for each of its rows, the mask and
+        prefix of the first step that offers a choice and that step's
+        index in ``action`` (-1 once the play has submitted). The encoders
+        run once; each sub-round scores the live rows' current steps,
+        sends each worker its picks, and waits for every worker it sent
+        to, which applies them, takes the forced steps that follow and
+        reports the next step to choose. Other reports that arrive
+        meanwhile (the other half's batches) are kept for later.
+        """
+        buf = self._shared.buffer
+        n = len(rows)
+        logp = np.zeros(n, dtype=np.float32)
+        value = np.zeros(n, dtype=np.float32)
+        groups = []
+        with _span(spans, "forward"):
+            for agent in np.unique(owner):
+                idx = np.nonzero(owner == agent)[0]
+                net = nets[int(agent)]
+                obs, privileged = gather(idx)
+                summary, card_states, v = actor_encode(net, obs, privileged)
+                value[idx] = v.detach().float().cpu().numpy()
+                groups.append((idx, summary, card_states, _picker(net)))
+        rounds = 0
+        scored = 0
+        with _span(spans, "sample"):
+            while True:
+                step = buf.action[rows]
+                live = step >= 0
+                if not live.any():
+                    break
+                actions = np.full(n, -1, dtype=np.int64)
+                for idx, summary, card_states, picker in groups:
+                    pos = np.nonzero(live[idx])[0]
+                    if len(pos) == 0:
+                        continue
+                    j = idx[pos]
+                    r = rows[j]
+                    k = step[j]
+                    sel = torch.from_numpy(pos).to(summary.device)
+                    a, lp = score_step(
+                        picker, summary[sel], card_states[sel],
+                        buf.candidates[r, k], buf.candidate_mask[r, k], k,
+                        temperature, greedy, rng,
+                    )
+                    actions[j] = a
+                    logp[j] += lp
+                    scored += len(j)
+                asked = []
+                for w, (off, count) in spans_of.items():
+                    if live[off : off + count].any():
+                        self._rep_qs[w].put(("pick", half, actions[off : off + count].copy()))
+                        asked.append(w)
+                answered = set()
+                while len(answered) < len(asked):
+                    msg = self._receive()
+                    if msg[0] == "picked":
+                        if msg[2] != half:
+                            raise RuntimeError("a worker answered picks for the wrong half")
+                        answered.add(msg[1])
+                    else:
+                        absorb(msg)
+                rounds += 1
+        steps = buf.candidate_mask[rows].any(axis=-1).sum(axis=-1).astype(np.int64)
+        return steps, logp, value, rounds, scored
 
     # --- teardown ---------------------------------------------------------
 

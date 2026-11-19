@@ -44,6 +44,7 @@ from ..nn.features import Cache
 from ..nn.model import ModelConfig
 from ..sim.state import PlayState
 from .buffer import obs_batch_from_arrays
+from .pick_rollout import greedy_play
 from .rollout import _choose, _evaluate, _InFlight, _pack
 
 
@@ -76,6 +77,8 @@ def net_policy(
                     f"asked seat {seat} to act, but {int(state.to_act)} is to act"
                 )
             packed = _pack(_InFlight(state=state, episode=0), cache, cfg)
+            if cfg.cards_mode:
+                return greedy_play(net, packed, device)
             obs = obs_batch_from_arrays(
                 packed.history[None],
                 np.array([packed.history_len], dtype=np.int64),

@@ -55,6 +55,30 @@ ARCHES: dict[str, dict[str, dict[str, Any]]] = {
         "declare_model": {"width": 512, "depth": 3, "residual": True, "ffn": "swiglu"},
         "bury_model": {"d": 256, "layers": 4, "heads": 4, "value_width": 512, "ffn": "swiglu"},
     },
+    # The "Large" set the user chose on 2026-11-19 for E7's cold start
+    # (research/E7.md), with SwiGLU: the play network 512 wide with a
+    # 6-layer history encoder, the card critic 384 x 6, the declaration
+    # network a residual 4 x 1024, the burial network 384 x 6. The action
+    # space is chosen apart (``--action-space cards``).
+    "v7": {
+        "model": {
+            "d_model": 512,
+            "n_heads": 8,
+            "n_layers_history": 6,
+            "n_layers_query": 3,
+            "d_ff": 1536,
+            "ffn": "swiglu",
+            "head_d": 256,
+            "belief_d": 256,
+            "critic_kind": "cards",
+            "critic_d": 384,
+            "critic_layers": 6,
+            "critic_heads": 6,
+            "critic_d_ff": 1536,
+        },
+        "declare_model": {"width": 1024, "depth": 4, "residual": True, "ffn": "swiglu"},
+        "bury_model": {"d": 384, "layers": 6, "heads": 6, "value_width": 768, "ffn": "swiglu"},
+    },
 }
 
 

@@ -122,6 +122,42 @@ use seed 20260923 by default), and report win rate, levels and points
 together. Copy records into `research/evals/<date>/` and commit them to
 `rl-research`.
 
+## 6. E7: card by card, cold start
+
+`research/E7.md`: every play chosen card by card, the Large SwiGLU
+networks (`--arch v7`), from random initialisation. `zero2`'s
+cold-start recipe (1024 hands a step, warm-up 300 steps, blocks of 100
+pre-play and 200 play steps, leave-one-out over 4 burials with
+played-out returns), with play-outs from the start and without the
+compiled or graph-captured forwards, which card mode does not do yet.
+
+Smoke first (2 steps, a few minutes on a GPU):
+
+```bash
+python -m tractor.cluster train --root $TRACTOR_ROOT --name e7-smoke --overwrite \
+  --arch v7 --action-space cards --steps 2 --hands 32 --rollout-workers 4 \
+  --eval-every 0 --checkpoint-every 1 --warmup-steps 1 --play-phase-steps 1 \
+  --declare-phase-steps 1 --declare-hands 32 --bury-policy --bury-reward playout \
+  --bury-landlords 8 --bury-samples 4 --no-bury-scale-minibatch --fixed-shapes
+```
+
+The run:
+
+```bash
+sbatch -p <gpu partition> --gpus=1 research/ycrc/train.sbatch \
+  --name e7-v7 --steps 4000 --arch v7 --action-space cards --hands 1024 \
+  --lr 1e-4 --checkpoint-every 50 --keep-last 12 --rollout-workers 16 --eval-every 0 \
+  --fixed-shapes --bury-policy --random-burial-frac 0.2 --bury-samples 4 \
+  --no-bury-scale-minibatch --bury-reward playout --bury-landlords 512 \
+  --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 --declare-hands 1024
+```
+
+`--lr 1e-4` departs from `zero2`'s 3e-4: the larger v6 networks
+collapsed on `zero2`'s recipe (methodology doc §7, Exp 3) and 1e-4 is
+what held `zero2`'s peak. Drop the flag for `zero2`'s exact settings.
+Milestones are measured with `eval.sbatch` as in §5; card mode is picked
+up from the checkpoint.
+
 ## Rules that hold here as on Modal
 
 - **Zero.** Nothing may train on heuristic knowledge: labels come from the

@@ -135,7 +135,8 @@ def _play(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
     stats["bot"] = bot
     stats["pre_play"] = pre_play
     stats["search"] = search
-    stats["candidates"] = candidates
+    # What the network was actually shown: card mode has no list.
+    stats["candidates"] = "cards" if cfg.cards_mode else candidates
     stats["declare_net"] = declare_net is not None
     stats["seed"] = seed
     os.makedirs(RESULTS, exist_ok=True)

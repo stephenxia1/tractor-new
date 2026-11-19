@@ -113,6 +113,14 @@ NUM_PRIVILEGED_ROWS = NUM_REL_SEATS + 1
 
 # Scalars derived per candidate; see ``CandidateScorer.forward``.
 NUM_CAND_SCALARS = 6
+
+# Card-by-card play (E7, ``ModelConfig.action_space = "cards"``): a play
+# is an ascending sequence of card-type picks ended by SUBMIT, at most 25
+# cards and the SUBMIT. ``sim/picks.py`` owns the legality; these are the
+# extents the model and the buffer share.
+PICK_SUBMIT = NUM_TYPES  # 54
+NUM_PICK_ACTIONS = NUM_TYPES + 1  # 55
+MAX_PICKS = 26
 # Scalars pulled out of each card's static block: point value, is-trump,
 # strength.
 NUM_CARD_SCALARS = 3
@@ -182,6 +190,13 @@ class ModelConfig:
     # and this deep, trained with it (``CardCritic``). 0 reads it raw.
     critic_history_d: int = 0
     critic_history_layers: int = 0
+    # ``action_space``: "candidates" scores an enumerated list of whole
+    # moves (every run through v6); "cards" picks a play one card at a
+    # time, then SUBMIT (E7, research/E7.md). In "cards" an ObsBatch's
+    # ``candidates`` holds the cards picked before each step,
+    # [B, MAX_PICKS, 54], and ``candidate_mask`` each step's legal
+    # actions, bool[B, MAX_PICKS, 55], all False past the last step.
+    action_space: str = "candidates"
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads:
@@ -204,6 +219,14 @@ class ModelConfig:
             # The flat critic's privileged MLP adds the context into its
             # first layer by index; it is the legacy design and stays GELU.
             raise ValueError("the flat critic is GELU only; SwiGLU runs use critic_kind='cards'")
+        if self.action_space not in ("candidates", "cards"):
+            raise ValueError(
+                f"action_space must be 'candidates' or 'cards', not {self.action_space!r}"
+            )
+
+    @property
+    def cards_mode(self) -> bool:
+        return self.action_space == "cards"
 
     @property
     def head_dim(self) -> int:
@@ -905,9 +928,12 @@ class QueryEncoder(nn.Module):
         return tokens * mask.unsqueeze(-1).to(tokens.dtype), mask
 
     def forward(
-        self, obs: ObsBatch, history_enc: Tensor, history_keep: Tensor
-    ) -> Tensor:
-        """-> [B, d_model], the state summary h."""
+        self, obs: ObsBatch, history_enc: Tensor, history_keep: Tensor,
+        with_cards: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """-> [B, d_model], the state summary h; with ``with_cards``,
+        also the final card-type token states [B, 54, d_model] (zero where
+        the card is not held), which the card-by-card head points at."""
         tokens, token_mask = self.build_tokens(obs)
         gate = token_mask.unsqueeze(-1).to(tokens.dtype)
 
@@ -929,7 +955,11 @@ class QueryEncoder(nn.Module):
         x = tokens
         for block in self.blocks:
             x = block(x, token_attn, mem, mem_attn) * gate
-        return self.out_norm(x[:, QUERY_CONTEXT])
+        if not with_cards:
+            return self.out_norm(x[:, QUERY_CONTEXT])
+        out = self.out_norm(x)
+        held = token_mask[:, QUERY_HAND:].unsqueeze(-1).to(out.dtype)
+        return out[:, QUERY_CONTEXT], out[:, QUERY_HAND:] * held
 
 
 # --- 3. candidate scorer --------------------------------------------------
@@ -1053,6 +1083,113 @@ class CandidateScorer(nn.Module):
 # --- 4. auxiliary heads ---------------------------------------------------
 
 
+class PickHead(nn.Module):
+    """Card-by-card play (E7): scores the 54 card types and SUBMIT at each
+    pick step, from the state summary, the card-type token states and the
+    cards picked so far.
+
+    For step ``k`` with prefix counts ``p_k``::
+
+        s_k = h + LN(p_k @ W_p C) + E_step[k]
+        u_k = s_k + FFN(LN(s_k))
+        logit(t) = <W_q u_k, W_k C_t> / sqrt(d) + b(W_k C_t) + c[copies of t picked]
+        logit(SUBMIT) = w_s . u_k + b_s
+
+    The encoders run once per decision; each step runs only this head.
+    In training every step of a play is scored at once from its prefixes
+    (teacher forcing). Masking is the caller's (``pick_log_probs``): this
+    returns raw logits.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        d = cfg.d_model
+        self.key = nn.Linear(d, d)
+        self.pool = nn.Linear(d, d, bias=False)
+        self.pool_norm = nn.LayerNorm(d)
+        self.step_embed = nn.Parameter(torch.zeros(MAX_PICKS, d))
+        self.norm = nn.LayerNorm(d)
+        self.ff = _FeedForward(d, cfg.d_ff, cfg.ffn)
+        self.query = nn.Linear(d, d)
+        self.card_bias = nn.Linear(d, 1)
+        # Copies of the card already in the prefix: 0, 1, 2 or more. A
+        # second copy makes a pair, which the dot product alone would
+        # have to learn to see through the pooled prefix.
+        self.count_bias = nn.Parameter(torch.zeros(3))
+        self.submit = nn.Linear(d, 1)
+        self.apply(_init_module)
+        nn.init.normal_(self.step_embed, std=0.02)
+
+    def forward(
+        self, summary: Tensor, cards: Tensor, prefix: Tensor, start: int | Tensor = 0
+    ) -> Tensor:
+        """``summary`` [B, d], ``cards`` [B, 54, d], ``prefix`` [B, P, 54]
+        (copies picked before each step), steps ``start .. start+P-1``;
+        ``start`` may be an int64[B] of per-row step indices when P is 1
+        (the rollout, where rows sit at different steps).
+        -> logits [B, P, 55], SUBMIT last."""
+        steps = prefix.shape[1]
+        keys = self.key(cards)  # [B, 54, d]
+        pooled = torch.bmm(prefix.to(cards.dtype), self.pool(cards))  # [B, P, d]
+        if isinstance(start, Tensor):
+            if steps != 1:
+                raise ValueError("per-row step indices take one step per row")
+            step = self.step_embed[start].unsqueeze(1)  # [B, 1, d]
+        else:
+            step = self.step_embed[start : start + steps].unsqueeze(0)
+        s = summary.unsqueeze(1) + self.pool_norm(pooled) + step.to(summary.dtype)
+        u = s + self.ff(self.norm(s))
+        q = self.query(u)  # [B, P, d]
+        scale = 1.0 / math.sqrt(self.cfg.d_model)
+        card = torch.bmm(q, keys.transpose(1, 2)) * scale  # [B, P, 54]
+        card = card + self.card_bias(keys).transpose(1, 2)
+        bucket = prefix.round().clamp(0, 2).long()
+        card = card + self.count_bias.to(card.dtype)[bucket]
+        return torch.cat((card, self.submit(u)), dim=-1)
+
+
+def pick_log_probs(logits: Tensor, mask: Tensor) -> Tensor:
+    """Masked log-softmax over the 55 pick actions, float32. A step with
+    no legal action (padding past a play's SUBMIT) comes out uniform and
+    must be excluded by the caller."""
+    masked = torch.where(mask, logits.float(), torch.full_like(logits, MASK_LOGIT, dtype=torch.float32))
+    return F.log_softmax(masked, dim=-1)
+
+
+def pick_actions(prefix: Tensor, mask: Tensor) -> Tensor:
+    """The action taken at each step, recovered from consecutive prefixes:
+    the card added between step k and k+1, or SUBMIT at a play's last step.
+    ``prefix`` [B, P, 54], ``mask`` bool[B, P, 55]. -> int64[B, P], -1 past
+    the last step. Prefix rows past the last step must be zero."""
+    b, p, _ = prefix.shape
+    valid = mask.any(dim=-1)  # [B, P]
+    nxt = torch.cat((prefix[:, 1:], prefix.new_zeros(b, 1, prefix.shape[2])), dim=1)
+    diff = nxt.float() - prefix.float()
+    added = diff.sum(dim=-1) > 0.5  # a card was picked at this step
+    card = diff.argmax(dim=-1)
+    act = torch.where(added, card, torch.full_like(card, PICK_SUBMIT))
+    return torch.where(valid, act, torch.full_like(act, -1))
+
+
+def play_log_prob(log_probs: Tensor, actions: Tensor) -> Tensor:
+    """Sum over a play's steps of the log-probability of the action taken.
+    ``log_probs`` [B, P, 55] from ``pick_log_probs``, ``actions`` [B, P]
+    from ``pick_actions``. -> [B]."""
+    valid = actions >= 0
+    taken = log_probs.gather(2, actions.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    return torch.where(valid, taken, torch.zeros_like(taken)).sum(dim=1)
+
+
+def pick_entropy(log_probs: Tensor, mask: Tensor) -> Tensor:
+    """Sum over a play's steps of each step's entropy over its legal
+    actions. -> [B]. A forced step contributes zero."""
+    zero = torch.zeros((), dtype=log_probs.dtype, device=log_probs.device)
+    probs = torch.where(mask, log_probs.exp(), zero)
+    terms = torch.where(mask, probs * log_probs, zero)
+    return -terms.sum(dim=(1, 2))
+
+
 class AuxHeads(nn.Module):
     """Value, outcome class, and per-card location beliefs off ``h``.
 
@@ -1134,13 +1271,36 @@ class TractorNet(nn.Module):
         self.cfg = cfg or ModelConfig()
         self.history = HistoryEncoder(self.cfg)
         self.query = QueryEncoder(self.cfg)
-        self.scorer = CandidateScorer(self.cfg)
+        if self.cfg.cards_mode:
+            self.picker = PickHead(self.cfg)
+        else:
+            self.scorer = CandidateScorer(self.cfg)
         self.heads = AuxHeads(self.cfg)
+
+    def encode(self, obs: ObsBatch) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Card mode's once-per-decision part. -> ``(summary h,
+        card states C, history_enc, history_keep)``."""
+        history_enc, history_keep = self.history(obs.history, obs.history_len)
+        summary, cards = self.query(obs, history_enc, history_keep, with_cards=True)
+        return summary, cards, history_enc, history_keep
 
     def forward(self, obs: ObsBatch) -> ActorOutput:
         history_enc, history_keep = self.history(obs.history, obs.history_len)
-        summary = self.query(obs, history_enc, history_keep)
-        logits, log_probs = self.scorer(summary, obs)
+        if self.cfg.cards_mode:
+            # Every step of every play at once, from the stored prefixes:
+            # ``logits`` and ``log_probs`` are [B, MAX_PICKS, 55].
+            summary, card_states = self.query(
+                obs, history_enc, history_keep, with_cards=True
+            )
+            logits = self.picker(summary, card_states, obs.candidates)
+            log_probs = pick_log_probs(logits, obs.candidate_mask)
+            logits = torch.where(
+                obs.candidate_mask, logits.float(),
+                torch.full_like(log_probs, MASK_LOGIT),
+            )
+        else:
+            summary = self.query(obs, history_enc, history_keep)
+            logits, log_probs = self.scorer(summary, obs)
         value, outcome_logits, belief_logits, belief_log_probs = self.heads(
             summary, obs.cards
         )
@@ -1491,6 +1651,26 @@ class ActorCritic(nn.Module):
         )
         return out, value
 
+    def encode(
+        self, obs: ObsBatch, privileged: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """Card mode's rollout forward: the encoders and the critic, no
+        pick head. -> ``(summary h, card states C, value)``; ``value`` is
+        ``None`` for an actor whose critic is held elsewhere."""
+        summary, cards, history_enc, _keep = self.actor.encode(obs)
+        if self.critic is None:
+            return summary, cards, None
+        value = self.critic(
+            history_enc,
+            obs.history_len,
+            privileged,
+            detach=True,
+            context=obs.context,
+            cards=obs.cards,
+            trick=obs.planes[:, PLANE_TRICK : PLANE_TRICK + NUM_REL_SEATS],
+        )
+        return summary, cards, value
+
 
 # --- building batches -----------------------------------------------------
 
@@ -1595,6 +1775,40 @@ def batch_privileged(
     return t.to(device) if device is not None else t
 
 
+def _dummy_picks(
+    rng: np.random.Generator, batch: int, hand: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Card-mode ``candidates`` and ``candidate_mask`` for ``dummy_batch``:
+    an ascending pick sequence out of each row's hand, its prefixes, and
+    masks allowing any held type at or above the last pick, and SUBMIT
+    once something is picked."""
+    prefix = np.zeros((batch, MAX_PICKS, NUM_TYPES), dtype=np.float32)
+    mask = np.zeros((batch, MAX_PICKS, NUM_PICK_ACTIONS), dtype=bool)
+    for i in range(batch):
+        held = hand[i].astype(np.int64)
+        if held.sum() == 0:
+            held[int(rng.integers(0, NUM_TYPES))] = 1
+        pool = np.repeat(np.arange(NUM_TYPES), held)
+        n = int(rng.integers(1, min(len(pool), MAX_PICKS - 1) + 1))
+        chosen = np.sort(rng.choice(pool, size=n, replace=False))
+        picked = np.zeros(NUM_TYPES, dtype=np.float32)
+        last = -1
+        for k in range(n + 1):
+            prefix[i, k] = picked
+            left = held - picked
+            ok = (left > 0) & (np.arange(NUM_TYPES) >= max(last, 0))
+            mask[i, k, :NUM_TYPES] = ok if k < MAX_PICKS - 1 else False
+            mask[i, k, PICK_SUBMIT] = k > 0
+            if k < n:
+                t = int(chosen[k])
+                mask[i, k, t] = True
+                picked[t] += 1
+                last = t
+            else:
+                mask[i, k, :NUM_TYPES] = False  # the play ends here
+    return prefix, mask
+
+
 def dummy_batch(
     cfg: ModelConfig | None = None,
     batch: int = 8,
@@ -1629,15 +1843,18 @@ def dummy_batch(
     ).astype(np.float32)
     cards = rng.standard_normal((batch, NUM_TYPES, D_CARD), dtype=np.float32)
 
-    cand = np.zeros((batch, cfg.max_candidates, NUM_TYPES), dtype=np.float32)
-    mask = np.zeros((batch, cfg.max_candidates), dtype=bool)
-    for i in range(batch):
-        k = int(rng.integers(1, n_candidates + 1))
-        mask[i, :k] = True
-        for j in range(k):
-            picks = rng.integers(0, NUM_TYPES, size=int(rng.integers(1, 9)))
-            for p in picks:
-                cand[i, j, p] = min(cand[i, j, p] + 1.0, 2.0)
+    if cfg.cards_mode:
+        cand, mask = _dummy_picks(rng, batch, planes[:, PLANE_HAND])
+    else:
+        cand = np.zeros((batch, cfg.max_candidates, NUM_TYPES), dtype=np.float32)
+        mask = np.zeros((batch, cfg.max_candidates), dtype=bool)
+        for i in range(batch):
+            k = int(rng.integers(1, n_candidates + 1))
+            mask[i, :k] = True
+            for j in range(k):
+                picks = rng.integers(0, NUM_TYPES, size=int(rng.integers(1, 9)))
+                for p in picks:
+                    cand[i, j, p] = min(cand[i, j, p] + 1.0, 2.0)
 
     obs = ObsBatch(
         history=torch.from_numpy(hist),

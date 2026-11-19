@@ -59,6 +59,7 @@ from ..rules.cards import Ctx, NUM_TYPES
 from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, TrickRecord, team_of
 from ..train.buffer import obs_batch_from_arrays
+from ..train.pick_rollout import greedy_play
 from ..train.rollout import _InFlight, _choose, _evaluate, _pack
 from ..sim.bury import BuryConfig, policy_burials, value_burials
 from ..sim.deal import declare_features
@@ -310,7 +311,7 @@ def _launcher(node: str | Sequence[str] | None) -> list[str]:
 # --- scoring one decision -------------------------------------------------
 
 
-CANDIDATE_SOURCES = ("host", "sim")
+CANDIDATE_SOURCES = ("host", "sim", "cards")
 
 
 def _greedy_index(
@@ -344,6 +345,15 @@ def _greedy_index(
     seat = int(msg["seat"])
     if int(state.to_act) != seat:
         raise HostError(f"asked seat {seat} to act, but {int(state.to_act)} is to act")
+    if cfg.cards_mode != (source == "cards"):
+        raise ValueError(f"source {source!r} with action space {cfg.action_space!r}")
+    if source == "cards":
+        # Card by card (research/E7.md): picked greedily under the
+        # rollout's masks on the rebuilt position; the engine judges it.
+        if search is not None:
+            raise ValueError("search over card-by-card plays is not implemented")
+        packed = _pack(_InFlight(state=state, episode=0), cache, cfg)
+        return 0, False, [greedy_play(net, packed, device)]
     if source == "sim":
         # Exactly the rollout's call (``rollout._pack``), cap included.
         candidates = list(state.legal_moves(cap=cfg.max_candidates).moves)
@@ -672,6 +682,12 @@ def play_against_bot(
     if not HOST.exists():  # pragma: no cover - a broken checkout
         raise HostError(f"the evaluation host is missing: {HOST}")
     cfg = cfg or getattr(net, "cfg", None) or ModelConfig()
+    if cfg.cards_mode:
+        # A card-by-card network has no candidate list to be shown: it
+        # picks on the rebuilt position and the engine judges the play.
+        candidates = "cards"
+    elif candidates == "cards":
+        raise ValueError("candidates 'cards' needs a card-by-card network")
     device = torch.device(device)
     # The host must never offer a move the padded candidate axis cannot
     # carry: the surplus would be dropped here, and a candidate the
@@ -733,7 +749,7 @@ def play_against_bot(
                         net, msg, cache, cfg, device, decision_rng, search, candidates
                     )
                     searched[shard] += int(did)
-                    if candidates == "sim":
+                    if candidates in ("sim", "cards"):
                         host.write({"t": "play", "cards": offered[index].tolist()})
                     else:
                         host.write({"t": "choose", "index": index})

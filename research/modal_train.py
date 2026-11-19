@@ -321,7 +321,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_scale_minibatch: bool = True, bury_reward: str = "critic",
            bury_landlords: int = 0, distill_paths: str = "", distill_coef: float = 1.0,
            distill_lr: float = 3e-5, distill_steps: int = 2,
-           distill_minibatch: int = 512, declare_reward: str = "critic") -> None:
+           distill_minibatch: int = 512, declare_reward: str = "critic",
+           action_space: str = "") -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -380,6 +381,9 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
     fn = {"a10g": train_a10g, "a100": train_a100,
           "l40s": train_l40s, "h100": train_h100}[gpu.lower()]
     extra = dict(ARCHES[arch])
+    if action_space:
+        # "cards": every play chosen card by card (research/E7.md).
+        extra["model"] = {**extra.get("model", {}), "action_space": action_space}
     if population:
         if eval_every:
             print("population: in-loop evaluation is off; measure checkpoints "

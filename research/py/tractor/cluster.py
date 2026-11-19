@@ -105,6 +105,7 @@ def _train_parser(sub: Any) -> None:
     p.add_argument("--distill-steps", type=int, default=2)
     p.add_argument("--distill-minibatch", type=int, default=512)
     p.add_argument("--declare-reward", default="critic")
+    p.add_argument("--action-space", default="", choices=("", "candidates", "cards"))
 
 
 def _bot_list(spec: str) -> tuple[str, ...]:
@@ -119,6 +120,9 @@ def train_overrides(a: argparse.Namespace) -> dict:
     from .nn.arch import ARCHES
 
     extra = dict(ARCHES[a.arch])
+    if a.action_space:
+        # "cards": every play chosen card by card (research/E7.md).
+        extra["model"] = {**extra.get("model", {}), "action_space": a.action_space}
     eval_every = a.eval_every
     if a.population:
         eval_every = 0
@@ -355,7 +359,9 @@ def play_pair(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
               BuryConfig(rounds=0 if pre_play == "agent-heur" else 8, consider=12)),
         candidates=candidates)
     stats.update(seconds=time.perf_counter() - started, checkpoint=checkpoint, bot=bot,
-                 pre_play=pre_play, search=search, candidates=candidates,
+                 pre_play=pre_play, search=search,
+                 # What the network was actually shown: card mode has no list.
+                 candidates="cards" if cfg.cards_mode else candidates,
                  declare_net=declare_net is not None, seed=seed)
     return stats
 

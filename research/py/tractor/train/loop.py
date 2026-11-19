@@ -395,6 +395,17 @@ def train(
     model_cfg = ModelConfig(**cfg.model) if cfg.model else ModelConfig()
     net = ActorCritic(model_cfg).to(device)
     ppo_cfg = PPOConfig(**cfg.ppo) if cfg.ppo else PPOConfig()
+    if model_cfg.cards_mode:
+        # What the first version of card-by-card play leaves out
+        # (research/E7.md): refused here rather than half-working.
+        if cfg.rollout_forwards != "eager":
+            raise ValueError("card mode runs its rollout forwards eagerly; "
+                             "drop --compile / --rollout-forwards")
+        if ppo_cfg.compile or ppo_cfg.cuda_graphs:
+            raise ValueError("card mode does not compile or capture the learner's "
+                             "forwards yet; drop --compile / --cuda-graphs")
+        if cfg.distill:
+            raise ValueError("distillation onto card-by-card plays is not implemented")
     # No sink is handed to the learner: the loop already folds its
     # metrics into a row that also carries the rollout, the spans, the
     # memory and the evaluation, and a learner logging the same

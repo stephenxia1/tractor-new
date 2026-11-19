@@ -95,6 +95,8 @@ from ..gen.episode import deal_sizes, generate
 from ..nn.features import PLANE_TRICK, POINTS_PER_DECK, Cache, encode
 from ..nn.model import (
     MASK_LOGIT,
+    MAX_PICKS,
+    NUM_PICK_ACTIONS,
     ModelConfig,
     ObsBatch,
     history_bucket,
@@ -106,6 +108,7 @@ from ..rules.cards import NUM_TYPES
 from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, hand_result, team_of
 from .buffer import RolloutBuffer, obs_batch_from_arrays
+from .pick_rollout import sample_plays
 
 __all__ = ["collect", "DEFAULT_POOL", "DECKS", "MAX_LEVEL_GAIN"]
 
@@ -153,6 +156,8 @@ class _Decision:
     candidate_mask: np.ndarray
     privileged: np.ndarray
     moves: MoveSet
+    # Card mode (E7): the seat's card-by-card legality; None for whole moves.
+    rules: Any = None
 
 
 @dataclass(slots=True)
@@ -196,6 +201,28 @@ def _pack(
     seat = int(state.to_act)
     with _span(spans, "encode"):
         obs = encode(state, seat, cache)
+    if cfg.cards_mode:
+        # No enumeration: the play is picked card by card against
+        # ``sim/picks.py``'s masks, and the pick loop fills the prefix and
+        # mask blocks (``train/pick_rollout.py``).
+        from ..sim.picks import PickRules
+
+        return _Decision(
+            seat=seat,
+            history=obs.history.astype(np.float16),
+            history_len=int(obs.history_len),
+            context=obs.context.astype(np.float16),
+            unseen=obs.unseen.astype(np.float16),
+            planes=obs.planes.astype(np.float16),
+            cards=obs.cards.astype(np.float16),
+            candidates=np.zeros((MAX_PICKS, NUM_TYPES), dtype=np.float16),
+            candidate_mask=np.zeros((MAX_PICKS, NUM_PICK_ACTIONS), dtype=bool),
+            privileged=privileged_view(state.hands, state.kitty, seat).astype(
+                np.float16
+            ),
+            moves=MoveSet(),
+            rules=PickRules.for_state(state),
+        )
     # Capped at the tensor width: anything the enumerator produced past
     # this would be dropped when the batch is padded, and a candidate the
     # policy cannot see is worse than one that was never offered.
@@ -595,7 +622,11 @@ def collect(
     cfg = cfg or getattr(nets[0], "cfg", None) or ModelConfig()
     if critic is not None and agents is None:
         raise ValueError("a shared critic needs the seating to know who is who")
-    if cfg.max_candidates != buffer.candidates.shape[1]:
+    if cfg.cards_mode != (buffer.candidate_mask.ndim == 3):
+        raise ValueError("the buffer and the network disagree about the action space")
+    if cfg.cards_mode and critic is not None:
+        raise ValueError("card-mode rollout with a shared critic is not supported yet")
+    if not cfg.cards_mode and cfg.max_candidates != buffer.candidates.shape[1]:
         raise ValueError(
             f"cfg.max_candidates {cfg.max_candidates} does not match the "
             f"buffer's {buffer.candidates.shape[1]}"
@@ -646,6 +677,7 @@ def collect(
     truncated = 0
     unenumerated = 0
     n_forwards = 0
+    forced_steps = scored_steps = 0
     batch_total = 0
 
     was_training = [getattr(n, "training", False) for n in nets]
@@ -701,20 +733,34 @@ def collect(
                     owner = np.zeros(len(packed), dtype=np.int64)
                 else:
                     owner = seating[hand_idx, seats]
-                slots, chosen_logp, value_np = routed_step(
-                    nets, owner, gather, temperature, greedy, rng, spans,
-                    lengths=np.array([d.history_len for d in packed]), chunks=chunks,
-                    critic=critic, forwards=forwards,
-                    seat_agents=(
-                        None if critic is None
-                        else relative_seat_agents(seating[hand_idx], seats)
-                    ),
-                )
+                picks = None
+                if cfg.cards_mode:
+                    with _span(spans, "forward"):
+                        picks = sample_plays(
+                            nets, owner, gather, [d.rules for d in packed],
+                            temperature, greedy, rng,
+                        )
+                    slots, chosen_logp, value_np = picks.steps, picks.logp, picks.value
+                    forced_steps += picks.forced_steps
+                    scored_steps += picks.scored_steps
+                else:
+                    slots, chosen_logp, value_np = routed_step(
+                        nets, owner, gather, temperature, greedy, rng, spans,
+                        lengths=np.array([d.history_len for d in packed]), chunks=chunks,
+                        critic=critic, forwards=forwards,
+                        seat_agents=(
+                            None if critic is None
+                            else relative_seat_agents(seating[hand_idx], seats)
+                        ),
+                    )
 
                 with _span(spans, "step"):
                     finished: list[int] = []
                     for i, (hand, decision) in enumerate(zip(active, packed)):
                         slot = int(slots[i])
+                        if picks is not None:
+                            decision.candidates = picks.prefix[i]
+                            decision.candidate_mask = picks.mask[i]
                         row = buffer.add(
                             history=decision.history,
                             history_len=decision.history_len,
@@ -743,7 +789,10 @@ def collect(
 
                         # float16 holds card counts 0..2 exactly, so the
                         # slot read back is the move the enumerator built.
-                        cards = decision.candidates[slot].astype(np.int8)
+                        if picks is not None:
+                            cards = picks.play[i]
+                        else:
+                            cards = decision.candidates[slot].astype(np.int8)
                         before = len(hand.state.tricks)
                         hand.state.step(cards)
                         if len(hand.state.tricks) > before:
@@ -772,5 +821,7 @@ def collect(
         "unenumerated": unenumerated,
         "forwards": n_forwards,
         "mean_batch": batch_total / max(n_forwards, 1),
+        **({"forced_steps": float(forced_steps), "scored_steps": float(scored_steps)}
+           if cfg.cards_mode else {}),
         "seconds": elapsed,
     }
