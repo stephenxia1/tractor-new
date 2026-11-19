@@ -27,7 +27,7 @@ def test_zero2_dst2_flags():
                             "bury_scale_minibatch": False, "bury_reward": "playout",
                             "bury_landlords": 512, "declare_reward": "critic"}
     assert o["distill"] == {"paths": "/d/*.npz", "coef": 1.0, "lr": 1e-4, "steps": 8,
-                            "minibatch": 512}
+                            "minibatch": 512, "reload_every": 0, "window_rows": 0}
     assert o["bury_policy"] and o["buffer_capacity"] == 1024 * 100
 
 

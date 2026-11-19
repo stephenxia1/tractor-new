@@ -86,10 +86,16 @@ def generate(
 ) -> tuple[DistillRows, dict[str, float]]:
     """Play ``starts`` to the end with the policy; label the positions
     where search acts with search's choice. -> (rows, stats)."""
+    from ..eval.search import CandidatePolicy
+
     cache = cache or Cache()
     keep: dict[str, list] = {f.name: [] for f in fields(DistillRows)}
     decisions = searched = changed = 0
     net.eval()
+    # Search's forward (eval/fastnet.py): the policy's logits computed as
+    # the training forward computes them, without the work not read.
+    policy = CandidatePolicy(net, cache, cfg, device)
+    fast = policy.fast
     for start in starts:
         state = start.state()
         while not state.done:
@@ -104,13 +110,17 @@ def generate(
             )
             priv = torch.from_numpy(packed.privileged[None].astype(np.float32)).to(device)
             with torch.no_grad():
-                out, _v = _evaluate(net, obs, priv)
-            logp = out.log_probs[0, :n].float().cpu().numpy()
+                if fast is not None:
+                    logits = fast.logits(obs)
+                else:
+                    logits = _evaluate(net, obs, priv)[0].logits
+                logp_all = torch.log_softmax(logits.float(), dim=-1)
+            logp = logp_all[0, :n].cpu().numpy()
             decisions += 1
             top = int(np.argmax(logp))
             if n > 1 and float(np.exp(logp[top])) < search.confident:
                 index, did = search_move(net, state, list(moves.moves[:n]), logp, search,
-                                         rng, cache, cfg, device)
+                                         rng, cache, cfg, device, policy=policy)
                 if did:
                     searched += 1
                     changed += int(index != top)
@@ -142,11 +152,21 @@ def generate(
 class Distiller:
     """Cross-entropy toward search's choices on the actor alone."""
 
-    def __init__(self, net: Any, rows: DistillRows, device: Any, lr: float = 1e-5,
+    def __init__(self, net: Any, rows: DistillRows | None, device: Any, lr: float = 1e-5,
                  minibatch: int = 512, coef: float = 1.0, max_grad_norm: float = 0.5,
-                 bf16: bool = True) -> None:
+                 bf16: bool = True, source: str | None = None,
+                 window_rows: int = 0) -> None:
+        """``rows`` fixed for the run, or ``source`` (a shard glob) read by
+        ``refresh`` -- the newest shards up to ``window_rows`` rows -- for
+        labels made while the run trains (``train/labels.py``). Until a
+        refresh finds any, ``step`` does nothing."""
         self.net = net
         self.rows = rows
+        self.fresh = None
+        if source is not None:
+            from .labels import FreshRows
+
+            self.fresh = FreshRows(source, window_rows)
         self.device = torch.device(device)
         self.minibatch = int(minibatch)
         self.coef = float(coef)
@@ -155,8 +175,19 @@ class Distiller:
         self.opt = torch.optim.AdamW(self.params, lr=lr, weight_decay=0.0)
         self.amp = bool(bf16) and self.device.type == "cuda"
 
+    def refresh(self) -> dict[str, float]:
+        """Reload the freshest shards from ``source``. -> metrics."""
+        if self.fresh is None:
+            return {}
+        rows, metrics = self.fresh.load()
+        if rows is not None:
+            self.rows = rows
+        return metrics
+
     def step(self, n_minibatches: int, rng: np.random.Generator) -> dict[str, float]:
         r = self.rows
+        if r is None or len(r) == 0:
+            return {"distill/rows": 0.0}
         actor = _actor(self.net)
         actor.train()
         ce_sum = agree_sum = 0.0

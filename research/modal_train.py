@@ -322,7 +322,8 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
            bury_landlords: int = 0, distill_paths: str = "", distill_coef: float = 1.0,
            distill_lr: float = 3e-5, distill_steps: int = 2,
            distill_minibatch: int = 512, declare_reward: str = "critic",
-           action_space: str = "") -> None:
+           action_space: str = "", distill_reload_every: int = 0,
+           distill_window_rows: int = 0) -> None:
     """Submit a run and return, rather than waiting on it.
 
     `--population K` trains K agents, one per seat at K/4 tables,
@@ -476,7 +477,9 @@ def launch(steps: int = 2500, hands: int = 1024, name: str = "run",
             # Expert iteration (train/distill.py): shards of search-labelled
             # positions from modal_perf.py::distill_gen; empty paths is off.
             "distill": ({"paths": distill_paths, "coef": distill_coef, "lr": distill_lr,
-                         "steps": distill_steps, "minibatch": distill_minibatch}
+                         "steps": distill_steps, "minibatch": distill_minibatch,
+                         "reload_every": distill_reload_every,
+                         "window_rows": distill_window_rows}
                         if distill_paths else {}),
         },
     )

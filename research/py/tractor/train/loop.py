@@ -33,6 +33,8 @@ failing.
 
 from __future__ import annotations
 
+import os
+
 import contextlib
 import copy
 import json
@@ -256,7 +258,12 @@ def save_checkpoint(
     }
     if extra:
         blob.update(extra)
-    torch.save(blob, path)
+    # Written aside and renamed into place, so a reader that finds the
+    # file -- a label generator following the run, a resume -- never
+    # loads half of one.
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(blob, tmp)
+    os.replace(tmp, path)
     return path
 
 
@@ -500,11 +507,17 @@ def train(
     if cfg.distill:
         from .distill import Distiller, load_rows
 
+        # ``reload_every`` > 0: labels made while this run trains
+        # (``cluster follow``), the newest ``window_rows`` reread every
+        # that many steps. 0: the shards as they are now, for the run.
+        reload_every = int(cfg.distill.get("reload_every", 0))
         distiller = Distiller(
-            net, load_rows(cfg.distill["paths"]), device,
+            net, None if reload_every else load_rows(cfg.distill["paths"]), device,
             lr=float(cfg.distill.get("lr", 1e-5)),
             minibatch=int(cfg.distill.get("minibatch", 512)),
             coef=float(cfg.distill.get("coef", 1.0)),
+            source=cfg.distill["paths"] if reload_every else None,
+            window_rows=int(cfg.distill.get("window_rows", 0)),
         )
     # Started before the first step and closed in the `finally` below,
     # so worker start-up is paid once for the run and not once a step.
@@ -623,6 +636,13 @@ def train(
                 metrics = learner.update(buffer)
             if distiller is not None:
                 with spans.span("distill"):
+                    every = int(cfg.distill.get("reload_every", 0))
+                    if every and (step - start) % every == 0:
+                        fresh = distiller.refresh()
+                        if "distill/label_step_max" in fresh:
+                            # How far the newest labels trail the policy.
+                            fresh["distill/label_lag"] = step - fresh["distill/label_step_max"]
+                        metrics.update(fresh)
                     metrics.update(distiller.step(int(cfg.distill.get("steps", 4)), rng))
 
             # Before the metrics row is assembled, so that the evaluation's

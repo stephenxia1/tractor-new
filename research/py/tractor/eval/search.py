@@ -32,6 +32,14 @@ piece replaced by a learned one:
 Every candidate is scored against the same worlds, so the comparison
 between candidates carries no sampling noise from the deal.
 
+The search itself (``search_plays``) does not know how the network
+chooses a play. It asks a *policy* for two things -- the greedy play of
+the seat to act in each of a batch of states, and the critic's value
+there -- and is handed the root's candidate plays and their prior. The
+candidate-list network is ``CandidatePolicy``; a card-by-card network
+(research/E7.md) supplies its own, with the root's plays from a beam over
+picks. ``search_move`` is the candidate-list entry point.
+
 Nothing here reads a hidden card. The sampler takes the searching
 seat's hand, the public record and the hand *sizes* from the state; the
 other seats' actual holdings are overwritten before the simulation
@@ -42,7 +50,7 @@ hidden cards and demanding identical worlds and an identical choice.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -51,11 +59,15 @@ from ..nn.features import POINTS_PER_DECK, Cache
 from ..nn.model import ModelConfig
 from ..rules.cards import NUM_SUITS, NUM_TYPES
 from ..rules.combos import play_suit
+from ..sim.actions import MoveSet
 from ..sim.state import NUM_SEATS, PlayState, team_of
 from ..train.buffer import obs_batch_from_arrays
 from ..train.rollout import _evaluate, _InFlight, _pack
 
-__all__ = ["SearchConfig", "known_voids", "sample_world", "search_move"]
+__all__ = [
+    "SearchConfig", "known_voids", "sample_world", "search_move", "search_plays",
+    "CandidatePolicy", "SearchPolicy",
+]
 
 # The critic is trained on per-seat trick credit of +/- p / (2 * deck
 # points), so its value times this is the future point margin of the
@@ -192,11 +204,28 @@ def _in_world(state: PlayState, world: World) -> PlayState:
     return sim
 
 
-def _forward(
-    net: Any, sims: list[PlayState], cache: Cache, cfg: ModelConfig, device: Any
-) -> tuple[list[Any], Any, torch.Tensor]:
-    """One batched forward over the seat to act in each state."""
-    packed = [_pack(_InFlight(state=s, episode=0), cache, cfg) for s in sims]
+class SearchPolicy(Protocol):
+    """What ``search_plays`` needs from a network."""
+
+    def play(self, states: Sequence[PlayState]) -> list[np.ndarray]:
+        """The greedy play (int8[54]) of the seat to act in each state."""
+        ...
+
+    def value(self, states: Sequence[PlayState]) -> np.ndarray:
+        """float64[n]: the critic's value for the seat to act in each state,
+        in its training units (per-seat trick credit)."""
+        ...
+
+
+def _batch(sims: Sequence[PlayState], cache: Cache, cfg: ModelConfig, device: Any,
+           moves: Sequence[Any] | None = None):
+    """``moves`` are the candidate lists already built (``None``: build
+    them; an empty ``MoveSet`` per state for a value-only batch)."""
+    if moves is None:
+        packed = [_pack(_InFlight(state=s, episode=0), cache, cfg) for s in sims]
+    else:
+        packed = [_pack(_InFlight(state=s, episode=0), cache, cfg, moves=m)
+                  for s, m in zip(sims, moves)]
     obs = obs_batch_from_arrays(
         np.stack([p.history for p in packed]),
         np.array([p.history_len for p in packed], dtype=np.int64),
@@ -211,14 +240,85 @@ def _forward(
     privileged = torch.from_numpy(
         np.stack([p.privileged for p in packed]).astype(np.float32)
     ).to(device)
-    with torch.no_grad():
-        out, value = _evaluate(net, obs, privileged)
-    if value is None:
-        raise ValueError(
-            "search scores leaves with the critic, and this network has none "
-            "(a population agent's critic is the population's shared one)"
-        )
-    return packed, out, value
+    return packed, obs, privileged
+
+
+_NO_MOVES = MoveSet(moves=[np.zeros(NUM_TYPES, dtype=np.int8)])
+
+
+class CandidatePolicy:
+    """The candidate-list network as search uses it: greedy over the
+    simulator's candidate list (``legal_moves``, the rollout's cap), as
+    the evaluation plays, and the privileged critic at the leaves.
+
+    ``fast`` runs ``eval.fastnet.SearchNet`` -- the same function without
+    the work search does not read -- and ``False`` the training forward.
+    ``bf16`` runs the forwards under bfloat16 autocast (CPU or GPU).
+    """
+
+    def __init__(self, net: Any, cache: Cache, cfg: ModelConfig, device: Any,
+                 fast: bool = True, bf16: bool = False) -> None:
+        if getattr(net, "actor", None) is not None and net.critic is None:
+            raise ValueError(
+                "search scores leaves with the critic, and this network has none "
+                "(a population agent's critic is the population's shared one)"
+            )
+        self.net = net
+        self.cache = cache
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self.bf16 = bool(bf16)
+        self.fast = None
+        if fast and getattr(net, "actor", None) is not None:
+            from .fastnet import SearchNet
+
+            self.fast = SearchNet(net)
+
+    def _autocast(self):
+        return torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.bf16)
+
+    def play(self, states: Sequence[PlayState]) -> list[np.ndarray]:
+        out: list[np.ndarray | None] = [None] * len(states)
+        choose: list[int] = []
+        moves: list[Any] = []
+        for i, s in enumerate(states):
+            options = s.legal_moves(cap=self.cfg.max_candidates)
+            if len(options.moves) == 1:
+                out[i] = options.moves[0]
+            else:
+                choose.append(i)
+                moves.append(options)
+        if choose:
+            packed, obs, privileged = _batch(
+                [states[i] for i in choose], self.cache, self.cfg, self.device, moves
+            )
+            with torch.no_grad(), self._autocast():
+                if self.fast is not None:
+                    logits = self.fast.logits(obs)
+                else:
+                    logits = _evaluate(self.net, obs, privileged)[0].logits
+            # Greedy, as the evaluation plays; padded slots sit at
+            # MASK_LOGIT and cannot win the argmax.
+            slots = logits.float().argmax(dim=1).cpu().numpy()
+            for i, p, slot in zip(choose, packed, slots):
+                out[i] = p.moves.moves[int(slot)]
+        return out  # type: ignore[return-value]
+
+    def value(self, states: Sequence[PlayState]) -> np.ndarray:
+        if not states:
+            return np.zeros(0, dtype=np.float64)
+        # The critic reads no candidates: a placeholder stands in for the
+        # list rather than enumerating one per leaf.
+        empty = None if self.fast is None else [_NO_MOVES] * len(states)
+        _packed, obs, privileged = _batch(states, self.cache, self.cfg, self.device, empty)
+        with torch.no_grad(), self._autocast():
+            if self.fast is not None:
+                value = self.fast.value(obs, privileged)
+            else:
+                value = _evaluate(self.net, obs, privileged)[1]
+        if value is None:
+            raise ValueError("search scores leaves with the critic, and this network has none")
+        return value.float().cpu().numpy().astype(np.float64)
 
 
 def search_move(
@@ -233,8 +333,11 @@ def search_move(
     device: Any,
     worlds: list[World] | None = None,
     details: dict | None = None,
+    policy: SearchPolicy | None = None,
 ) -> tuple[int, bool]:
-    """``(index into moves, searched)`` for the seat to act in ``state``.
+    """``(index into moves, searched)`` for the seat to act in ``state``:
+    ``search_plays`` with the candidate-list network (``CandidatePolicy``)
+    unless ``policy`` is given.
 
     ``worlds`` replaces the sampled worlds, and ``details`` (a dict) is
     filled with the candidates searched, the per-world scores and their
@@ -242,9 +345,33 @@ def search_move(
     (research/py/test_zero_search_parity.py). Neither changes a search
     that does not pass them.
     """
+    if policy is None:
+        policy = CandidatePolicy(net, cache, cfg, device)
+    return search_plays(policy, state, moves, log_prior, search, rng,
+                        worlds=worlds, details=details)
+
+
+def search_plays(
+    policy: SearchPolicy,
+    state: PlayState,
+    plays: Sequence[np.ndarray],
+    log_prior: np.ndarray,
+    search: SearchConfig,
+    rng: np.random.Generator,
+    worlds: list[World] | None = None,
+    details: dict | None = None,
+) -> tuple[int, bool]:
+    """``(index into plays, searched)`` for the seat to act in ``state``.
+
+    ``plays`` are the root's candidate plays (int8[54] each) and
+    ``log_prior`` the policy's log-probability of each: a candidate list
+    and its log-softmax, or a beam's top plays and their summed pick
+    log-probabilities. Nothing else here depends on how the policy
+    chooses.
+    """
     order = np.argsort(-log_prior, kind="stable")
     best = int(order[0])
-    if len(moves) <= 1 or float(np.exp(log_prior[best])) >= search.confident:
+    if len(plays) <= 1 or float(np.exp(log_prior[best])) >= search.confident:
         return best, False
     top = [int(i) for i in order[: search.top_k]]
     if len(top) == 1:
@@ -261,7 +388,7 @@ def search_move(
     for world in worlds:
         for i in top:
             sim = _in_world(state, world)
-            sim.step(moves[i])
+            sim.step(plays[i])
             sims.append(sim)
 
     # Play every simulation forward in lockstep: one batched forward per
@@ -270,31 +397,15 @@ def search_move(
         live = [s for s in sims if not s.done and len(s.tricks) < stop]
         if not live:
             break
-        choose: list[PlayState] = []
-        for s in live:
-            options = s.legal_moves(cap=cfg.max_candidates)
-            if len(options.moves) == 1:
-                s.step(options.moves[0])
-            else:
-                choose.append(s)
-        if not choose:
-            continue
-        packed, out, _value = _forward(net, choose, cache, cfg, device)
-        # Greedy, as the evaluation plays; padded slots already sit at
-        # MASK_LOGIT and cannot win the argmax.
-        slots = out.logits.float().argmax(dim=1).cpu().numpy()
-        for s, p, slot in zip(choose, packed, slots):
-            s.step(p.moves.moves[int(slot)])
+        for s, play in zip(live, policy.play(live)):
+            s.step(play)
 
     # Leaf values: the critic's future margin for the seat to act, signed
     # for the searching team. Finished hands have nothing to come.
     future = np.zeros(len(sims), dtype=np.float64)
     open_rows = [k for k, s in enumerate(sims) if not s.done]
     if open_rows:
-        _packed, _out, value = _forward(
-            net, [sims[k] for k in open_rows], cache, cfg, device
-        )
-        value = value.float().cpu().numpy()
+        value = policy.value([sims[k] for k in open_rows])
         for k, v in zip(open_rows, value):
             sign = 1.0 if team_of(int(sims[k].to_act)) == team else -1.0
             future[k] = sign * float(v) * _value_to_points(state.num_decks)

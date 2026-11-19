@@ -171,10 +171,13 @@ def play(checkpoint: str, bot: str, deals: int, seed: int,
                  candidates)
 
 
-# Search needs the GPU. A searched decision is tens of forward rows, and
-# on one CPU thread a row costs about 100 ms -- measured, batch 1 to 64
-# -- so the search that takes seconds there is milliseconds here. The
-# shards share the device from their own threads; the work is small
+# Search on a GPU. The note that stood here (a CPU thread at ~100 ms a
+# forward row, so search needs the GPU) was re-measured on 2026-11-19
+# and no longer holds: with search's own forward (eval/fastnet.py) a
+# searched decision costs ~0.14 s at 8 worlds x top 3 and ~0.2 s at
+# 12 x 4 on one CPU core, all cores busy, against ~0.6 s and ~1.2 s
+# through the training forward (research/README.md, *Search on CPUs*).
+# The shards share the device from their own threads; the work is small
 # batches, bound by kernel launches, which an A10G serves as well as a
 # larger card.
 #
@@ -207,7 +210,8 @@ def _measure(ckpts: list, names: list, deals: int, seed: int, workers: int,
     each write to ``path`` (a volume commit, on Modal)."""
     on_write = on_write or (lambda: None)
     # Search, and the burial climb of --pre-play agent, are batched
-    # forwards that a CPU thread runs at ~100 ms a row. `gpu` sends the
+    # forwards; search is cheap on a CPU now (see play_gpu), the climb
+    # is not re-measured. `gpu` sends the
     # rest there too: 32-core CPU containers are sometimes not to be had
     # (Modal queues them "waiting to be scheduled on a CPU worker").
     fn = play_gpu if (gpu or search or pre_play.startswith("agent")) else play

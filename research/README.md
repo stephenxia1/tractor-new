@@ -1448,6 +1448,61 @@ to be trained from scratch (`--action-space cards`).
 
 The launch command for Bouchet is in `ycrc/README.md` §6.
 
+### Search on CPUs (2026-11-19)
+
+The user's plan: wider search for the labels, and search moved off the
+GPU so that labels can be made beside training. The cost was re-measured
+first: the note in `modal_eval.py` (a CPU thread at ~100 ms a forward row,
+so search needs a GPU) no longer described anything.
+
+Measured in a cloud session's container (an Intel Xeon with AVX-512 and
+AMX, torch 2.15, one single-threaded process per core) on `zero2-dst2`
+step 5000's actor and critic (the app's float16 export), over 60 searched
+decisions from the policy's own self-play, confidence 0.99, look-ahead
+to the end of the trick. Milliseconds per searched decision:
+
+| forward | 8 x 3 | 12 x 4 | same choice as the training forward |
+| --- | --- | --- | --- |
+| training forward (`ActorCritic.forward`, as before) | 603 | 1,169-1,223 | (reference) |
+| search's own forward (`eval/fastnet.py`), float32 | **138** | **197-214** | 60 of 60 |
+| the same under bfloat16 autocast | | 207 | 57 of 60 |
+| int8 dynamic quantization (before prefix sharing) | | 334 | 15 of 60 |
+
+Four processes on four cores ran at 210-225 ms each (12 x 4): it scales
+with cores. `torch.compile` made the forward slower on the CPU (78.9
+against 71.2 ms a batch, after 87 s of compiling) and was dropped; bf16
+no longer pays once the exact savings are in, and int8 breaks the
+policy. ONNX was not tried: the forward is matrix-multiply bound and its
+token compaction depends on the data.
+
+Where the factor of six comes from, all of it exact: the query block runs
+only the seven fixed tokens and the held card types (the others are
+masked keys, zeroed after every block), and only the context token in
+its last layer; plies run the actor alone and leaves the critic alone;
+the history, the query block's cross-attention memory and the critic run
+to the batch's longest history rather than 128 positions; a search
+batch's shared history prefix (per seat to act, the tokens being
+seat-relative) is encoded once, with its keys and values in every
+history layer and its cross-attention keys and values in every query
+layer; and the candidate list is built once per state, not at all for a
+leaf. Logits agree to 3e-5, values to 2e-7, the argmax on 1,824 of 1,824
+rows (`tests/test_fastnet.py`).
+
+What it buys: a hand is ~100 decisions, two thirds searched, so ~14 s of
+one core and ~65 label rows at 12 x 4. A 1,250-hand shard is about 10
+minutes on 32 cores, where an A10G took about an hour at 8 x 3.
+
+Built on it (`train/labels.py`): `cluster gen --workers` for a fixed
+shard on CPUs; `cluster follow` (`ycrc/follow.sbatch`), CPU processes
+that follow a training run's newest checkpoint and keep writing shards
+into a rolling directory; and `--distill-reload-every` /
+`--distill-window-rows`, which make `train/distill.py` reread the newest
+shards every N steps instead of loading them once, logging the label lag.
+The search itself (`search_plays`) now takes a policy rather than a
+network, so a card-by-card network can use it with its root plays from a
+beam over picks (`eval/search_cards.py`; checked, not yet wired in while
+E7 is on hold).
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

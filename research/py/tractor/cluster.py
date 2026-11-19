@@ -104,6 +104,10 @@ def _train_parser(sub: Any) -> None:
     p.add_argument("--distill-lr", type=float, default=3e-5)
     p.add_argument("--distill-steps", type=int, default=2)
     p.add_argument("--distill-minibatch", type=int, default=512)
+    # Labels made while the run trains (`follow`): reread the newest shards
+    # every this many steps, up to --distill-window-rows rows (0: all).
+    p.add_argument("--distill-reload-every", type=int, default=0)
+    p.add_argument("--distill-window-rows", type=int, default=0)
     p.add_argument("--declare-reward", default="critic")
     p.add_argument("--action-space", default="", choices=("", "candidates", "cards"))
 
@@ -169,7 +173,9 @@ def train_overrides(a: argparse.Namespace) -> dict:
         "bury_policy": a.bury_policy,
         "restart_schedule": a.restart_schedule,
         "distill": ({"paths": a.distill_paths, "coef": a.distill_coef, "lr": a.distill_lr,
-                     "steps": a.distill_steps, "minibatch": a.distill_minibatch}
+                     "steps": a.distill_steps, "minibatch": a.distill_minibatch,
+                     "reload_every": a.distill_reload_every,
+                     "window_rows": a.distill_window_rows}
                     if a.distill_paths else {}),
     }
 
@@ -244,6 +250,9 @@ def _gen_parser(sub: Any) -> None:
     p.add_argument("--worlds", type=int, default=8)
     p.add_argument("--top-k", type=int, default=3)
     p.add_argument("--confident", type=float, default=0.99)
+    # Above 1: that many single-threaded processes on the CPU, one per core
+    # (search is cheap there: train/labels.py), merged into the one shard.
+    p.add_argument("--workers", type=int, default=1)
 
 
 def run_gen(a: argparse.Namespace) -> int:
@@ -260,6 +269,18 @@ def run_gen(a: argparse.Namespace) -> int:
     out = Path(a.out_dir) / f"shard_{a.shard:03d}.npz"
     if out.exists():
         print(f"{out} exists; nothing to do", flush=True)
+        return 0
+    if a.workers > 1:
+        from .train.labels import generate_pool
+
+        t0 = time.perf_counter()
+        stats = generate_pool(a.checkpoint, a.hands,
+                              SearchConfig(worlds=a.worlds, top_k=a.top_k,
+                                           confident=a.confident),
+                              [a.seed, a.shard], a.workers, out)
+        print(json.dumps({"checkpoint": a.checkpoint, "shard": a.shard, "hands": a.hands,
+                          "workers": a.workers, "seconds": time.perf_counter() - t0,
+                          **stats}), flush=True)
         return 0
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     blob = torch.load(a.checkpoint, map_location="cpu", weights_only=False)
@@ -396,6 +417,41 @@ def run_eval(a: argparse.Namespace) -> int:
     return 0
 
 
+# --- follow -------------------------------------------------------------------
+
+
+def _follow_parser(sub: Any) -> None:
+    p = sub.add_parser("follow", help="label shards on CPUs from a training run's newest checkpoint")
+    p.add_argument("--run-dir", required=True, help="the run's directory (holds checkpoints/)")
+    p.add_argument("--out-dir", required=True, help="the rolling shard directory")
+    p.add_argument("--hands", type=int, default=16, help="hands per shard")
+    p.add_argument("--worlds", type=int, default=12)
+    p.add_argument("--top-k", type=int, default=4)
+    p.add_argument("--confident", type=float, default=0.99)
+    p.add_argument("--extra-tricks", type=int, default=0)
+    p.add_argument("--workers", type=int,
+                   default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
+    p.add_argument("--task", type=int,
+                   default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
+    p.add_argument("--keep", type=int, default=50, help="each worker's newest shards kept")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--poll-s", type=float, default=60.0)
+
+
+def run_follow(a: argparse.Namespace) -> int:
+    from .eval.search import SearchConfig
+    from .train.labels import follow_pool
+
+    search = SearchConfig(worlds=a.worlds, top_k=a.top_k, confident=a.confident,
+                          extra_tricks=a.extra_tricks)
+    written = follow_pool(a.workers, run_dir=a.run_dir, out_dir=a.out_dir, hands=a.hands,
+                          search=search, seed=a.seed, task=a.task, keep=a.keep,
+                          poll_s=a.poll_s)
+    print(json.dumps({"run_dir": a.run_dir, "task": a.task, "workers": a.workers,
+                      "shards": written}), flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m tractor.cluster", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -403,8 +459,10 @@ def main(argv: list[str] | None = None) -> int:
     _train_parser(sub)
     _gen_parser(sub)
     _eval_parser(sub)
+    _follow_parser(sub)
     a = ap.parse_args(argv)
-    return {"train": run_train, "gen": run_gen, "eval": run_eval}[a.cmd](a)
+    return {"train": run_train, "gen": run_gen, "eval": run_eval,
+            "follow": run_follow}[a.cmd](a)
 
 
 if __name__ == "__main__":

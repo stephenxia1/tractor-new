@@ -99,14 +99,16 @@ sbatch -p <gpu partition> --gpus=1 research/ycrc/eval.sbatch --checkpoint $CK \
   --bots smart-v18 --out $TRACTOR_ROOT/evals/zero2-dst2-5000-policy-ycrc.jsonl
 ```
 
-**4b. Labels** from the 12 x 4 search, six shards of 1,250 hands (8 x 3
-took about an hour a shard on an A10G; expect about twice that):
+**4b. Labels** from the 12 x 4 search, six shards of 1,250 hands. On a
+CPU partition, 32 cores a shard (about 10 minutes each, §5b):
 
 ```bash
-sbatch -p <gpu partition> --gpus=1 --array=0-5 research/ycrc/gen.sbatch \
+sbatch -p <cpu partition> -c 32 --mem=64G -t 6:00:00 --array=0-5 research/ycrc/gen.sbatch \
   --checkpoint $CK --out-dir $TRACTOR_ROOT/distill/dst2-5000-w12k4 --hands 1250 --seed 2 \
-  --worlds 12 --top-k 4 --confident 0.99
+  --worlds 12 --top-k 4 --confident 0.99 --workers 32
 ```
+
+or on GPUs as before (drop `--workers`, use `-p <gpu partition> --gpus=1`).
 
 **4c. Two arms from step 5,000 to 6,000**, identical except for
 distillation, on `zero2-dst2`'s settings:
@@ -153,6 +155,53 @@ Compare the arms at the same step, paired on the same deals (both records
 use seed 20260923 by default), and report win rate, levels and points
 together. Copy records into `research/evals/<date>/` and commit them to
 `rl-research`.
+
+## 5b. Labels on CPUs, and continuous expert iteration
+
+Search runs on CPUs now (`eval/fastnet.py`; methodology in
+`research/README.md`, *Search on CPUs*): measured at about 0.2 s per
+searched decision per core at 12 worlds x top 4, all cores busy. A hand
+is about 100 decisions, two thirds of them searched, so about 14 s of
+one core and 65 label rows per hand. Bouchet's CPU partitions are the
+place for it; `sinfo -s` lists them.
+
+**A fixed shard on CPUs** (the §4b labels without a GPU): one process per
+core, merged into one shard:
+
+```bash
+sbatch -p <cpu partition> -c 32 --mem=64G -t 6:00:00 --array=0-5 research/ycrc/gen.sbatch \
+  --checkpoint $CK --out-dir $TRACTOR_ROOT/distill/dst2-5000-w12k4 --hands 1250 --seed 2 \
+  --worlds 12 --top-k 4 --confident 0.99 --workers 32
+```
+
+(about 1,250 hands x 14 s / 32 cores = 10 minutes a shard, if Bouchet's
+cores match the ones measured; an A10G took about an hour a shard at 8 x 3.)
+
+**Continuous expert iteration.** The run distils from a rolling
+directory that CPU jobs keep filling from its newest checkpoint; labels
+trail the policy by roughly a checkpoint interval plus a shard's time,
+and each refresh logs `ppo/distill/label_lag` (steps). Until the first
+shards exist the run trains without distilling.
+
+```bash
+RUN=zero2-live
+sbatch -p <gpu partition> --gpus=1 research/ycrc/train.sbatch \
+  --name $RUN --resume $CK --steps 6000 $COMMON \
+  --distill-paths "$TRACTOR_ROOT/distill/$RUN/s*.npz" --distill-reload-every 25 \
+  --distill-window-rows 200000 \
+  --distill-coef 1.0 --distill-lr 1e-4 --distill-steps 8 --distill-minibatch 512
+sbatch -p <cpu partition> --array=0-1 research/ycrc/follow.sbatch \
+  --run-dir $TRACTOR_ROOT/$RUN --out-dir $TRACTOR_ROOT/distill/$RUN \
+  --hands 16 --worlds 12 --top-k 4 --confident 0.99 --keep 100
+```
+
+Sizing: `dst2`'s settings read 8 x 512 = 4,096 label rows a step. At
+~18 s a step (Modal's H100; slower GPUs take longer) that is ~230 rows a
+second, which ~50 cores at 12 x 4 produce, each row then read about
+once. Two tasks of 32 cores cover it. The window of 200,000 rows (about
+50 steps' worth) takes ~6 GB of the trainer's memory. A shard names the
+checkpoint step it came from (`s0005250-t001-w07-00012.npz`), and each
+process keeps only its own newest `--keep` shards.
 
 ## 6. E7: card by card, cold start
 
