@@ -1510,32 +1510,35 @@ on one core against ~6.0 s through the training forward.
 
 The user's plan widens search from 8 worlds x top 3 to 12 x 4 for the
 round-2 labels, after checking cost and gain. `zero2-dst2` step 5000 +
-search at 12 x 4 (confidence 0.99, look-ahead to the end of the trick),
-770 deals per fair bot on the two usual seeds, paired hand for hand
-against the 8 x 3 records of 2026-11-16 (`tab_evals.py --paired`; levels
-from the two standard errors, `u`, since the 2026-11-16 records keep no
-per-deal levels):
+search (confidence 0.99, look-ahead to the end of the trick) at both
+widths, 770 deals per fair bot on the two usual seeds, all four runs on
+the same platform: CPUs in this container (`cluster eval --procs 3
+--workers 6`) with a float32 network rebuilt from the app's float16
+export, the original checkpoint having stayed on Modal. Paired hand for
+hand (`tab_evals.py --paired`); levels pair deal by deal on seed 20261114,
+where both records keep `per_deal_levels`, and on seed 20260923 come from
+the two standard errors (`u`), the first 12 x 4 record predating the field.
 
-| bot | 8 x 3 win | 12 x 4 win | 12 x 4 - 8 x 3 win | levels | points |
+| fair bots v18 / v28 / v34 | 8 x 3 win | 12 x 4 win | 12 x 4 - 8 x 3 win | levels | points |
 | --- | --- | --- | --- | --- | --- |
-| seed 20260923, v18 / v28 / v34 | 0.607 | 0.598 | -0.010 +/- 0.013 | -0.003 +/- 0.032 u | +0.58 +/- 0.82 |
-| seed 20261114, v18 / v28 / v34 | 0.610 | 0.611 | +0.002 +/- 0.013 | -0.004 +/- 0.032 u | -0.37 +/- 0.82 |
-| **both seeds, 9,240 hands** | | | **-0.004 +/- 0.009** | **-0.003 +/- 0.022 u** | **+0.10 +/- 0.58** |
+| seed 20260923 | 0.604 | 0.598 | -0.006 +/- 0.013 | -0.000 +/- 0.032 u | +0.63 +/- 0.82 |
+| seed 20261114 | 0.611 | 0.611 | +0.000 +/- 0.013 | -0.005 +/- 0.023 | -0.40 +/- 0.82 |
+| **both seeds, 9,240 hands** | | | **-0.003 +/- 0.009** | **-0.003 +/- 0.020** | **+0.12 +/- 0.58** |
 
-Per bot every difference is inside its interval (win +/- 0.022, points
-+/- 1.4). The wider search plays no better: the interval excludes a gain
-of a point of win rate. It searched the same share of decisions (64%;
-32,700 of 50,700 a bot) and costs ~1.45x as much per searched decision
-(197-214 against 138 ms on a core, above).
+The wider search plays no better: every per-bot difference is inside its
+interval (win +/- 0.022, points +/- 1.4), the signs flip between seeds,
+and the pooled interval excludes a gain of a point of win rate. It
+searches the same share of decisions (64%; 32,700 of 50,700 a bot) and
+costs ~1.45x as much per searched decision (197-214 against 138 ms on a
+core, above), ~1.2x a whole evaluation (52.4 against 42.8 minutes a bot,
+the bots' own turns and the unsearched decisions diluting it).
 
-One difference besides the width: the 12 x 4 runs played on CPUs in this
-container (`cluster eval --procs 3 --workers 6`, ~52 minutes a bot) with
-a float32 network rebuilt from the app's float16 export (the original
-checkpoint stayed on Modal), where the 8 x 3 records ran the original on
-a Modal GPU. Rerunning eight 8 x 3 deals this way reproduced the Modal
-record on 7 of 8. A like-for-like 8 x 3 on the same rebuild and platform
-is running; its records keep `per_deal_levels`, so levels pair too.
-Records: `evals/2026-11-19/zero2-dst2-5000-f16-policy-search12x4-c99-*.jsonl`.
+The platform does not matter: the same 8 x 3 search on the rebuild and on
+CPUs against the 2026-11-16 records (the original on a Modal GPU), paired,
+is -0.001 +/- 0.001 win and -0.01 +/- 0.07 points (seed 20260923 -0.004 +/-
+0.002, seed 20261114 +0.001 +/- 0.001); the two make almost every decision
+alike. Against those records 12 x 4 is -0.004 +/- 0.009 win, +0.10 +/- 0.58
+points. Records: `evals/2026-11-19/zero2-dst2-5000-f16-policy-search{12x4,8x3}-c99-*.jsonl`.
 
 ## Next steps
 

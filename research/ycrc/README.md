@@ -77,33 +77,14 @@ CK=$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt
 mkdir -p $TRACTOR_ROOT/evals
 ```
 
-**4a. The cost and the gain of 12 x 4** (two jobs, one per seed; the 8 x 3
-records for the same checkpoint and deals are in
-`research/evals/2026-11-16/zero2-dst2-5000-policy-search8-c99*.jsonl`):
-
-```bash
-for SEED in 20260923 20261114; do
-  sbatch -p <gpu partition> --gpus=1 research/ycrc/eval.sbatch --checkpoint $CK \
-    --search-worlds 12 --search-top 4 --search-confident 0.99 --seed $SEED \
-    --out $TRACTOR_ROOT/evals/zero2-dst2-5000-policy-search12x4-c99-$SEED.jsonl
-done
-```
-
-Or on a CPU partition, which search now runs well on (§5b): the same
-jobs with `-p <cpu partition>` and no `--gpus`, plus `--procs 16`, which
-spreads the 32 shards over 16 processes (each shard's bot host is a
-process of its own). The bots' own search dominates the time there:
-`smart-v34` thinks ~0.7 s a decision against ~0.2 s for 12 x 4.
-
-A platform check alongside (one bot, no search, about half an hour): its
-per-deal results should match the Modal record
-`zero2-dst2-5000-policy.jsonl` deal for deal. If they do, the paired
-comparison above measures the search width alone.
-
-```bash
-sbatch -p <gpu partition> --gpus=1 research/ycrc/eval.sbatch --checkpoint $CK \
-  --bots smart-v18 --out $TRACTOR_ROOT/evals/zero2-dst2-5000-policy-ycrc.jsonl
-```
+**4a. The cost and the gain of 12 x 4: done, no need to run.** Measured
+in a cloud session on CPUs, both widths on the same platform, 770 deals
+per fair bot, both seeds (`research/README.md`, "Wider search"): 12 x 4 -
+8 x 3 is -0.003 +/- 0.009 win, -0.003 +/- 0.020 levels, +0.12 +/- 0.58
+points over 9,240 paired hands, at ~1.45x the cost per searched decision.
+The platform check came out at -0.001 +/- 0.001 win against the Modal
+records. **Before 4b, decide the label width**: 12 x 4 as planned, or
+8 x 3, which played as well for two thirds of the cost.
 
 **4b. Labels** from the 12 x 4 search, six shards of 1,250 hands. On a
 CPU partition, 32 cores a shard (about 10 minutes each, §5b):
@@ -113,6 +94,10 @@ sbatch -p <cpu partition> -c 32 --mem=64G -t 6:00:00 --array=0-5 research/ycrc/g
   --checkpoint $CK --out-dir $TRACTOR_ROOT/distill/dst2-5000-w12k4 --hands 1250 --seed 2 \
   --worlds 12 --top-k 4 --confident 0.99 --workers 32
 ```
+
+For 8 x 3 labels instead, the same with `--worlds 8 --top-k 3` and
+`--out-dir $TRACTOR_ROOT/distill/dst2-5000-w8k3` (and that directory in
+4c's `--distill-paths`).
 
 or on GPUs as before (drop `--workers`, use `-p <gpu partition> --gpus=1`).
 
