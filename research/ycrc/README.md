@@ -65,14 +65,51 @@ python -m tractor.cluster train --root $TRACTOR_ROOT --name smoke --overwrite \
   --bury-policy --resume $TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt
 ```
 
-## 4. Expert iteration, round 2
+## 4. Wider search, then expert iteration round 2
 
-The question (methodology doc §11): does distillation keep paying when
-the labels come from the stronger bot? Two arms from `zero2-dst2` step
-5,000 to 6,000, identical except for the labels. Submit from the
-repository root.
+The questions (2026-11-19): does search at 12 worlds x top 4 beat 8 x 3
+enough to be worth its cost, and does distillation keep paying when the
+labels come from the wider search? Confidence 0.99 and look-ahead to the
+end of the trick throughout. Submit from the repository root.
 
-`zero2-dst2`'s settings:
+```bash
+CK=$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt
+mkdir -p $TRACTOR_ROOT/evals
+```
+
+**4a. The cost and the gain of 12 x 4** (two jobs, one per seed; the 8 x 3
+records for the same checkpoint and deals are in
+`research/evals/2026-11-16/zero2-dst2-5000-policy-search8-c99*.jsonl`):
+
+```bash
+for SEED in 20260923 20261114; do
+  sbatch -p <gpu partition> --gpus=1 research/ycrc/eval.sbatch --checkpoint $CK \
+    --search-worlds 12 --search-top 4 --search-confident 0.99 --seed $SEED \
+    --out $TRACTOR_ROOT/evals/zero2-dst2-5000-policy-search12x4-c99-$SEED.jsonl
+done
+```
+
+A platform check alongside (one bot, no search, about half an hour): its
+per-deal results should match the Modal record
+`zero2-dst2-5000-policy.jsonl` deal for deal. If they do, the paired
+comparison above measures the search width alone.
+
+```bash
+sbatch -p <gpu partition> --gpus=1 research/ycrc/eval.sbatch --checkpoint $CK \
+  --bots smart-v18 --out $TRACTOR_ROOT/evals/zero2-dst2-5000-policy-ycrc.jsonl
+```
+
+**4b. Labels** from the 12 x 4 search, six shards of 1,250 hands (8 x 3
+took about an hour a shard on an A10G; expect about twice that):
+
+```bash
+sbatch -p <gpu partition> --gpus=1 --array=0-5 research/ycrc/gen.sbatch \
+  --checkpoint $CK --out-dir $TRACTOR_ROOT/distill/dst2-5000-w12k4 --hands 1250 --seed 2 \
+  --worlds 12 --top-k 4 --confident 0.99
+```
+
+**4c. Two arms from step 5,000 to 6,000**, identical except for
+distillation, on `zero2-dst2`'s settings:
 
 ```bash
 COMMON="--arch v5 --hands 1024 --lr 1e-4 --length-buckets 4 --checkpoint-every 50 \
@@ -80,24 +117,19 @@ COMMON="--arch v5 --hands 1024 --lr 1e-4 --length-buckets 4 --checkpoint-every 5
   --rollout-forwards compiled --bury-policy --random-burial-frac 0.2 --bury-samples 4 \
   --no-bury-scale-minibatch --bury-reward playout --bury-landlords 512 \
   --warmup-steps 300 --play-phase-steps 200 --declare-phase-steps 100 --declare-hands 1024"
-CK=$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt
 ```
 
-1. Labels, six shards of 1,250 hands (about an hour each on an A10G):
-   ```bash
-   sbatch -p <gpu partition> --gpus=1 --array=0-5 research/ycrc/gen.sbatch \
-     --checkpoint $CK --out-dir $TRACTOR_ROOT/distill/dst2-5000 --hands 1250 --seed 2
-   ```
-2. The control, plain PPO (can start at once):
+1. The control, plain PPO (does not depend on the labels; can start at once):
    ```bash
    sbatch -p <gpu partition> --gpus=1 research/ycrc/train.sbatch \
      --name zero2-d2c --resume $CK --steps 6000 $COMMON
    ```
-3. Distillation on the new labels, once all six shards exist:
+2. Distillation on the new labels, once all six shards exist, as `dst2`
+   (coef 1.0, lr 1e-4, 8 minibatches of 512 a step):
    ```bash
    sbatch -p <gpu partition> --gpus=1 research/ycrc/train.sbatch \
      --name zero2-dst3 --resume $CK --steps 6000 $COMMON \
-     --distill-paths "$TRACTOR_ROOT/distill/dst2-5000/shard_*.npz" \
+     --distill-paths "$TRACTOR_ROOT/distill/dst2-5000-w12k4/shard_*.npz" \
      --distill-coef 1.0 --distill-lr 1e-4 --distill-steps 8 --distill-minibatch 512
    ```
 
@@ -123,6 +155,8 @@ together. Copy records into `research/evals/<date>/` and commit them to
 `rl-research`.
 
 ## 6. E7: card by card, cold start
+
+**On hold** (2026-11-19) until the zero2 work in §4 is under way.
 
 `research/E7.md`: every play chosen card by card, the Large SwiGLU
 networks (`--arch v7`), from random initialisation. `zero2`'s
