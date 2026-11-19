@@ -2,11 +2,13 @@
 
     python scripts/tab_evals.py evals/2026-09-24/v4-final-*.jsonl
     python scripts/tab_evals.py A.jsonl B.jsonl --paired [--a step_0002000] [--b final]
+    python scripts/tab_evals.py A1.jsonl B1.jsonl A2.jsonl B2.jsonl --paired   # pooled
 
 One line per (checkpoint, pre-play, bot), then the mean over smart-v18 /
 v28 / v34 -- the three fair search bots the README tables average.
-`--paired` takes exactly two files measured on the same seed and deal
-count and prints B - A hand for hand, bot by bot. Same seed means the
+`--paired` takes two files measured on the same seed and deal count and
+prints B - A hand for hand, bot by bot; given several A/B pairs (one per
+seed, say) it prints each and then every paired hand pooled. Same seed means the
 same deals, so the difference is valid for any two runs; it is tightest
 when both sides also start play from the same positions (two
 `--pre-play random` files), and wider when pre-play differs (two burial
@@ -77,7 +79,7 @@ def table(rows: list[dict]) -> None:
               f"win att {avg('winrate_attacking'):.3f}")
 
 
-def paired(a: list[dict], b: list[dict]) -> None:
+def paired(a: list[dict], b: list[dict], pooled: tuple[list, list] | None = None) -> None:
     by_bot = {r["bot"]: r for r in a}
     print(f"{'bot':10} {'A':>6} {'B':>6} {'B - A win':>16} {'B - A points':>16}")
     pooled_w: list[float] = []
@@ -103,6 +105,9 @@ def paired(a: list[dict], b: list[dict]) -> None:
         mw, hw = mean_ci(pooled_w)
         mp, hp = mean_ci(pooled_p)
         print(f"{'v18-v34':10} {'':6} {'':6} {mw:+8.3f}±{hw:.3f} {mp:+9.2f}±{hp:.2f}")
+    if pooled is not None:
+        pooled[0].extend(pooled_w)
+        pooled[1].extend(pooled_p)
 
 
 def main() -> None:
@@ -115,11 +120,21 @@ def main() -> None:
     ap.add_argument("--b", default="", help="checkpoint filter for the second file")
     args = ap.parse_args()
     if args.paired:
-        if len(args.files) != 2:
-            raise SystemExit("--paired takes exactly two files")
-        a = [r for r in load(args.files[0]) if args.a in r["checkpoint"]]
-        b = [r for r in load(args.files[1]) if args.b in r["checkpoint"]]
-        paired(a, b)
+        if len(args.files) < 2 or len(args.files) % 2:
+            raise SystemExit("--paired takes A/B pairs of files")
+        pairs = list(zip(args.files[0::2], args.files[1::2]))
+        everything: tuple[list, list] = ([], [])
+        for fa, fb in pairs:
+            if len(pairs) > 1:
+                print(f"A = {fa}\nB = {fb}")
+            a = [r for r in load(fa) if args.a in r["checkpoint"]]
+            b = [r for r in load(fb) if args.b in r["checkpoint"]]
+            paired(a, b, everything)
+        if len(pairs) > 1 and everything[0]:
+            mw, hw = mean_ci(everything[0])
+            mp, hp = mean_ci(everything[1])
+            print(f"pooled over {len(pairs)} pairs, fair bots: B - A win {mw:+.3f}±{hw:.3f}, "
+                  f"points {mp:+.2f}±{hp:.2f} ({len(everything[0])} hands)")
     else:
         table([r for f in args.files for r in load(f)])
 
