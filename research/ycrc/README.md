@@ -83,8 +83,13 @@ per fair bot, both seeds (`research/README.md`, "Wider search"): 12 x 4 -
 8 x 3 is -0.003 +/- 0.009 win, -0.003 +/- 0.020 levels, +0.12 +/- 0.58
 points over 9,240 paired hands, at ~1.45x the cost per searched decision.
 The platform check came out at -0.001 +/- 0.001 win against the Modal
-records. **Before 4b, decide the label width**: 12 x 4 as planned, or
-8 x 3, which played as well for two thirds of the cost.
+records. Nor are 12 x 4's labels cleaner: two independent searches of
+the same position choose the same move 0.725 of the time at 12 x 4 and
+0.719 at 8 x 3 (+0.007 +/- 0.013, 7,183 positions; `research/README.md`,
+"Distillation flattened the policy"). **Before 4b, decide the label
+width**: 12 x 4 as planned, or 8 x 3, which played as well for two thirds
+of the cost. That section also lists label changes to consider (soft
+targets, agreement-filtered labels, 12 x 3); none is implemented.
 
 **All of 4b, 4c and §5's milestone evaluations in one command**, as a
 chain of Slurm jobs (`round2.sh`; job ids in `$TRACTOR_ROOT/round2-jobs.txt`):

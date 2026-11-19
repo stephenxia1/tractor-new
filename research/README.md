@@ -1547,6 +1547,61 @@ is -0.001 +/- 0.001 win and -0.01 +/- 0.07 points (seed 20260923 -0.004 +/-
 alike. Against those records 12 x 4 is -0.004 +/- 0.009 win, +0.10 +/- 0.58
 points. Records: `evals/2026-11-19/zero2-dst2-5000-f16-policy-search{12x4,8x3}-c99-*.jsonl`.
 
+### Distillation flattened the policy, and search's labels are noisy (2026-11-19)
+
+**The distilled policy is far less sure of itself.** Search acts where
+the policy's top move is below 0.99. In the evaluation records (8 x 3,
+same pipeline) that is 26-29% of decisions for the plain-PPO policies and
+65% for the distilled one:
+
+| checkpoint | share of decisions searched |
+| --- | --- |
+| `zero2-lr1e4` step 4000 (round 1's label source) | 0.287 |
+| `zero2-c1e4` step 5000 (plain PPO, the control) | 0.255 |
+| `zero2-dst2` step 5000 (distilled on round 1's labels) | **0.645** |
+
+Round 1's labels were one search's choice, one-hot, and search overruled
+the policy's top move on ~60% of the positions it labelled. A policy
+trained toward such targets spreads its mass. Round 2 from `zero2-dst2`
+therefore yields ~41 label rows a hand against ~17.
+
+**How noisy the labels are.** Positions where search acts in
+`zero2-dst2` step 5000's own play (sampled moves, as label generation
+plays), each searched twice at each width with independent world
+samples; 7,183 positions from 160 hands (`scripts/cpu_search/label_noise.py`,
+two runs pooled):
+
+| | 8 x 3 | 12 x 4 | 12 x 4 - 8 x 3 |
+| --- | --- | --- | --- |
+| two searches choose the same move | 0.719 +/- 0.010 | 0.725 +/- 0.010 | +0.007 +/- 0.013 |
+| search overrules the policy's top move | 0.535 +/- 0.012 | 0.577 +/- 0.011 | +0.042 +/- 0.011 |
+
+The two widths choose the same move on 0.663 +/- 0.011 of positions. More
+than a quarter of labels would come out different from a second search
+of the same position, at either width: 12 x 4's extra worlds are spent on
+a fourth candidate, and its labels are no cleaner. By the policy's own
+confidence (8 x 3):
+
+| policy's top move | positions | two searches agree | search overrules |
+| --- | --- | --- | --- |
+| below 0.5 | 1,865 | 0.682 | 0.628 |
+| 0.5 to 0.8 | 2,906 | 0.722 | 0.572 |
+| 0.8 to 0.95 | 1,465 | 0.734 | 0.455 |
+| 0.95 to 0.99 | 947 | 0.758 | 0.360 |
+
+Even where the policy puts 95-99% on a move, search overrules it on 36%
+of positions, and a second search disagrees with the first on a quarter:
+there, search is mostly choosing between moves its few worlds cannot
+tell apart. Both widths train toward that noise, so 12 x 4 labels should
+flatten the policy no less than 8 x 3 labels did.
+
+Changes this suggests, for the user to decide (none is made): soft
+targets from search's per-candidate values rather than one-hot choices
+(the generator would have to keep the values); labelling only positions
+where two independent searches agree (72% of them); or labels from more
+worlds at the same top 3 (12 x 3), which spends the width on the values
+rather than on another candidate.
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget
