@@ -114,3 +114,52 @@ def test_search_chooses_as_the_training_forward_does() -> None:
         assert a == b
         checked += 1
     assert checked >= 3
+
+
+# --- card-by-card networks (research/E7.md) -----------------------------------
+
+
+def test_card_mode_encode_and_value_match_the_training_forward() -> None:
+    from .test_cards_mode import CARDS, _net as cards_net
+
+    net, cache = cards_net(11).eval(), Cache()
+    fast = SearchNet(net)
+    rng = np.random.default_rng(12)
+    states = _states(1, seed=13)
+    batches = [states[i : i + 12] for i in range(0, len(states), 12)]
+    for state in states[5::20]:  # one decision's worlds: a shared prefix
+        seat = int(state.to_act)
+        batches.append([_in_world(state, sample_world(state, seat, rng)) for _ in range(8)])
+    for sims in batches:
+        packed = [_pack(_InFlight(state=s, episode=0), cache, CARDS) for s in sims]
+        obs = obs_batch_from_arrays(
+            np.stack([p.history for p in packed]), np.array([p.history_len for p in packed]),
+            np.stack([p.context for p in packed]), np.stack([p.unseen for p in packed]),
+            np.stack([p.planes for p in packed]), np.stack([p.cards for p in packed]),
+            np.stack([p.candidates for p in packed]), np.stack([p.candidate_mask for p in packed]),
+            device="cpu",
+        )
+        priv = torch.from_numpy(np.stack([p.privileged for p in packed]).astype(np.float32))
+        with torch.no_grad():
+            summary, card_states, value = net.encode(obs, priv)
+        f_summary, f_cards = fast.encode(obs)
+        assert torch.allclose(f_summary, summary, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(f_cards, card_states, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(fast.value(obs, priv), value, atol=1e-5, rtol=1e-5)
+
+
+def test_card_mode_search_is_the_same_on_the_fast_path() -> None:
+    from ..eval.search_cards import PickPolicy, beam_plays
+    from .test_cards_mode import CARDS, _net as cards_net
+
+    net, cache = cards_net(14).eval(), Cache()
+    states = _states(1, seed=15)[3::11]
+    quick, exact = PickPolicy(net, cache, CARDS, "cpu"), PickPolicy(net, cache, CARDS, "cpu", fast=False)
+    for a, b in zip(quick.play(states), exact.play(states)):
+        assert np.array_equal(a, b)
+    assert np.allclose(quick.value(states), exact.value(states), atol=1e-5)
+    for state in states:
+        p1, l1 = beam_plays(net, state, 3, cache, CARDS, "cpu")
+        p2, l2 = beam_plays(net, state, 3, cache, CARDS, "cpu", fast=False)
+        assert all(np.array_equal(x, y) for x, y in zip(p1, p2))
+        assert np.allclose(l1, l2, atol=1e-4)

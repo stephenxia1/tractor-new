@@ -328,6 +328,9 @@ def _eval_parser(sub: Any) -> None:
     p.add_argument("--search-extra-tricks", type=int, default=0)
     p.add_argument("--search-confident", type=float, default=0.9)
     p.add_argument("--candidates", default="host")
+    # Processes the shards are spread over (CPU nodes: about half the
+    # cores, since each shard's bot host is a process of its own).
+    p.add_argument("--procs", type=int, default=1)
     p.add_argument("--out", required=True)
 
 
@@ -344,9 +347,69 @@ def _load_net(checkpoint: str, device: str) -> tuple[Any, Any]:
 
 def play_pair(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
               pre_play: str, search: dict | None, device: str,
-              candidates: str = "host") -> dict:
+              candidates: str = "host", procs: int = 1) -> dict:
     """``modal_eval.py::_play`` without the volume: the same arguments,
-    the same record."""
+    the same record.
+
+    ``procs`` above 1 spreads the ``workers`` shards over that many
+    processes, each with its own copy of the networks: on a CPU node,
+    where search runs in each shard's own thread, one process's
+    interpreter lock would otherwise serialise them."""
+    if procs > 1:
+        return _play_pair_procs(checkpoint, bot, deals, seed, workers, pre_play, search,
+                                device, candidates, procs)
+    stats, cfg, declare_net = _play_shards(checkpoint, bot, deals, seed, workers, pre_play,
+                                          search, device, candidates, None)
+    return _record(stats, cfg, declare_net is not None, checkpoint, bot, pre_play, search,
+                   candidates, seed)
+
+
+def _record(stats: dict, cfg: Any, declared: bool, checkpoint: str, bot: str, pre_play: str,
+            search: dict | None, candidates: str, seed: int) -> dict:
+    stats.update(checkpoint=checkpoint, bot=bot, pre_play=pre_play, search=search,
+                 # What the network was actually shown: card mode has no list.
+                 candidates="cards" if cfg.cards_mode else candidates,
+                 declare_net=declared, seed=seed)
+    return stats
+
+
+def _play_shards_worker(args: tuple) -> dict:
+    stats, _cfg, _declare = _play_shards(*args)
+    return stats
+
+
+def _play_pair_procs(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
+                     pre_play: str, search: dict | None, device: str, candidates: str,
+                     procs: int) -> dict:
+    import multiprocessing as mp
+
+    from .eval.bots import summarise_hands
+
+    started = time.perf_counter()
+    shards = max(1, min(int(workers), int(deals)))
+    procs = max(1, min(int(procs), shards))
+    jobs = [(checkpoint, bot, deals, seed, workers, pre_play, search, device, candidates,
+             [k for k in range(shards) if k % procs == p]) for p in range(procs)]
+    with mp.get_context("spawn").Pool(procs) as pool:
+        parts = pool.map(_play_shards_worker, jobs)
+    merged: dict = {}
+    for part in parts:
+        merged.update(part["halves"])
+    if len(merged) != deals:
+        raise RuntimeError(f"asked for {deals} deals, the processes reported {len(merged)}")
+    stats = summarise_hands(merged, sum(p["searched"] for p in parts), per_hand=True)
+    _net, cfg = _load_net(checkpoint, "cpu")
+    stats["seconds"] = time.perf_counter() - started
+    declared = pre_play in ("agent", "agent-heur", "agent-critic", "agent-policy")
+    return _record(stats, cfg, declared, checkpoint, bot, pre_play, search, candidates, seed)
+
+
+def _play_shards(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
+                 pre_play: str, search: dict | None, device: str, candidates: str,
+                 subset: list | None) -> tuple[dict, Any, Any]:
+    """One process's part of an evaluation: ``subset`` of the shards, or
+    all of them. -> ``(stats, cfg, declare_net)``; with a subset the
+    stats are the raw hands."""
     import torch
 
     from .eval.bots import play_against_bot
@@ -378,13 +441,10 @@ def play_pair(checkpoint: str, bot: str, deals: int, seed: int, workers: int,
         bury=(BuryConfig(evaluator="critic", worlds=8, rounds=8)
               if pre_play == "agent-critic" else
               BuryConfig(rounds=0 if pre_play == "agent-heur" else 8, consider=12)),
-        candidates=candidates)
-    stats.update(seconds=time.perf_counter() - started, checkpoint=checkpoint, bot=bot,
-                 pre_play=pre_play, search=search,
-                 # What the network was actually shown: card mode has no list.
-                 candidates="cards" if cfg.cards_mode else candidates,
-                 declare_net=declare_net is not None, seed=seed)
-    return stats
+        candidates=candidates, shard_subset=subset, raw=subset is not None)
+    if subset is None:
+        stats["seconds"] = time.perf_counter() - started
+    return stats, cfg, declare_net
 
 
 def run_eval(a: argparse.Namespace) -> int:
@@ -409,7 +469,7 @@ def run_eval(a: argparse.Namespace) -> int:
             print(f"{bot}: already measured", flush=True)
             continue
         r = play_pair(a.checkpoint, bot, a.deals, a.seed, a.workers, a.pre_play, search,
-                      device, a.candidates)
+                      device, a.candidates, procs=a.procs)
         with out.open("a") as fh:
             fh.write(json.dumps(r) + "\n")
         print(f"{bot:10} win {r['winrate']:.3f}  levels {r['levels']:+.3f}  "

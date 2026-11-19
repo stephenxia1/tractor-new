@@ -651,8 +651,15 @@ def play_against_bot(
     bury: BuryConfig | None = None,
     bury_net: Any = None,
     candidates: str = "host",
+    shard_subset: Sequence[int] | None = None,
+    raw: bool = False,
 ) -> dict[str, Any]:
     """Duplicate-score ``net`` against the engine's ``bot``.
+
+    ``shard_subset`` plays only those of the ``workers`` shards, and
+    ``raw`` returns the hands played (``{"halves", "searched"}``) for
+    ``summarise_hands`` to score once every subset is in: how
+    ``tractor.cluster eval --procs`` spreads the shards over processes.
 
     ``candidates`` says who lists the network's moves: ``"host"``, the
     engine's enumerator (every measurement before 2026-11-14), or
@@ -799,24 +806,34 @@ def play_against_bot(
 
     searched: dict[int, int] = {}
     merged: dict[int, dict[int, _Half]] = {}
+    mine = list(range(shards)) if shard_subset is None else [
+        int(k) for k in shard_subset if 0 <= int(k) < shards
+    ]
     try:
-        if shards == 1:
-            merged = run_shard(0)
-        else:
-            with ThreadPoolExecutor(max_workers=shards) as pool:
-                for part in pool.map(run_shard, range(shards)):
+        if len(mine) == 1:
+            merged = run_shard(mine[0])
+        elif mine:
+            with ThreadPoolExecutor(max_workers=len(mine)) as pool:
+                for part in pool.map(run_shard, mine):
                     merged.update(part)
     finally:
         if was_training and hasattr(net, "train"):
             net.train()
 
+    if raw:
+        return {"halves": merged, "searched": float(sum(searched.values()))}
     if len(merged) != num_deals:
         raise HostError(
             f"asked for {num_deals} deals, {shards} shard(s) reported "
             f"{len(merged)}"
         )
+    return summarise_hands(merged, float(sum(searched.values())), per_hand)
+
+
+def summarise_hands(merged: dict, searched: float, per_hand: bool = False) -> dict[str, Any]:
+    """The record ``play_against_bot`` returns, from the hands played."""
     stats: dict[str, Any] = summarise(merged)
-    stats["searched_decisions"] = float(sum(searched.values()))
+    stats["searched_decisions"] = float(searched)
     stats["learner_blocked"] = float(
         sum(h.learner_blocked for halves in merged.values() for h in halves.values())
     )

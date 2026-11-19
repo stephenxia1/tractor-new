@@ -104,13 +104,17 @@ def sample_plays(
     temperature: float,
     greedy: bool,
     rng: np.random.Generator,
+    encode: Callable[[Any, Any, torch.Tensor], tuple] | None = None,
 ) -> PickBatch:
     """Each row's play, picked card by card through its owner's network.
 
     ``rules[i]`` is row ``i``'s ``sim.picks.PickRules``. Owners are
     visited in index order and draw from ``rng`` in turn, as
-    ``rollout.routed_step`` does for whole moves.
+    ``rollout.routed_step`` does for whole moves. ``encode(net, obs,
+    privileged)`` replaces ``actor_encode`` (search passes its CPU
+    forward, ``eval/fastnet.py``); a ``None`` value leaves the values 0.
     """
+    encode = encode or actor_encode
     n = len(owner)
     out = PickBatch(
         prefix=np.zeros((n, MAX_PICKS, NUM_TYPES), dtype=np.float16),
@@ -124,8 +128,9 @@ def sample_plays(
         idx = np.nonzero(owner == agent)[0]
         net = nets[int(agent)]
         obs, privileged = gather(idx)
-        summary, card_states, value = actor_encode(net, obs, privileged)
-        out.value[idx] = value.detach().float().cpu().numpy()
+        summary, card_states, value = encode(net, obs, privileged)
+        if value is not None:
+            out.value[idx] = value.detach().float().cpu().numpy()
         picker = _picker(net)
         picked = np.zeros((len(idx), NUM_TYPES), dtype=np.int8)
         last = np.full(len(idx), -1, dtype=np.int64)

@@ -31,6 +31,7 @@ from ..sim.state import PlayState
 from ..train.buffer import obs_batch_from_arrays
 from ..train.pick_rollout import _picker, actor_encode, sample_plays
 from ..train.rollout import _InFlight, _pack
+from .fastnet import SearchNet
 from .search import SearchConfig, search_plays
 
 __all__ = ["PickPolicy", "beam_plays", "search_cards_move"]
@@ -58,11 +59,18 @@ def _batch(states: Sequence[PlayState], cache: Cache, cfg: ModelConfig, device: 
 class PickPolicy:
     """A card-by-card ``ActorCritic`` as ``search_plays`` uses it."""
 
-    def __init__(self, net: Any, cache: Cache, cfg: ModelConfig, device: Any) -> None:
+    def __init__(self, net: Any, cache: Cache, cfg: ModelConfig, device: Any,
+                 fast: bool = True) -> None:
         if not cfg.cards_mode:
             raise ValueError("PickPolicy is for card-by-card networks")
         self.net, self.cache, self.cfg = net, cache, cfg
         self.device = torch.device(device)
+        # Search's CPU forward, as the candidate-list policy uses it.
+        self.fast = SearchNet(net) if fast else None
+
+    def _encode(self, net: Any, obs: Any, privileged: torch.Tensor):
+        summary, cards = self.fast.encode(obs)
+        return summary, cards, None
 
     def play(self, states: Sequence[PlayState]) -> list[np.ndarray]:
         packed, obs, privileged = _batch(states, self.cache, self.cfg, self.device)
@@ -71,6 +79,7 @@ class PickPolicy:
                 [self.net], np.zeros(len(states), dtype=np.int64),
                 lambda idx: (obs, privileged), [p.rules for p in packed],
                 1.0, True, np.random.default_rng(0),
+                encode=self._encode if self.fast is not None else None,
             )
         return [picks.play[i].copy() for i in range(len(states))]
 
@@ -79,18 +88,25 @@ class PickPolicy:
             return np.zeros(0, dtype=np.float64)
         _packed, obs, privileged = _batch(states, self.cache, self.cfg, self.device)
         with torch.no_grad():
-            _summary, _cards, value = actor_encode(self.net, obs, privileged)
+            if self.fast is not None:
+                value = self.fast.value(obs, privileged)
+            else:
+                value = actor_encode(self.net, obs, privileged)[2]
         return value.float().cpu().numpy().astype(np.float64)
 
 
 def beam_plays(net: Any, state: PlayState, k: int, cache: Cache, cfg: ModelConfig,
-               device: Any, width: int = 16) -> tuple[list[np.ndarray], np.ndarray]:
+               device: Any, width: int = 16,
+               fast: bool = True) -> tuple[list[np.ndarray], np.ndarray]:
     """``(plays, log-probabilities)``: the seat to act's ``k`` most probable
     plays (fewer if fewer exist), best first."""
     packed, obs, privileged = _batch([state], cache, cfg, torch.device(device))
     rules = packed[0].rules
     with torch.no_grad():
-        summary, card_states, _value = actor_encode(net, obs, privileged)
+        if fast:
+            summary, card_states = SearchNet(net).encode(obs)
+        else:
+            summary, card_states, _value = actor_encode(net, obs, privileged)
     picker = _picker(net)
     # Live prefixes: (picked counts, last type, log-probability, step).
     live: list[tuple[np.ndarray, int, float, int]] = [

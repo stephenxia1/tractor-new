@@ -89,6 +89,12 @@ for SEED in 20260923 20261114; do
 done
 ```
 
+Or on a CPU partition, which search now runs well on (§5b): the same
+jobs with `-p <cpu partition>` and no `--gpus`, plus `--procs 16`, which
+spreads the 32 shards over 16 processes (each shard's bot host is a
+process of its own). The bots' own search dominates the time there:
+`smart-v34` thinks ~0.7 s a decision against ~0.2 s for 12 x 4.
+
 A platform check alongside (one bot, no search, about half an hour): its
 per-deal results should match the Modal record
 `zero2-dst2-5000-policy.jsonl` deal for deal. If they do, the paired

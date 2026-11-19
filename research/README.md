@@ -1492,8 +1492,9 @@ What it buys: a hand is ~100 decisions, two thirds searched, so ~14 s of
 one core and ~65 label rows at 12 x 4. A 1,250-hand shard is about 10
 minutes on 32 cores, where an A10G took about an hour at 8 x 3.
 
-Built on it (`train/labels.py`): `cluster gen --workers` for a fixed
-shard on CPUs; `cluster follow` (`ycrc/follow.sbatch`), CPU processes
+Built on it (`train/labels.py`): `cluster eval --procs`, an evaluation's
+shards spread over processes rather than threads of one (the same
+record, per deal); `cluster gen --workers` for a fixed shard on CPUs; `cluster follow` (`ycrc/follow.sbatch`), CPU processes
 that follow a training run's newest checkpoint and keep writing shards
 into a rolling directory; and `--distill-reload-every` /
 `--distill-window-rows`, which make `train/distill.py` reread the newest
@@ -1501,7 +1502,9 @@ shards every N steps instead of loading them once, logging the label lag.
 The search itself (`search_plays`) now takes a policy rather than a
 network, so a card-by-card network can use it with its root plays from a
 beam over picks (`eval/search_cards.py`; checked, not yet wired in while
-E7 is on hold).
+E7 is on hold). The CPU forward serves card mode too (`SearchNet.encode`,
+the card critic): at v7's sizes a 12 x 4 search costs ~1.6 s a decision
+on one core against ~6.0 s through the training forward.
 
 ## Next steps
 

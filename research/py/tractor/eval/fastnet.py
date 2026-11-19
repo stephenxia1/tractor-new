@@ -59,15 +59,14 @@ _REL_SEATS = 4
 
 
 class SearchNet:
-    """``logits`` and ``value`` for a candidate-list ``ActorCritic``,
+    """``logits`` and ``value`` for a candidate-list ``ActorCritic``, or
+    ``encode`` and ``value`` for a card-by-card one (research/E7.md),
     computed as its forward computes them."""
 
     def __init__(self, net: Any) -> None:
         actor = getattr(net, "actor", None)
         if actor is None or getattr(net, "critic", None) is None:
             raise ValueError("search needs an ActorCritic with its own critic")
-        if actor.cfg.cards_mode:
-            raise ValueError("SearchNet scores candidate lists; card mode has its own policy")
         self.net = net
         self.actor = actor
         self.critic = net.critic
@@ -79,9 +78,20 @@ class SearchNet:
     def logits(self, obs: ObsBatch) -> Tensor:
         """float32[B, C]: the policy's logits, ``MASK_LOGIT`` where no
         candidate is (C as in ``obs``)."""
+        if self.cfg.cards_mode:
+            raise ValueError("a card-by-card network has no candidate list: use encode")
         hist = self._history(obs.history, obs.history_len)
         summary = self._summary(obs, hist)
         return self._score(summary, obs)
+
+    @torch.no_grad()
+    def encode(self, obs: ObsBatch) -> tuple[Tensor, Tensor]:
+        """Card mode: ``(summary [B, d], card states [B, 54, d])``, what
+        ``TractorNet.encode`` returns for the pick head."""
+        if not self.cfg.cards_mode:
+            raise ValueError("encode is the card-by-card network's; use logits")
+        hist = self._history(obs.history, obs.history_len)
+        return self._summary(obs, hist, with_cards=True)
 
     @torch.no_grad()
     def value(self, obs: ObsBatch, privileged: Tensor) -> Tensor:
@@ -155,7 +165,7 @@ class SearchNet:
 
     # --- the query block, held cards only ---------------------------------
 
-    def _summary(self, obs: ObsBatch, hist: "_History") -> Tensor:
+    def _summary(self, obs: ObsBatch, hist: "_History", with_cards: bool = False):
         q = self.actor.query
         tokens, token_mask = q.build_tokens(obs)
         b, _n, d = tokens.shape
@@ -181,12 +191,22 @@ class SearchNet:
         # prefix's (the sink and its history) once per group.
         mem_kv = [_mem_kv(block.ca.kv, mem, hist.groups) for block in q.blocks]
 
-        for block, (k, v) in zip(q.blocks[:-1], mem_kv[:-1]):
+        # Card mode reads every held card's final state, so its last layer
+        # runs in full; otherwise only the context token's.
+        full = q.blocks if with_cards else q.blocks[:-1]
+        for block, (k, v) in zip(full, mem_kv):
             x = x + block.sa(block.norm_sa(x), attn_mask=token_attn)
             ca = block.ca
             x = x + ca.proj(_sdpa(ca.q(block.norm_ca(x)), k, v, ca.n_heads, mem_attn))
             x = x + block.ff(block.norm_ff(x))
             x = x * gate
+        if with_cards:
+            out = q.out_norm(x) * gate
+            # Back to the 61 token slots; dropped ones (cards not held)
+            # stay zero, as the training forward's ``* held`` leaves them.
+            slots = torch.zeros(b, tokens.shape[1], d, dtype=out.dtype, device=out.device)
+            slots.scatter_(1, idx.unsqueeze(-1).expand(b, width, d), out)
+            return slots[:, _CONTEXT], slots[:, _FIXED:]
         x0 = self._last_block(q.blocks[-1], x, token_attn, mem_kv[-1], mem_attn)
         return q.out_norm(x0)
 

@@ -482,6 +482,30 @@ def test_a_real_match_against_the_engine() -> None:
     )
 
 
+def test_shard_subsets_merge_to_the_whole_match() -> None:
+    """``shard_subset`` + ``raw`` (``cluster eval --procs``): the shards
+    played in separate calls and merged score exactly as one call. NEEDS NODE."""
+    if shutil.which("npx") is None:
+        print("    SKIPPED: npx is not on PATH, so the TypeScript host cannot run")
+        return
+    import torch
+
+    from ..eval.bots import summarise_hands
+
+    cfg = _tiny()
+    torch.manual_seed(3)
+    net = ActorCritic(cfg)
+    kw = dict(cfg=cfg, num_deals=4, seed=77, max_candidates=MOVE_CAP, workers=2,
+              per_hand=True)
+    whole = _with_deadline(lambda: play_against_bot(net, "lowball", **kw), 600)
+    parts = [_with_deadline(lambda k=k: play_against_bot(
+        net, "lowball", shard_subset=[k], raw=True, **kw), 600) for k in (0, 1)]
+    merged = {**parts[0]["halves"], **parts[1]["halves"]}
+    again = summarise_hands(merged, parts[0]["searched"] + parts[1]["searched"], per_hand=True)
+    for key in ("winrate", "levels", "points", "per_hand_wins", "per_deal_points", "hands"):
+        assert again[key] == whole[key], key
+
+
 def test_sim_candidates_are_the_rollouts_list() -> None:
     """``candidates="sim"`` shows the network what training showed it.
 

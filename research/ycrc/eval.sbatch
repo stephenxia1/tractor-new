@@ -6,6 +6,8 @@
 #     --checkpoint "$TRACTOR_ROOT/zero2-dst3/milestones/step_0005250.pt" \
 #     --out "$TRACTOR_ROOT/evals/zero2-dst3-5250-policy.jsonl"
 # Add --search-worlds 8 --search-confident 0.99 for search.
+# On a CPU partition (no --gpus) add --procs 16: the shards then run in
+# 16 processes rather than as threads of one (tractor.cluster eval).
 #SBATCH --job-name=tractor-eval
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=48G
