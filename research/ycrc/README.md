@@ -222,12 +222,26 @@ RUN=zero2-live
 sbatch -p <gpu partition> --gpus=1 research/ycrc/train.sbatch \
   --name $RUN --resume $CK --steps 6000 $COMMON \
   --distill-paths "$TRACTOR_ROOT/distill/$RUN/s*.npz" --distill-reload-every 25 \
-  --distill-window-rows 200000 \
+  --distill-window-rows 200000 --distill-max-age 150 \
   --distill-coef 1.0 --distill-lr 1e-4 --distill-steps 8 --distill-minibatch 512
 sbatch -p <cpu partition> --array=0-1 research/ycrc/follow.sbatch \
   --run-dir $TRACTOR_ROOT/$RUN --out-dir $TRACTOR_ROOT/distill/$RUN \
-  --hands 16 --worlds 12 --top-k 4 --confident 0.99 --keep 100
+  --hands 16 --worlds 12 --top-k 4 --confident 0.99 --keep 100 \
+  --initial-checkpoint auto
 ```
+
+`--initial-checkpoint auto` labels from the checkpoint the run resumed
+from (its `launch.json`) until the run writes one of its own, a
+checkpoint interval in; without it the followers wait and those first
+steps train undistilled. `--distill-max-age 150` leaves out shards
+labelled more than 150 steps ago (three checkpoint intervals), so a
+follower that falls behind -- queued, requeued -- stops the distillation
+rather than leaving it on old labels; each refresh logs
+`ppo/distill/label_age_mean`, `label_age_max` and `shards_too_old`
+beside `label_lag`, `rows` and `shards`. A requeued trainer rereads the
+window at its first step, and its checkpoints carry the distiller's
+optimiser (about 85 MB more each, live runs only), so the requeue
+resumes its moments. With none of these flags a run is as before.
 
 Sizing: `dst2`'s settings read 8 x 512 = 4,096 label rows a step. At
 ~18 s a step (Modal's H100; slower GPUs take longer) that is ~230 rows a

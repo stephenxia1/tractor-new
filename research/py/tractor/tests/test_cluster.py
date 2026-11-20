@@ -31,6 +31,26 @@ def test_zero2_dst2_flags():
     assert o["bury_policy"] and o["buffer_capacity"] == 1024 * 100
 
 
+def test_live_distill_flags():
+    o = cluster.train_overrides(_parse([
+        "--distill-paths", "/d/s*.npz", "--distill-reload-every", "25",
+        "--distill-window-rows", "200000", "--distill-max-age", "150"]))
+    assert o["distill"]["reload_every"] == 25 and o["distill"]["window_rows"] == 200000
+    assert o["distill"]["max_age"] == 150
+    # Unset, the key is absent: a run without it keeps its config as before.
+    o = cluster.train_overrides(_parse(["--distill-paths", "/d/s*.npz",
+                                        "--distill-reload-every", "25"]))
+    assert "max_age" not in o["distill"]
+
+
+def test_follow_initial_checkpoint_flag():
+    ap = argparse.ArgumentParser()
+    cluster._follow_parser(ap.add_subparsers(dest="cmd"))
+    base = ["follow", "--run-dir", "r", "--out-dir", "o"]
+    assert ap.parse_args(base).initial_checkpoint == ""
+    assert ap.parse_args([*base, "--initial-checkpoint", "auto"]).initial_checkpoint == "auto"
+
+
 def test_defaults_and_v6():
     o = cluster.train_overrides(_parse(["--arch", "v6"]))
     assert o["rollout_forwards"] == "eager" and o["distill"] == {} and o["bury_train"] == {}

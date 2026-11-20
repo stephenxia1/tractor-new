@@ -108,6 +108,8 @@ def _train_parser(sub: Any) -> None:
     # every this many steps, up to --distill-window-rows rows (0: all).
     p.add_argument("--distill-reload-every", type=int, default=0)
     p.add_argument("--distill-window-rows", type=int, default=0)
+    # ... and none labelled more than this many steps ago (0: any age).
+    p.add_argument("--distill-max-age", type=int, default=0)
     p.add_argument("--declare-reward", default="critic")
     p.add_argument("--action-space", default="", choices=("", "candidates", "cards"))
 
@@ -175,7 +177,8 @@ def train_overrides(a: argparse.Namespace) -> dict:
         "distill": ({"paths": a.distill_paths, "coef": a.distill_coef, "lr": a.distill_lr,
                      "steps": a.distill_steps, "minibatch": a.distill_minibatch,
                      "reload_every": a.distill_reload_every,
-                     "window_rows": a.distill_window_rows}
+                     "window_rows": a.distill_window_rows,
+                     **({"max_age": a.distill_max_age} if a.distill_max_age else {})}
                     if a.distill_paths else {}),
     }
 
@@ -496,6 +499,9 @@ def _follow_parser(sub: Any) -> None:
     p.add_argument("--keep", type=int, default=50, help="each worker's newest shards kept")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--poll-s", type=float, default=60.0)
+    p.add_argument("--initial-checkpoint", default="",
+                   help="label from this checkpoint until the run writes one of its own; "
+                        "'auto': the one it resumed from (launch.json). '' waits")
 
 
 def run_follow(a: argparse.Namespace) -> int:
@@ -506,7 +512,7 @@ def run_follow(a: argparse.Namespace) -> int:
                           extra_tricks=a.extra_tricks)
     written = follow_pool(a.workers, run_dir=a.run_dir, out_dir=a.out_dir, hands=a.hands,
                           search=search, seed=a.seed, task=a.task, keep=a.keep,
-                          poll_s=a.poll_s)
+                          poll_s=a.poll_s, initial=a.initial_checkpoint)
     print(json.dumps({"run_dir": a.run_dir, "task": a.task, "workers": a.workers,
                       "shards": written}), flush=True)
     return 0

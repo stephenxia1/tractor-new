@@ -155,18 +155,19 @@ class Distiller:
     def __init__(self, net: Any, rows: DistillRows | None, device: Any, lr: float = 1e-5,
                  minibatch: int = 512, coef: float = 1.0, max_grad_norm: float = 0.5,
                  bf16: bool = True, source: str | None = None,
-                 window_rows: int = 0) -> None:
+                 window_rows: int = 0, max_age: int = 0) -> None:
         """``rows`` fixed for the run, or ``source`` (a shard glob) read by
-        ``refresh`` -- the newest shards up to ``window_rows`` rows -- for
-        labels made while the run trains (``train/labels.py``). Until a
-        refresh finds any, ``step`` does nothing."""
+        ``refresh`` -- the newest shards up to ``window_rows`` rows, none
+        older than ``max_age`` steps (0: any age) -- for labels made while
+        the run trains (``train/labels.py``). Until a refresh finds any,
+        ``step`` does nothing."""
         self.net = net
         self.rows = rows
         self.fresh = None
         if source is not None:
             from .labels import FreshRows
 
-            self.fresh = FreshRows(source, window_rows)
+            self.fresh = FreshRows(source, window_rows, max_age)
         self.device = torch.device(device)
         self.minibatch = int(minibatch)
         self.coef = float(coef)
@@ -175,13 +176,18 @@ class Distiller:
         self.opt = torch.optim.AdamW(self.params, lr=lr, weight_decay=0.0)
         self.amp = bool(bf16) and self.device.type == "cuda"
 
-    def refresh(self) -> dict[str, float]:
-        """Reload the freshest shards from ``source``. -> metrics."""
+    def refresh(self, step: int | None = None) -> dict[str, float]:
+        """Reload the freshest shards from ``source``; ``step``, the
+        trainer's, ages them. -> metrics."""
         if self.fresh is None:
             return {}
-        rows, metrics = self.fresh.load()
+        rows, metrics = self.fresh.load(step)
         if rows is not None:
             self.rows = rows
+        elif self.fresh.max_age > 0:
+            # Every shard is past its age: stop distilling rather than
+            # keep fitting the last window, until fresh labels arrive.
+            self.rows = None
         return metrics
 
     def step(self, n_minibatches: int, rng: np.random.Generator) -> dict[str, float]:

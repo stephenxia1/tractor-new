@@ -471,21 +471,26 @@ def train(
     )
 
     def extra() -> dict | None:
-        if not full_hand:
-            return None
-        out = {"declare": {
-            "model": declare_net.state_dict(),
-            "optimizer": declare_learner.opt.state_dict(),
-            "phases_done": phases_done,
-            "config": asdict(declare_net.cfg),
-        }}
-        if bury_net is not None:
-            out["bury"] = {
-                "model": bury_net.state_dict(),
-                "optimizer": bury_learner.opt.state_dict(),
-                "config": asdict(bury_net.cfg),
+        out: dict = {}
+        if full_hand:
+            out["declare"] = {
+                "model": declare_net.state_dict(),
+                "optimizer": declare_learner.opt.state_dict(),
+                "phases_done": phases_done,
+                "config": asdict(declare_net.cfg),
             }
-        return out
+            if bury_net is not None:
+                out["bury"] = {
+                    "model": bury_net.state_dict(),
+                    "optimizer": bury_learner.opt.state_dict(),
+                    "config": asdict(bury_net.cfg),
+                }
+        if distiller is not None and distiller.fresh is not None:
+            # Labels made beside training: the distiller's optimiser rides
+            # along, so a requeue resumes its moments rather than zeroing
+            # them. Fixed shards keep the checkpoint as it was.
+            out["distill"] = {"optimizer": distiller.opt.state_dict()}
+        return out or None
 
     # A hand can take one deal's worth of rows per seat, and `collect`
     # refuses to start a hand it cannot guarantee room for -- so a
@@ -518,7 +523,16 @@ def train(
             coef=float(cfg.distill.get("coef", 1.0)),
             source=cfg.distill["paths"] if reload_every else None,
             window_rows=int(cfg.distill.get("window_rows", 0)),
+            max_age=int(cfg.distill.get("max_age", 0)),
         )
+        if reload_every and resume is not None and Path(resume).exists():
+            saved = torch.load(Path(resume), map_location="cpu",
+                               weights_only=False).get("distill")
+            if saved is not None:
+                distiller.opt.load_state_dict(saved["optimizer"])
+                # The config's learning rate, not the checkpoint's, as for PPO.
+                for group in distiller.opt.param_groups:
+                    group["lr"] = float(cfg.distill.get("lr", 1e-5))
     # Started before the first step and closed in the `finally` below,
     # so worker start-up is paid once for the run and not once a step.
     rollout_pool = (
@@ -638,7 +652,7 @@ def train(
                 with spans.span("distill"):
                     every = int(cfg.distill.get("reload_every", 0))
                     if every and (step - start) % every == 0:
-                        fresh = distiller.refresh()
+                        fresh = distiller.refresh(step)
                         if "distill/label_step_max" in fresh:
                             # How far the newest labels trail the policy.
                             fresh["distill/label_lag"] = step - fresh["distill/label_step_max"]
