@@ -60,10 +60,16 @@ modal volume get tractor-rl zero2-dst2/milestones/step_0005000.pt $TRACTOR_ROOT/
 srun -p <gpu partition> --gpus=1 -c 8 --mem=32G -t 30:00 --pty bash
 source research/ycrc/env.sh && cd research/py
 python -m tractor.cluster train --root $TRACTOR_ROOT --name smoke --overwrite \
-  --steps 2 --hands 16 --rollout-workers 4 --eval-every 0 --checkpoint-every 1 \
+  --steps 5002 --hands 16 --rollout-workers 4 --eval-every 0 --checkpoint-every 1 \
+  --milestone-every 1 \
   --warmup-steps 1 --play-phase-steps 1 --declare-phase-steps 1 --declare-hands 16 \
   --bury-policy --resume $TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt
 ```
+
+`--steps` is the total, not a count from the checkpoint: resumed at step
+5,000, `--steps 2` trains nothing and only writes `final.pt`. 5002 runs two
+steps, each with a declaration phase, and `--milestone-every 1` copies both
+to `milestones/`.
 
 ## 4. Wider search, then expert iteration round 2
 
