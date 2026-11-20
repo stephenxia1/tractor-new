@@ -1,0 +1,1 @@
+research/scratch-v35/results/bury_v1play.jsonl: 2000 deals  X better by -0.23±1.01 attacker points, landlord win -0.029±0.020; kitty pts X 0.1 Y 9.3
