@@ -66,6 +66,9 @@ export type SlotOptions = {
   readonly baselineBotBySeat?: ReadonlyArray<BotType | undefined>;
   // Bot used for declaration and kitty burial at every seat.
   readonly prePlayBot?: BotType;
+  // Per-seat override of `prePlayBot`, indexed by seat, so that in a
+  // bot-vs-bot match each team declares and buries with its own bot.
+  readonly prePlayBotBySeat?: ReadonlyArray<BotType | undefined>;
   // Replace the pre-play bot with the Python generator's draw
   // (tractor/gen/episode.py): one declaration uniform over every legal
   // (seat, declaration), no overrides, and a burial uniform over the
@@ -576,7 +579,7 @@ export class GameSlot {
   }
 
   private botDeclares(seat: Seat): boolean {
-    const action = pickBotAction(this.state, seat, this.prePlayBot);
+    const action = pickBotAction(this.state, seat, this.prePlayBotFor(seat));
     if (action.kind !== 'declare') return false;
     const event = this.toEvent(action, seat);
     if (event === null) return false;
@@ -695,7 +698,7 @@ export class GameSlot {
     }
     const numPlayers = this.state.config.numPlayers;
     for (let seat = 0; seat < numPlayers; seat++) {
-      const action = pickBotAction(this.state, seat, this.prePlayBot);
+      const action = pickBotAction(this.state, seat, this.prePlayBotFor(seat));
       if (action.kind === 'wait') continue;
       const event = this.toEvent(action, seat);
       if (event === null) continue;
@@ -793,7 +796,7 @@ export class GameSlot {
       this.apply({ kind: 'replace_kitty', seat, cards });
       return;
     }
-    const action = pickBotAction(this.state, seat, this.prePlayBot);
+    const action = pickBotAction(this.state, seat, this.prePlayBotFor(seat));
     if (action.kind !== 'replace_kitty') {
       throw new Error(`expected replace_kitty from bot, got ${action.kind}`);
     }
@@ -841,6 +844,10 @@ export class GameSlot {
 
   private botForSeat(seat: Seat): BotType {
     return this.opts.baselineBotBySeat?.[seat] ?? this.baselineBot;
+  }
+
+  private prePlayBotFor(seat: Seat): BotType {
+    return this.opts.prePlayBotBySeat?.[seat] ?? this.prePlayBot;
   }
 
   private playWithBot(seat: Seat, bot: BotType): void {

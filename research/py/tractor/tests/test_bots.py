@@ -577,6 +577,38 @@ def test_a_real_match_on_the_simulators_candidates() -> None:
     )
 
 
+def test_smart_v35_is_measurable_but_not_a_ladder_rung() -> None:
+    """``smart-v35``, the harder fair benchmark, resolves by name through
+    the host like the other fair bots (``cluster eval --bots smart-v35``).
+    NEEDS NODE.
+
+    It is evaluation only, so it is not in ``LADDER`` or the cluster's
+    default ``FAIR`` set, which in-loop evaluation during training reads:
+    nothing should ever train against it or be tuned to it in passing.
+    """
+    from ..cluster import FAIR
+    from ..eval.bots import LADDER, resolve_bots
+
+    assert "smart-v35" not in LADDER
+    assert "smart-v35" not in FAIR.split(",")
+    assert resolve_bots(["smart-v35"]) == ("smart-v35",)
+    if shutil.which("npx") is None:
+        print("    SKIPPED: npx is not on PATH, so the TypeScript host cannot run")
+        return
+    cfg = _tiny()
+    net = ActorCritic(cfg)
+    stats = _with_deadline(
+        lambda: play_against_bot(
+            net, "smart-v35", cfg=cfg, num_deals=1, seed=4244, max_candidates=MOVE_CAP,
+        ),
+        900,
+    )
+    assert stats["deals"] == 1.0
+    assert stats["decisions"] > 0.0
+    print(f"    untrained vs smart-v35: {stats['points']:+.1f} points, "
+          f"{int(stats['decisions'])} decisions")
+
+
 def main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

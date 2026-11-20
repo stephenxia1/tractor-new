@@ -1,7 +1,7 @@
 import { effectiveSuit, compareCards, isTrump, naturalRankIndex } from './ordering';
 import { findNKinds, findTractors } from './combos';
 import { classifyCombo, comboBeats, type ClassifiedCombo } from './classifier';
-import { pointsForCard, sumPoints } from './scoring';
+import { computeHandResult, pointsForCard, sumPoints } from './scoring';
 import {
   declarationTier,
   teamOf,
@@ -13,7 +13,8 @@ import {
 } from './state';
 import { availableDeclarationsFor } from './declareEnum';
 import { applyEvent, nextToPlay } from './reducer';
-import { legalEvents } from './legalActions';
+import { legalActions, legalEvents } from './legalActions';
+import { enumerateCandidates } from './rl/v2/candidates';
 import { buildDeck } from './deck';
 import { mulberry32, shuffle } from './prng';
 import {
@@ -89,7 +90,8 @@ export type BotType =
   | 'smart-v31'      // v18 play-phase + smarter declare + smarter bury
   | 'smart-v33'      // v18 clone with lead bonus weight reduced 0.15 -> 0.10
   | 'smart-v34'      // v18 clone with lead bonus weight reduced 0.15 -> 0.05
-  | 'rl-mlp'         // small-MLP policy trained via REINFORCE self-play
+  | 'smart-v35'      // fair search: worlds from public constraints, rollouts to the hand's end; evaluation only
+  | 'rl-mlp'        // small-MLP policy trained via REINFORCE self-play
   | 'rl-dmc'         // DMC self-play, three Q-nets (landlord / defender / attacker)
   | 'rl-v2'          // DMC self-play, points-target net with history attention + CTDE critic
   | 'rl-v2-search'   // rl-v2 + determinized search, worlds weighted by the belief head
@@ -129,6 +131,7 @@ export const BOT_TYPES: ReadonlyArray<BotType> = [
   'smart-v31',
   'smart-v33',
   'smart-v34',
+  'smart-v35',
   'rl-mlp',
   'rl-dmc',
   'rl-v2',
@@ -225,6 +228,8 @@ export function botTypeLabel(t: BotType): string {
       return 'v33: Ganges (lead bonus 0.10)';
     case 'smart-v34':
       return 'Medium';
+    case 'smart-v35':
+      return 'v35: Hard (benchmark)';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
     case 'rl-dmc':
@@ -441,6 +446,9 @@ function pickBotActionUnguarded(
   }
   if (type === 'smart-v34') {
     return pickSmartV34(state, seat);
+  }
+  if (type === 'smart-v35') {
+    return pickSmartV35(state, seat);
   }
   if (type === 'rl-mlp') {
     return rlMlpAgent()(state, seat);
@@ -6709,4 +6717,768 @@ function scoreCandidateV34(
   }
   const leadBonus = SMART_V34_LEAD_BONUS_WEIGHT * handLeadVal * avgWins;
   return avgPointsScore - penalty + leadBonus;
+}
+
+// =========================================================================
+// Strategy: smart-v35
+// =========================================================================
+//
+// A harder fair benchmark than smart-v34, for measuring the research
+// agents once v18/v28/v34 stopped separating them. Evaluation only.
+//
+// Same idea as the v13+ lineage -- deal the cards this seat cannot see,
+// play every candidate out in each dealt world, keep the best average --
+// with the parts that limited v34 replaced:
+//
+// 1. **Worlds consistent with everything the table has seen.** v34 deals
+//    the unseen cards uniformly, so a seat that has shown itself out of
+//    hearts is dealt hearts again and the rollout has it follow suit
+//    instead of trumping. Here every world respects, from public play
+//    only: hand sizes, shown voids (rules.md §7.3: a follower who played
+//    off-suit has none of the led suit left), pair shortfalls (a follower
+//    who played fewer pairs than a pair/tractor lead demanded holds no
+//    pair of that suit), and declarations (cards shown face up when
+//    declaring stay in the declarer's hand until played -- or in the
+//    kitty, when the declarer is the landlord and might have buried
+//    them). The landlord alone also knows the cards it buried.
+//
+// 2. **Rollouts to the end of the hand, scored like the hand is.** v34
+//    plays five tricks with a 0.6 discount and adds a hand-tuned card cost;
+//    nothing past that horizon, and the kitty bonus (rules.md §8.2, up to
+//    eight times the kitty) never, enters its estimate. Here each rollout
+//    plays to the last card with the cheap v1 policy at every seat, and is
+//    scored by the final attacker total including the kitty bonus, plus
+//    weights on the win (80-point cliff, §8.3) and the level swing.
+//    v1 is ~30x cheaper per move than the smart-v3 policy v34 rolls out
+//    with, which is what pays for the far larger number of worlds.
+//
+// 3. **The budget goes where the decision is.** A seat with one legal move
+//    plays it without searching. Otherwise candidates are compared on the
+//    same worlds (common random numbers, so the deal's luck cancels in the
+//    comparison) and the weaker half is dropped round by round
+//    (sequential halving), so the best few candidates see most of the
+//    worlds. The budget is counted in simulated plays, not time, so a
+//    decision is a pure function of the position.
+//
+// 4. **Only what a human in that seat knows.** Candidate throws come from
+//    public information (rl/v2/candidates.ts: a component is offered only
+//    when no unseen card can beat it); `legalEvents`' lead-throw branch,
+//    which tests safety against the other seats' real hands, is never
+//    called. The world sampler reads only the public facts above, and its
+//    seed is a hash of this seat's own hand and the cards played, so two
+//    positions that look the same from this seat get the same decision
+//    (packages/engine/test/smart-v35.test.ts re-deals the hidden cards and
+//    checks exactly that).
+//
+// Declaring is v34's. Burial keeps v34's voiding logic but stops burying
+// points the attackers could multiply (smartBuryV35).
+
+type SmartV35Params = {
+  // Simulated plays per decision, the search's whole budget.
+  readonly budget: number;
+  // Most worlds dealt for one decision.
+  readonly maxWorlds: number;
+  // Worlds every candidate is scored on before any is dropped.
+  readonly minWorlds: number;
+  // Utility weights, in attacker points: the win (80-point cliff) and
+  // each level of swing.
+  readonly winWeight: number;
+  readonly levelWeight: number;
+  // Tricks at the start of each rollout (the one in progress counts)
+  // played by smart-v3 rather than v1, and what one such play costs
+  // against the budget, in v1 plays.
+  readonly lookaheadTricks: number;
+  readonly lookaheadCost: number;
+};
+
+const SMART_V35_PARAMS: SmartV35Params = {
+  budget: 6000,
+  maxWorlds: 48,
+  minWorlds: 4,
+  winWeight: 20,
+  levelWeight: 10,
+  lookaheadTricks: 0,
+  lookaheadCost: 20,
+};
+
+// Experiment hook for research scripts: a v35 with some knobs changed.
+// Not a registered bot type.
+export function makeSmartV35Agent(
+  overrides: Partial<SmartV35Params> = {},
+): (state: GameState, seat: Seat) => BotAction {
+  const params = { ...SMART_V35_PARAMS, ...overrides };
+  return (state, seat) => pickSmartV35(state, seat, params);
+}
+
+function pickSmartV35(
+  state: GameState,
+  seat: Seat,
+  params: SmartV35Params = SMART_V35_PARAMS,
+): BotAction {
+  const hand = state.currentHand;
+  if (hand === null) return { kind: 'wait' };
+  const myCards = hand.hands[seat] ?? [];
+
+  if (state.phase === 'declare_lockout' || state.phase === 'declare_open') {
+    if (state.phase === 'declare_open' && hand.landlord === seat) {
+      return { kind: 'pick_up_kitty' };
+    }
+    return smartDeclare(state, seat, myCards, hand);
+  }
+  if (state.phase === 'kitty_replace') {
+    if (hand.landlord !== seat) return { kind: 'wait' };
+    if (hand.trumpRank === null) return { kind: 'wait' };
+    return smartBuryV35(state, hand, myCards);
+  }
+  if (state.phase !== 'play') return { kind: 'wait' };
+  if (hand.trumpRank === null || hand.landlord === null) return { kind: 'wait' };
+  if (turnSeat(state) !== seat) return { kind: 'wait' };
+
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank,
+    trumpSuit: hand.trumpSuit,
+  };
+  return smartV35Search(state, seat, myCards, ctx, state.config.numDecks, params);
+}
+
+// ---- smart-v35: burial --------------------------------------------------
+
+// The research stack's heuristic burial (research/py/tractor/sim/bury.py,
+// `_keep_scores`), which as the zero agent's burial beat every value-guided
+// alternative until a learned policy caught it. Each card gets a keep
+// score -- trumps highest, then rank, twice its points, a bonus for a
+// pair, and a penalty for sitting in a short plain suit so short suits
+// still get voided -- and the eight lowest are buried. smartBury voids
+// short suits whole, points included, and so leaves the attackers ~10
+// kitty points to multiply on the last trick; this keeps 10s and Ks.
+function smartBuryV35(
+  state: GameState,
+  hand: HandState,
+  myCards: ReadonlyArray<Card>,
+): BotAction {
+  const ctx: TrumpContext = {
+    trumpRank: hand.trumpRank!,
+    trumpSuit: hand.trumpSuit,
+  };
+  const kittySize = state.config.kittySize;
+  const suitLen = new Map<EffectiveSuit, number>();
+  const copies = new Map<string, number>();
+  for (const c of myCards) {
+    const es = effectiveSuit(c, ctx);
+    suitLen.set(es, (suitLen.get(es) ?? 0) + 1);
+    copies.set(cardKey(c), (copies.get(cardKey(c)) ?? 0) + 1);
+  }
+  const sorted = [...myCards].sort((a, b) => compareCards(a, b, ctx));
+  const keep = new Map<Card, number>();
+  sorted.forEach((c, i) => {
+    if (isTrump(c, ctx) || c.kind !== 'standard') {
+      keep.set(c, 100 + i);
+      return;
+    }
+    let s = naturalRankIndex(c.rank) + 2 * pointsForCard(c);
+    if ((copies.get(cardKey(c)) ?? 0) >= 2) s += 6;
+    s -= 2 * Math.max(0, 6 - (suitLen.get(effectiveSuit(c, ctx)) ?? 0));
+    keep.set(c, s);
+  });
+  const order = sorted
+    .map((c, i) => ({ c, i }))
+    .sort((a, b) => keep.get(a.c)! - keep.get(b.c)! || a.i - b.i);
+  return { kind: 'replace_kitty', cards: order.slice(0, kittySize).map((x) => x.c) };
+}
+
+// ---- smart-v35: candidates ----------------------------------------------
+
+function v35Cards(a: BotAction): ReadonlyArray<Card> | null {
+  return a.kind === 'play_cards' ? a.cards : null;
+}
+
+function smartV35Candidates(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  n: number,
+): ReadonlyArray<Card>[] {
+  const hand = state.currentHand!;
+  const trick = hand.currentTrick;
+  const seen = new Set<string>();
+  const out: ReadonlyArray<Card>[] = [];
+  const consider = (cards: ReadonlyArray<Card> | null | undefined): void => {
+    if (cards === null || cards === undefined || cards.length === 0) return;
+    const key = candidateKeyByRank(cards);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(cards);
+  };
+
+  if (trick === null) {
+    // v1's choice first: ties in the search go to it.
+    consider(v35Cards(smartLead(myCards, ctx, n)));
+    // Every pair and tractor in the hand, and the throws public
+    // information proves safe (never `legalActions`' throw branch, which
+    // tests safety against the other seats' real hands). Singles are
+    // thinned to the ones worth leading: per suit the highest, the
+    // lowest and the lowest non-point card.
+    const myKitty = hand.landlord === seat ? hand.kitty : [];
+    const singles = new Map<EffectiveSuit, Card[]>();
+    for (const c of enumerateCandidates(state, seat, {
+      includeThrows: true,
+      myKitty,
+      maxCandidates: 512,
+    })) {
+      if (c.cards.length > 1) {
+        consider(c.cards);
+        continue;
+      }
+      const card = c.cards[0]!;
+      const es = effectiveSuit(card, ctx);
+      const list = singles.get(es);
+      if (list === undefined) singles.set(es, [card]);
+      else list.push(card);
+    }
+    for (const list of singles.values()) {
+      list.sort((a, b) => compareCards(a, b, ctx));
+      consider([list[list.length - 1]!]);
+      consider([list[0]!]);
+      const np = list.find((c) => pointsForCard(c) === 0);
+      if (np !== undefined) consider([np]);
+    }
+    return out;
+  }
+
+  consider(v35Cards(smartFollow(state, seat, myCards, trick, ctx, n)));
+  // legalActions' follow branch reads only this hand and the trick.
+  for (const a of legalActions(state, seat)) {
+    if (a.kind === 'play_cards') consider(a.cards);
+  }
+  consider(buildTrumpFillCandidate(myCards, trick, ctx));
+  const sortedLow = [...myCards].sort((a, b) => compareCards(a, b, ctx));
+  for (const pref of ['low', 'high', 'point-dump'] as const) {
+    consider(v35Cards(fillFollow(myCards, sortedLow, trick, ctx, n, pref)));
+  }
+
+  // A single led and none of its suit held: the choice is which card to
+  // throw away or which trump to ruff with, which the lists above barely
+  // cover. Per suit: the lowest, the lowest non-point, the highest point
+  // card; in trump also the highest.
+  const lead = trick.plays[0]!;
+  const ledSuit = effectiveSuit(lead.cards[0]!, ctx);
+  if (
+    lead.cards.length === 1 &&
+    !myCards.some((c) => effectiveSuit(c, ctx) === ledSuit)
+  ) {
+    const bySuit = new Map<EffectiveSuit, Card[]>();
+    for (const c of sortedLow) {
+      const es = effectiveSuit(c, ctx);
+      const list = bySuit.get(es);
+      if (list === undefined) bySuit.set(es, [c]);
+      else list.push(c);
+    }
+    for (const [es, cards] of bySuit) {
+      consider([cards[0]!]);
+      const np = cards.find((c) => pointsForCard(c) === 0);
+      if (np !== undefined) consider([np]);
+      let bestPoint: Card | null = null;
+      for (const c of cards) {
+        if (pointsForCard(c) > 0 && (bestPoint === null || pointsForCard(c) >= pointsForCard(bestPoint))) {
+          bestPoint = c;
+        }
+      }
+      if (bestPoint !== null) consider([bestPoint]);
+      if (es === 'trump') consider([cards[cards.length - 1]!]);
+    }
+  }
+  return out;
+}
+
+// ---- smart-v35: what this seat knows ------------------------------------
+
+type V35Info = {
+  readonly seat: Seat;
+  readonly numPlayers: number;
+  // Unseen cards not pinned to a seat, in deck order.
+  readonly free: ReadonlyArray<Card>;
+  // Shown in a declaration, not yet played: in the declarer's hand.
+  readonly pinned: ReadonlyArray<{ card: Card; seat: Seat }>;
+  // Shown by a declarer who is also the landlord: in its hand or the kitty.
+  readonly pinnedOrKitty: ReadonlyArray<{ card: Card; seat: Seat }>;
+  readonly sizes: ReadonlyArray<number>;
+  // Kitty cards this seat cannot see (0 for the landlord).
+  readonly kittyUnknown: number;
+  readonly voids: ReadonlyArray<ReadonlySet<EffectiveSuit>>;
+  readonly noPair: ReadonlyArray<ReadonlySet<EffectiveSuit>>;
+  readonly seed: number;
+};
+
+function v35PublicInfo(state: GameState, seat: Seat, ctx: TrumpContext): V35Info {
+  const hand = state.currentHand!;
+  const numPlayers = state.config.numPlayers;
+  const n = state.config.numDecks;
+  const myCards = hand.hands[seat] ?? [];
+  const iAmLandlord = hand.landlord === seat;
+
+  const known = new Set<string>();
+  // FNV-1a over what this seat has seen, for the world seed.
+  let h = 0x811c9dc5;
+  const mix = (v: number): void => {
+    h = Math.imul(h ^ (v & 0xffff), 0x01000193) >>> 0;
+  };
+  const strHash = (s: string): void => {
+    for (let i = 0; i < s.length; i++) mix(s.charCodeAt(i));
+  };
+  const mineSorted = myCards.map(identityKey).sort();
+  for (const k of mineSorted) {
+    known.add(k);
+    strHash(k);
+  }
+  mix(0xfe);
+
+  const voids: Array<Set<EffectiveSuit>> = [];
+  const noPair: Array<Set<EffectiveSuit>> = [];
+  for (let s = 0; s < numPlayers; s++) {
+    voids.push(new Set());
+    noPair.push(new Set());
+  }
+  const scan = (plays: ReadonlyArray<{ seat: Seat; cards: ReadonlyArray<Card> }>): void => {
+    const lead = plays[0];
+    if (lead === undefined) return;
+    for (const p of plays) {
+      mix(0xa0 + p.seat);
+      for (const c of p.cards) {
+        known.add(identityKey(c));
+        strHash(identityKey(c));
+      }
+    }
+    const ledSuit = effectiveSuit(lead.cards[0]!, ctx);
+    const leadClass = classifyCombo(lead.cards, ctx, n);
+    let parts: ReadonlyArray<ClassifiedCombo> = [];
+    if (leadClass.ok) parts = [leadClass.combo];
+    else {
+      const d = decomposeThrow(lead.cards, ctx, n);
+      if (d.ok) parts = d.throw.components;
+    }
+    const pairsDemanded = leadObligations(parts, n).pairs;
+    for (let i = 1; i < plays.length; i++) {
+      const p = plays[i]!;
+      const inLed = p.cards.filter((c) => effectiveSuit(c, ctx) === ledSuit);
+      if (inLed.length < p.cards.length) voids[p.seat]!.add(ledSuit);
+      if (pairsDemanded > 0 && findNKinds(inLed, n).length < pairsDemanded) {
+        noPair[p.seat]!.add(ledSuit);
+      }
+    }
+  };
+  for (const t of hand.tricks) scan(t.plays);
+  if (hand.currentTrick !== null) scan(hand.currentTrick.plays);
+  if (iAmLandlord) {
+    mix(0xfd);
+    for (const c of hand.kitty) {
+      known.add(identityKey(c));
+      strHash(identityKey(c));
+    }
+  }
+
+  // Declarations are made face up, so the cards shown are public.
+  const pinnedKeys = new Map<string, Seat>();
+  for (const d of hand.declarationLog) {
+    for (const c of d.cards) {
+      const k = identityKey(c);
+      if (known.has(k)) continue;
+      pinnedKeys.set(k, d.seat);
+    }
+  }
+
+  const pinned: Array<{ card: Card; seat: Seat }> = [];
+  const pinnedOrKitty: Array<{ card: Card; seat: Seat }> = [];
+  const free: Card[] = [];
+  for (const c of buildDeck(n)) {
+    const k = identityKey(c);
+    if (known.has(k)) continue;
+    const owner = pinnedKeys.get(k);
+    if (owner === undefined || owner === seat) free.push(c);
+    else if (owner === hand.landlord && !iAmLandlord) pinnedOrKitty.push({ card: c, seat: owner });
+    else pinned.push({ card: c, seat: owner });
+  }
+
+  const sizes: number[] = [];
+  for (let s = 0; s < numPlayers; s++) {
+    sizes.push(s === seat ? 0 : (hand.hands[s] ?? []).length);
+    mix(0xb0 + sizes[s]!);
+  }
+  mix(seat);
+  mix(hand.landlord ?? 7);
+  return {
+    seat,
+    numPlayers,
+    free,
+    pinned,
+    pinnedOrKitty,
+    sizes,
+    kittyUnknown: iAmLandlord ? 0 : hand.kitty.length,
+    voids,
+    noPair,
+    seed: h >>> 0,
+  };
+}
+
+// ---- smart-v35: dealing a world -----------------------------------------
+
+// One assignment of the unseen cards. Index numPlayers is the kitty.
+// Cards go most-constrained suit first, each to an eligible holder with
+// probability proportional to the room it has left -- uniform when
+// nothing constrains, and close to it otherwise. A card left with no
+// eligible holder means the greedy order painted itself into a corner
+// (the true deal proves a consistent assignment exists), so the deal is
+// retried; after a few failures one card may break a void. Pair
+// shortfalls are then repaired by swaps.
+function v35DealWorld(
+  info: V35Info,
+  ctx: TrumpContext,
+  n: number,
+  rng: () => number,
+): Card[][] {
+  const P = info.numPlayers;
+  const K = P; // kitty index
+  const accepts = (i: number, es: EffectiveSuit): boolean =>
+    i === K || !info.voids[i]!.has(es);
+  let out: Card[][] = [];
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const room: number[] = [...info.sizes, info.kittyUnknown];
+    out = [];
+    for (let i = 0; i <= P; i++) out.push([]);
+    const put = (i: number, c: Card): void => {
+      out[i]!.push(c);
+      room[i] = room[i]! - 1;
+    };
+    for (const { card, seat } of info.pinned) {
+      if (room[seat]! > 0) put(seat, card);
+      else put(K, card); // cannot happen with a consistent state
+    }
+    for (const { card, seat } of info.pinnedOrKitty) {
+      const total = room[seat]! + room[K]!;
+      if (total <= 0) continue;
+      put(rng() * total < room[seat]! ? seat : K, card);
+    }
+
+    // How many holders could take a card of this suit at all: fewer first.
+    const reach = (es: EffectiveSuit): number => {
+      let r = 0;
+      for (let i = 0; i <= P; i++) if (i !== info.seat && room[i]! > 0 && accepts(i, es)) r++;
+      return r;
+    };
+    const free = shuffle(info.free, rng);
+    const suitOf = free.map((c) => effectiveSuit(c, ctx));
+    const reachOf = new Map<EffectiveSuit, number>();
+    for (const es of suitOf) if (!reachOf.has(es)) reachOf.set(es, reach(es));
+    const order = free.map((_, i) => i);
+    order.sort((a, b) => reachOf.get(suitOf[a]!)! - reachOf.get(suitOf[b]!)!);
+
+    let relaxed = false;
+    for (const idx of order) {
+      const c = free[idx]!;
+      const es = suitOf[idx]!;
+      let total = 0;
+      for (let i = 0; i <= P; i++) {
+        if (i === info.seat || room[i]! <= 0 || !accepts(i, es)) continue;
+        total += room[i]!;
+      }
+      let target = -1;
+      if (total > 0) {
+        let r = rng() * total;
+        for (let i = 0; i <= P; i++) {
+          if (i === info.seat || room[i]! <= 0 || !accepts(i, es)) continue;
+          r -= room[i]!;
+          if (r < 0) {
+            target = i;
+            break;
+          }
+        }
+        if (target < 0) {
+          for (let i = P; i >= 0; i--) {
+            if (i !== info.seat && room[i]! > 0 && accepts(i, es)) {
+              target = i;
+              break;
+            }
+          }
+        }
+      } else {
+        relaxed = true;
+        for (let i = 0; i <= P; i++) {
+          if (i !== info.seat && room[i]! > 0) {
+            target = i;
+            break;
+          }
+        }
+      }
+      if (target < 0) continue; // no room anywhere: a bookkeeping error
+      put(target, c);
+    }
+    if (!relaxed) break;
+  }
+
+  // Pair shortfalls: a seat known to hold no pair of a suit gives one
+  // card of each such pair away, for a card that breaks no constraint.
+  // Cards a declaration pinned stay where they are.
+  const pinnedCards = new Set<Card>([
+    ...info.pinned.map((p) => p.card),
+    ...info.pinnedOrKitty.map((p) => p.card),
+  ]);
+  for (let s = 0; s < P; s++) {
+    if (s === info.seat || info.noPair[s]!.size === 0) continue;
+    for (const es of info.noPair[s]!) {
+      for (let guard = 0; guard < 8; guard++) {
+        const mine = out[s]!;
+        // First the copies of each card key, then a pair among them.
+        const at = new Map<string, number[]>();
+        let pairKey: string | null = null;
+        for (let i = 0; i < mine.length; i++) {
+          const c = mine[i]!;
+          if (effectiveSuit(c, ctx) !== es) continue;
+          const k = cardKey(c);
+          const list = at.get(k) ?? [];
+          list.push(i);
+          at.set(k, list);
+          if (list.length >= n) {
+            pairKey = k;
+            break;
+          }
+        }
+        if (pairKey === null) break;
+        // Give away a copy that no declaration pins to this seat.
+        const dupAt = at.get(pairKey)!.find((i) => !pinnedCards.has(mine[i]!)) ?? -1;
+        if (dupAt < 0) break;
+        const give = mine[dupAt]!;
+        let swapped = false;
+        for (let tries = 0; tries < 24 && !swapped; tries++) {
+          const t = Math.floor(rng() * (P + 1));
+          if (t === s || t === info.seat || out[t]!.length === 0) continue;
+          if (!accepts(t, es)) continue;
+          if (t < P && info.noPair[t]!.has(es) && out[t]!.some((x) => cardKey(x) === cardKey(give))) continue;
+          const j = Math.floor(rng() * out[t]!.length);
+          const take = out[t]![j]!;
+          if (pinnedCards.has(take)) continue;
+          const tes = effectiveSuit(take, ctx);
+          if (!accepts(s, tes)) continue;
+          if (tes === es && (cardKey(take) === cardKey(give) || mine.some((x) => cardKey(x) === cardKey(take)))) continue;
+          if (tes !== es && info.noPair[s]!.has(tes) && mine.some((x) => cardKey(x) === cardKey(take))) continue;
+          mine[dupAt] = take;
+          out[t]![j] = give;
+          swapped = true;
+        }
+        if (!swapped) break;
+      }
+    }
+  }
+  return out;
+}
+
+// The worlds smart-v35 would search from `seat`'s point of view, for
+// tests and diagnostics: each is the other seats' hands (this seat's own
+// entry left empty) and, when `seat` is not the landlord, the kitty.
+export function smartV35Worlds(
+  state: GameState,
+  seat: Seat,
+  count: number,
+): Array<{ hands: Card[][]; kitty: Card[] }> {
+  const hand = state.currentHand;
+  if (hand === null || hand.trumpRank === null) return [];
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank, trumpSuit: hand.trumpSuit };
+  const info = v35PublicInfo(state, seat, ctx);
+  const rng = mulberry32(info.seed);
+  const out: Array<{ hands: Card[][]; kitty: Card[] }> = [];
+  for (let i = 0; i < count; i++) {
+    const w = v35DealWorld(info, ctx, state.config.numDecks, rng);
+    out.push({ hands: w.slice(0, info.numPlayers), kitty: w[info.numPlayers]! });
+  }
+  return out;
+}
+
+function v35WorldState(state: GameState, info: V35Info, world: Card[][]): GameState {
+  const hand = state.currentHand!;
+  const hands: Record<Seat, ReadonlyArray<Card>> = {};
+  for (let s = 0; s < info.numPlayers; s++) {
+    hands[s] = s === info.seat ? (hand.hands[s] ?? []) : world[s]!;
+  }
+  const kitty = info.kittyUnknown > 0 ? world[info.numPlayers]! : hand.kitty;
+  return { ...state, currentHand: { ...hand, hands, kitty } };
+}
+
+// ---- smart-v35: rollouts ------------------------------------------------
+
+// v1's move for whoever is to play, made legal if v1 got a follow wrong
+// (it predates the order-independent follow obligations). Never counted
+// as a bot repair: rollouts are part of how v35 chooses, not moves.
+function v35RolloutMove(s: GameState, seat: Seat): ReadonlyArray<Card> {
+  const hand = s.currentHand!;
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank!, trumpSuit: hand.trumpSuit };
+  const n = s.config.numDecks;
+  const myCards = hand.hands[seat] ?? [];
+  const trick = hand.currentTrick;
+  const a =
+    trick === null
+      ? smartLead(myCards, ctx, n)
+      : smartFollow(s, seat, myCards, trick, ctx, n);
+  return a.kind === 'play_cards' ? a.cards : [];
+}
+
+function v35Canonical(s: GameState, seat: Seat): ReadonlyArray<Card> {
+  const hand = s.currentHand!;
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank!, trumpSuit: hand.trumpSuit };
+  const n = s.config.numDecks;
+  const myCards = hand.hands[seat] ?? [];
+  const trick = hand.currentTrick;
+  if (trick === null || trick.plays.length === 0) {
+    const sorted = [...myCards].sort((a, b) => compareCards(a, b, ctx));
+    return [sorted[0]!];
+  }
+  const leadCards = trick.plays[0]!.cards;
+  const leadClass = classifyCombo(leadCards, ctx, n);
+  let parts: ReadonlyArray<ClassifiedCombo> = [];
+  if (leadClass.ok) parts = [leadClass.combo];
+  else {
+    const d = decomposeThrow(leadCards, ctx, n);
+    if (d.ok) parts = d.throw.components;
+  }
+  const ledSuit = leadClass.ok ? leadClass.combo.effectiveSuit : effectiveSuit(leadCards[0]!, ctx);
+  return canonicalFollow(parts, leadCards.length, ledSuit, myCards, ctx, n);
+}
+
+// smart-v3's move: a two-trick lookahead that reads every hand of the
+// world it is given -- inside a sampled world, the world's hands.
+function v35LookaheadMove(s: GameState, seat: Seat): ReadonlyArray<Card> {
+  const hand = s.currentHand!;
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank!, trumpSuit: hand.trumpSuit };
+  const a = smartV3Search(s, seat, hand.hands[seat] ?? [], hand.currentTrick, ctx, s.config.numDecks);
+  return a.kind === 'play_cards' ? a.cards : [];
+}
+
+// Plays `s` to the end of the hand: the first `lookaheadTricks` tricks
+// (counting the one in progress) with smart-v3 at every seat, the rest
+// with v1. Returns the final attacker total (kitty bonus included) and
+// the cost in v1-play units.
+function v35Rollout(
+  s0: GameState,
+  lookaheadTricks: number,
+  lookaheadCost: number,
+): { attackerPoints: number; plays: number } {
+  let s = s0;
+  let plays = 0;
+  const startTricks = s0.currentHand?.tricks.length ?? 0;
+  for (let guard = 0; guard < 1000; guard++) {
+    if (s.phase === 'trick_review') {
+      const r = applyEvent(s, { kind: 'advance_trick' });
+      if (!r.ok) break;
+      s = r.state;
+      continue;
+    }
+    if (s.phase !== 'play') break;
+    const seat = nextToPlay(s);
+    if (seat === null) break;
+    const lookahead = s.currentHand!.tricks.length - startTricks < lookaheadTricks;
+    if (lookahead) plays += lookaheadCost - 1;
+    const move = lookahead ? v35LookaheadMove(s, seat) : v35RolloutMove(s, seat);
+    let r = applyEvent(s, { kind: 'play_cards', seat, cards: move });
+    if (!r.ok) r = applyEvent(s, { kind: 'play_cards', seat, cards: v35Canonical(s, seat) });
+    if (!r.ok) break;
+    s = r.state;
+    plays++;
+  }
+  return { attackerPoints: s.currentHand?.attackerPoints ?? 0, plays };
+}
+
+function v35Utility(attackerPoints: number, iAttack: boolean, p: SmartV35Params): number {
+  const res = computeHandResult(attackerPoints);
+  const iWin = (res.winner === 'attackers') === iAttack;
+  return (
+    (iAttack ? attackerPoints : -attackerPoints) +
+    p.winWeight * (iWin ? 1 : -1) +
+    p.levelWeight * (iWin ? res.levelDelta : -res.levelDelta)
+  );
+}
+
+// ---- smart-v35: the search ----------------------------------------------
+
+function smartV35Search(
+  state: GameState,
+  seat: Seat,
+  myCards: ReadonlyArray<Card>,
+  ctx: TrumpContext,
+  n: number,
+  params: SmartV35Params,
+): BotAction {
+  const candidates = smartV35Candidates(state, seat, myCards, ctx, n);
+  if (candidates.length === 0) {
+    const hand = state.currentHand!;
+    const fallback =
+      hand.currentTrick === null
+        ? smartLead(myCards, ctx, n)
+        : smartFollow(state, seat, myCards, hand.currentTrick, ctx, n);
+    return fallback;
+  }
+  if (candidates.length === 1) return { kind: 'play_cards', cards: candidates[0]! };
+
+  const hand = state.currentHand!;
+  const iAttack = teamOf(state, seat) !== teamOf(state, hand.landlord!);
+  const info = v35PublicInfo(state, seat, ctx);
+  const rng = mulberry32(info.seed);
+  const worlds: GameState[] = [];
+  const worldAt = (i: number): GameState => {
+    while (worlds.length <= i) worlds.push(v35WorldState(state, info, v35DealWorld(info, ctx, n, rng)));
+    return worlds[i]!;
+  };
+
+  const sum = new Float64Array(candidates.length);
+  const cnt = new Int32Array(candidates.length);
+  const dead = new Uint8Array(candidates.length);
+  let alive = candidates.map((_, i) => i);
+  let spent = 0;
+  let nextWorld = 0;
+
+  const scoreOn = (ci: number, wi: number): void => {
+    const w = worldAt(wi);
+    const r0 = applyEvent(w, { kind: 'play_cards', seat, cards: candidates[ci]! });
+    if (!r0.ok) {
+      // Not playable in this world (cannot happen for a legal follow; a
+      // throw from public information is safe in every world).
+      dead[ci] = 1;
+      return;
+    }
+    const { attackerPoints, plays } = v35Rollout(r0.state, params.lookaheadTricks, params.lookaheadCost);
+    spent += plays + 1;
+    sum[ci] = sum[ci]! + v35Utility(attackerPoints, iAttack, params);
+    cnt[ci] = cnt[ci]! + 1;
+  };
+
+  // Sequential halving: each round spends an equal share of the budget,
+  // evaluating every surviving candidate on the same new worlds, then
+  // keeps the better half. The first round is at least `minWorlds` deep.
+  const rounds = Math.max(1, Math.ceil(Math.log2(alive.length)));
+  for (let round = 0; round < rounds && alive.length > 1; round++) {
+    const share = (params.budget - spent) / (rounds - round);
+    const roundStart = spent;
+    let worldsThisRound = 0;
+    while (nextWorld < params.maxWorlds) {
+      const wi = nextWorld++;
+      for (const ci of alive) if (!dead[ci]) scoreOn(ci, wi);
+      worldsThisRound++;
+      if (round === 0 && worldsThisRound < params.minWorlds) continue;
+      if (spent - roundStart >= share) break;
+    }
+    alive = alive.filter((ci) => !dead[ci] && cnt[ci]! > 0);
+    if (alive.length <= 1) break;
+    if (round === rounds - 1 || nextWorld >= params.maxWorlds) break;
+    alive.sort((a, b) => sum[b]! / cnt[b]! - sum[a]! / cnt[a]! || a - b);
+    alive = alive.slice(0, Math.max(2, Math.ceil(alive.length / 2)));
+  }
+
+  let best = alive[0] ?? 0;
+  let bestMean = -Infinity;
+  for (const ci of alive) {
+    if (cnt[ci]! === 0) continue;
+    const m = sum[ci]! / cnt[ci]!;
+    if (m > bestMean + 1e-9) {
+      bestMean = m;
+      best = ci;
+    }
+  }
+  return { kind: 'play_cards', cards: candidates[best]! };
 }

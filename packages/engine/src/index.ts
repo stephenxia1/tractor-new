@@ -99,6 +99,7 @@ export {
 
 export {
   pickBotAction,
+  makeSmartV35Agent,
   botFollowRepairs,
   resetBotFollowRepairs,
   botTypeLabel,
