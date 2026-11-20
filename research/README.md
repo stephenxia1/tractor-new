@@ -1602,6 +1602,46 @@ where two independent searches agree (72% of them); or labels from more
 worlds at the same top 3 (12 x 3), which spends the width on the values
 rather than on another candidate.
 
+### Expert iteration round 2 (2026-11-19, Bouchet)
+
+`zero2-dst3` resumed `zero2-dst2` step 5000 with distillation (coef 1.0,
+lr 1e-4, 8 minibatches of 512 a step) on fresh labels from that
+checkpoint, 290,357 positions searched at 8 worlds x top 3; `zero2-d2c`
+resumed the same checkpoint on plain PPO. Both trained to step 6000 on
+YCRC Bouchet. Step 6000, its own pre-play, 770 deals per fair bot, seed
+20260923 (the records predate per-deal levels, so levels are unpaired, `u`):
+
+| step 6000 | win | levels | points | win attacking |
+| --- | --- | --- | --- | --- |
+| `zero2-d2c` (plain PPO) | 0.578 | +0.183 | +7.6 | 0.623 |
+| `zero2-dst3` (distilled) | **0.595** | **+0.230** | **+9.6** | 0.650 |
+| (`zero2-dst2` step 5000, for reference) | 0.579 | +0.225 | +9.0 | 0.634 |
+
+Paired over smart-v18 / v28 / v34:
+
+| | win | levels | points |
+| --- | --- | --- | --- |
+| `zero2-dst3` - `zero2-d2c` | **+0.018 +/- 0.014** | +0.048 +/- 0.031 u | **+1.94 +/- 0.91** |
+| `zero2-d2c` - `zero2-dst2` step 5000 | -0.002 +/- 0.013 | -0.042 +/- 0.032 u | -1.35 +/- 0.90 |
+| `zero2-dst3` - `zero2-dst2` step 5000 | +0.016 +/- 0.013 | +0.005 +/- 0.032 u | +0.60 +/- 0.88 |
+
+At the same point of round 1, its last milestone, `zero2-dst2` led its
+control by +0.008 +/- 0.014 win and +1.12 +/- 0.92 points: round 2's gap
+is larger, but within the error of round 1's. Plain PPO from step 5000 loses about a point and a half a hand of what
+round 1 bought; distillation keeps it and adds a little. `zero2-dst3`
+step 6000 is the best plain policy so far. Against smart-v35 (below), on
+the same deals, it wins 0.531 +/- 0.025, levels +0.045, points +1.7,
+where against smart-v34 it gives 0.596 / +0.231 / +9.5: the loss is in
+its attacking hands (0.655 against v34, 0.538 against v35).
+
+Not yet measured, all planned in `ycrc/round2.sh`: the milestones at
+5250 / 5500 / 5750, random pre-play at 5500 and 6000, and step 6000 +
+search on both seeds, which is where round 1's gain showed most (+0.014
++/- 0.010 win, +0.99 +/- 0.65 points over its control). One seed and one
+milestone is a single paired measurement; the pooled milestones and the
+search pair are what would settle it. Records:
+`evals/2026-11-19/zero2-{d2c,dst3}-6000-policy*.jsonl`.
+
 ### smart-v35, a harder fair benchmark (2026-11-19)
 
 The best zero agents beat smart-v18 / v28 / v34 at ~0.58-0.61, so those
