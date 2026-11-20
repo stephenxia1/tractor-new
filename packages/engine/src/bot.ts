@@ -6746,11 +6746,12 @@ function scoreCandidateV34(
 //    plays five tricks with a 0.6 discount and adds a hand-tuned card cost;
 //    nothing past that horizon, and the kitty bonus (rules.md §8.2, up to
 //    eight times the kitty) never, enters its estimate. Here each rollout
-//    plays to the last card with the cheap v1 policy at every seat, and is
-//    scored by the final attacker total including the kitty bonus, plus
-//    weights on the win (80-point cliff, §8.3) and the level swing.
-//    v1 is ~30x cheaper per move than the smart-v3 policy v34 rolls out
-//    with, which is what pays for the far larger number of worlds.
+//    finishes the current trick with smart-v3 at every seat (v34's own
+//    rollout policy) and plays the rest of the hand with the cheap v1
+//    policy, and is scored by the final attacker total including the
+//    kitty bonus, plus weights on the win (80-point cliff, §8.3) and the
+//    level swing. v1 is ~30x cheaper per move than smart-v3, which is
+//    what pays for rollouts to the last card in dozens of worlds.
 //
 // 3. **The budget goes where the decision is.** A seat with one legal move
 //    plays it without searching. Otherwise candidates are compared on the
@@ -6770,8 +6771,8 @@ function scoreCandidateV34(
 //    (packages/engine/test/smart-v35.test.ts re-deals the hidden cards and
 //    checks exactly that).
 //
-// Declaring is v34's. Burial keeps v34's voiding logic but stops burying
-// points the attackers could multiply (smartBuryV35).
+// Declaring is v34's. Burial picks, by the same rollouts, between v34's
+// burial and one that keeps point cards out of the kitty (smartBuryV35).
 
 type SmartV35Params = {
   // Simulated plays per decision, the search's whole budget.
@@ -6789,16 +6790,27 @@ type SmartV35Params = {
   // against the budget, in v1 plays.
   readonly lookaheadTricks: number;
   readonly lookaheadCost: number;
+  // Worlds each of the two candidate burials is played out on; 0 buries
+  // as smart-v34 does.
+  readonly buryWorlds: number;
 };
 
+// Measured on 64 duplicate deals against smart-v34 (seed 20261119,
+// paired): four times the budget on v1 rollouts alone bought nothing
+// (+0.7 +/- 6.9 points a deal); smart-v3 for each rollout's first trick
+// at twice the budget, so about as many worlds, leaned positive
+// (+5.7 +/- 7.7) at ~1.5x the cost and was kept. Choosing the burial by
+// rollouts held the attackers to 3.5 +/- 0.7 fewer points than v34's
+// burial over 2000 deals played by v1.
 const SMART_V35_PARAMS: SmartV35Params = {
-  budget: 6000,
+  budget: 12000,
   maxWorlds: 48,
   minWorlds: 4,
   winWeight: 20,
   levelWeight: 10,
-  lookaheadTricks: 0,
+  lookaheadTricks: 1,
   lookaheadCost: 20,
+  buryWorlds: 64,
 };
 
 // Experiment hook for research scripts: a v35 with some knobs changed.
@@ -6828,7 +6840,7 @@ function pickSmartV35(
   if (state.phase === 'kitty_replace') {
     if (hand.landlord !== seat) return { kind: 'wait' };
     if (hand.trumpRank === null) return { kind: 'wait' };
-    return smartBuryV35(state, hand, myCards);
+    return smartBuryV35(state, hand, myCards, params);
   }
   if (state.phase !== 'play') return { kind: 'wait' };
   if (hand.trumpRank === null || hand.landlord === null) return { kind: 'wait' };
@@ -6843,15 +6855,58 @@ function pickSmartV35(
 
 // ---- smart-v35: burial --------------------------------------------------
 
-// The research stack's heuristic burial (research/py/tractor/sim/bury.py,
-// `_keep_scores`), which as the zero agent's burial beat every value-guided
-// alternative until a learned policy caught it. Each card gets a keep
-// score -- trumps highest, then rank, twice its points, a bonus for a
-// pair, and a penalty for sitting in a short plain suit so short suits
-// still get voided -- and the eight lowest are buried. smartBury voids
-// short suits whole, points included, and so leaves the attackers ~10
-// kitty points to multiply on the last trick; this keeps 10s and Ks.
+// Two plain burials, each good on different hands, and the landlord keeps
+// whichever plays out better from its own seat. smartBury (v34's) voids
+// short plain suits whole, points and all; keepScoreBurial keeps 10s and
+// Ks out of the kitty the attackers can multiply. Both are played from
+// the start of play to the last card with v1 at every seat, on the same
+// worlds -- the 75 cards the landlord cannot see, dealt to the other
+// three seats (declared cards stay with their declarer) -- and scored as
+// the search scores a move. With two candidates and shared worlds there
+// is little room for the winner's curse that sank the research stack's
+// value-guided burial climb (research/README.md, "What the full hand
+// bought"). Ties keep smartBury.
 function smartBuryV35(
+  state: GameState,
+  hand: HandState,
+  myCards: ReadonlyArray<Card>,
+  params: SmartV35Params,
+): BotAction {
+  const plain = smartBury(state, hand, myCards);
+  if (params.buryWorlds <= 0 || plain.kind !== 'replace_kitty') return plain;
+  const alt = keepScoreBurial(state, hand, myCards);
+  if (alt.kind !== 'replace_kitty' || candidateKeyByRank(alt.cards) === candidateKeyByRank(plain.cards)) {
+    return plain;
+  }
+  const seat = hand.landlord!;
+  const ctx: TrumpContext = { trumpRank: hand.trumpRank!, trumpSuit: hand.trumpSuit };
+  const n = state.config.numDecks;
+  const starts: GameState[] = [];
+  for (const b of [plain, alt]) {
+    const r = applyEvent(state, { kind: 'replace_kitty', seat, cards: b.cards });
+    if (!r.ok) return plain;
+    starts.push(r.state);
+  }
+  // What the landlord cannot see is the same whichever eight it buries.
+  const info = v35PublicInfo(starts[0]!, seat, ctx);
+  const rng = mulberry32(info.seed ^ 0x6b17);
+  const sums = [0, 0];
+  for (let w = 0; w < params.buryWorlds; w++) {
+    const world = v35DealWorld(info, ctx, n, rng);
+    for (let i = 0; i < starts.length; i++) {
+      const { attackerPoints } = v35Rollout(v35WorldState(starts[i]!, info, world), 0, 1);
+      sums[i] = sums[i]! + v35Utility(attackerPoints, false, params);
+    }
+  }
+  return sums[1]! > sums[0]! ? alt : plain;
+}
+
+// The research stack's heuristic burial (research/py/tractor/sim/bury.py,
+// `_keep_scores`). Each card gets a keep score -- trumps highest, then
+// rank, twice its points, a bonus for a pair, and a penalty for sitting
+// in a short plain suit so short suits still get voided -- and the eight
+// lowest are buried.
+function keepScoreBurial(
   state: GameState,
   hand: HandState,
   myCards: ReadonlyArray<Card>,

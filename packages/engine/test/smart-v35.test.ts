@@ -171,10 +171,11 @@ describe('smart-v35', () => {
     expect(voidsSeen).toBeGreaterThan(0);
   }, 60_000);
 
-  it('buries fewer points than smart-v34 and only cards it holds', () => {
+  it("buries only cards it holds, choosing between v34's burial and a point-keeping one", () => {
     let v35Points = 0;
     let v34Points = 0;
     let hands = 0;
+    let differs = 0;
     for (let seed = 1; seed <= 30; seed++) {
       let s = createGame(defaultV1Config());
       s = applyEvent(s, { kind: 'start_hand', seed }).state;
@@ -207,9 +208,14 @@ describe('smart-v35', () => {
       expect(applyEvent(s, { kind: 'replace_kitty', seat: landlord, cards: mine.cards }).ok).toBe(true);
       v35Points += sumPoints(mine.cards);
       v34Points += sumPoints(theirs.cards);
+      if (keysOf(mine.cards) !== keysOf(theirs.cards)) differs++;
       hands++;
     }
     expect(hands).toBeGreaterThan(20);
+    // The alternative is chosen on some hands, not all, and it only ever
+    // keeps points back.
+    expect(differs).toBeGreaterThan(0);
+    expect(differs).toBeLessThan(hands);
     expect(v35Points).toBeLessThan(v34Points);
-  });
+  }, 60_000);
 });
