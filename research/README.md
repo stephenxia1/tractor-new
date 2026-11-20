@@ -1602,6 +1602,102 @@ where two independent searches agree (72% of them); or labels from more
 worlds at the same top 3 (12 x 3), which spends the width on the values
 rather than on another candidate.
 
+### smart-v35, a harder fair benchmark (2026-11-19)
+
+The best zero agents beat smart-v18 / v28 / v34 at ~0.58-0.61, so those
+bots are running out of room to separate them. `smart-v35`
+(`packages/engine/src/bot.ts`) is a fair search bot built to be clearly
+stronger than smart-v34. It is for evaluation only: it is not in
+`VISIBLE_BOT_TYPES`, `LADDER` or `cluster.py`'s default `FAIR`, so
+nothing trains against it or is tuned to it by accident. Name it
+explicitly: `python -m tractor.cluster eval ... --bots smart-v35`, or
+`--bot smart-v35` wherever a single bot is named.
+
+What it changes from v34:
+
+- **Worlds consistent with the table.** v34 deals the unseen cards
+  uniformly. v35 deals them respecting everything public: hand sizes,
+  shown voids, pair shortfalls (a follower who gave fewer pairs than a
+  pair or tractor lead demanded holds no pair in that suit), and declared
+  cards (still in the declarer's hand unless played, or possibly in the
+  kitty if the declarer is the landlord). Only the landlord knows its
+  burial.
+- **Rollouts to the last card, scored like the hand.** v34 plays five
+  tricks with a 0.6 discount and adds a hand-tuned card cost, so the
+  kitty bonus (up to 8x the kitty) never reaches its estimate. v35 plays
+  every candidate to the end of the hand with v1 (`smart`) at every
+  seat, about 30x cheaper per move than v34's smart-v3 rollouts. The
+  score is the final attacker total with the kitty bonus, plus 20 for
+  the win (the 80-point cliff) and 10 per level.
+- **Budget where the decision is.** Forced moves are not searched.
+  Otherwise candidates share worlds (common random numbers) and the worse
+  half is dropped round by round (sequential halving). The budget is
+  counted in simulated plays rather than time, so a move is a pure
+  function of the position.
+- **Fair by construction.** Lead throws come only from
+  `rl/v2/candidates.ts`'s public-information throws (safe in every deal);
+  the engine's throw enumerator, which checks against real hands, is
+  never called. The world seed hashes only this seat's hand, the cards
+  played and public counts. `test/smart-v35.test.ts` re-deals every
+  hidden card and checks the move does not change.
+- Declares as v34 does. Burial: v34's burial or a keep-the-points
+  burial, whichever plays out better over 64 shared worlds.
+
+**Against smart-v34** on duplicate deals (`src/botMatch.ts`): each deal
+is played twice from the same cards with the teams swapped, using
+GameSlot's duplicate seeding as `evalhost.ts` does. 95% intervals are
+clustered by deal, and the seeds were not used during development:
+
+| pre-play | seed | deals | v35 win | levels | points | v35 / v34 time |
+| --- | --- | --- | --- | --- | --- | --- |
+| random (same play start both halves) | 20260923 | 320 | **0.613 ± 0.028** | **+0.380 ± 0.062** | **+14.8 ± 2.4** | 7.67 / 25.74 s a hand (0.30x) |
+| each team declares and buries with its own bot | 20261114 | 192 | **0.586 ± 0.040** | **+0.206 ± 0.071** | **+7.6 ± 2.6** | 6.10 / 20.37 s a hand (0.30x) |
+
+The edge is smaller when each side does its own pre-play (a different
+seed too, so the two rows are not paired). v35 declares exactly as v34
+does, so there only its play and its burial differ. Random pre-play
+buries eight random cards, which leaves the play much more lopsided:
+v35 won 0.85 of its hands as attacker and 0.37 as defender there, and
+0.65 / 0.53 with its own pre-play.
+
+Time is each bot's own decisions for its two seats over a hand, measured
+in the same processes on the same deals (v34's includes the engine's own
+small share). At 770 deals a benchmark against v35 costs about a third
+of the bot time of one against v34.
+
+Development, on 64 deals of seed 20261119, paired against the first
+version (records in `evals/2026-11-19/v35-dev/`, scripts in
+`scripts/v35dev/`):
+
+| change | win | levels | points | cost |
+| --- | --- | --- | --- | --- |
+| v1 rollouts, 6,000 plays a decision (first version) | 0.633 ± 0.070 vs v34 | +0.43 ± 0.15 | +16.5 ± 5.7 | 0.18x v34 |
+| 4x the budget | +0.023 ± 0.083 | −0.02 ± 0.17 | +0.7 ± 6.9 | 2.5x |
+| smart-v3 plays each rollout's first trick (kept) | +0.016 ± 0.090 | +0.04 ± 0.18 | +5.7 ± 7.7 | 1.55x |
+
+More worlds bought nothing. A better rollout policy leaned positive and
+was kept, though the gain is not significant on its own. For the burial
+(`scripts/v35dev/bury_eval.ts`, 2,000 deals, the landlord's eight cards
+the only difference, v1 playing every seat), the rollout choice held the
+attackers to 3.45 ± 0.69 fewer points than v34's burial and raised the
+landlord's win rate by 0.035 ± 0.013, burying 4.9 kitty points against
+9.3. The keep-score burial alone was no better (−0.2 ± 1.0 points,
+−0.029 ± 0.020 win). Note that this harness plays v1 at every seat, the
+same policy the chooser's rollouts use.
+
+smart-v18 / v28 / v34 are unchanged: `test/fair-bots-unchanged.test.ts`
+replays their moves on 60 positions (every declaration and burial and
+32 plays) against a fixture made from the engine before smart-v35.
+
+```bash
+# from the repo root
+npx tsx research/src/botMatch.ts --a smart-v35 --b smart-v34 --deals 320 \
+  --seed 20260923 --pre-play random --procs 8 --out v35-v34.jsonl
+npx tsx research/src/botMatch.ts --summary v35-v34.jsonl
+# a checkpoint against it (from research/py)
+python -m tractor.cluster eval --checkpoint CKPT --bots smart-v35 --out RECORDS.jsonl
+```
+
 ## Next steps
 
 1. **Longer training**, then evaluate against the real opponents. Budget

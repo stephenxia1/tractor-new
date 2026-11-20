@@ -1,0 +1,5 @@
+smart-v35 (A) vs smart-v34 (B), pre-play bot, seed 20261114: 192 deals, 384 hands
+  A win 0.586 ± 0.040   levels +0.206 ± 0.071   points +7.62 ± 2.60   (per deal, 95%, clustered by deal)
+  A win attacking 0.646, defending 0.526
+  time choosing plays: A 6.10 s/hand (176 ms/play), B 20.37 s/hand (588 ms/play, engine included); A/B 0.30x
+exit 0 wall 1305s
