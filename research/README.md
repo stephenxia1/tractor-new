@@ -1634,13 +1634,44 @@ the same deals, it wins 0.531 +/- 0.025, levels +0.045, points +1.7,
 where against smart-v34 it gives 0.596 / +0.231 / +9.5: the loss is in
 its attacking hands (0.655 against v34, 0.538 against v35).
 
-Not yet measured, all planned in `ycrc/round2.sh`: the milestones at
-5250 / 5500 / 5750, random pre-play at 5500 and 6000, and step 6000 +
-search on both seeds, which is where round 1's gain showed most (+0.014
-+/- 0.010 win, +0.99 +/- 0.65 points over its control). One seed and one
-milestone is a single paired measurement; the pooled milestones and the
-search pair are what would settle it. Records:
-`evals/2026-11-19/zero2-{d2c,dst3}-6000-policy*.jsonl`.
+**The rest of the plan (2026-11-21).** Every evaluation `ycrc/round2.sh`
+planned, measured again with per-deal levels so that levels pair deal by
+deal (Bouchet's CPU partition, `cluster eval --procs 16`). The step 6000
+policy records come out as above (0.578 / +0.183 / +7.6 and 0.596 /
++0.231 / +9.6). `zero2-dst3` - `zero2-d2c`, paired over smart-v18 / v28 /
+v34; search is 8 worlds x top 3, confidence 0.99:
+
+| | win | levels | points |
+| --- | --- | --- | --- |
+| step 5250 | +0.006 +/- 0.014 | +0.023 +/- 0.025 | +0.74 +/- 0.87 |
+| step 5500 | +0.015 +/- 0.014 | +0.049 +/- 0.026 | +2.34 +/- 0.93 |
+| step 5750 | +0.008 +/- 0.014 | +0.016 +/- 0.026 | +0.74 +/- 0.95 |
+| step 6000 | +0.018 +/- 0.014 | +0.048 +/- 0.025 | +1.96 +/- 0.91 |
+| **the four milestones, 18,480 hands** | **+0.012 +/- 0.007** | **+0.034 +/- 0.013** | **+1.45 +/- 0.46** |
+| step 6000 + search, seed 20260923 | +0.013 +/- 0.014 | +0.015 +/- 0.026 | +1.13 +/- 0.94 |
+| step 6000 + search, seed 20261114 | +0.009 +/- 0.014 | +0.029 +/- 0.026 | +1.37 +/- 0.93 |
+| **step 6000 + search, both seeds, 9,240 hands** | **+0.011 +/- 0.010** | **+0.022 +/- 0.018** | **+1.25 +/- 0.66** |
+| random pre-play, 5500 and 6000, 9,240 hands | -0.003 +/- 0.009 | +0.009 +/- 0.020 | +0.76 +/- 0.78 |
+
+| step 6000 + search (win / levels / points) | seed 20260923 | seed 20261114 |
+| --- | --- | --- |
+| `zero2-d2c` (plain PPO) | 0.607 / +0.267 / +10.6 | 0.616 / +0.264 / +10.6 |
+| `zero2-dst3` (distilled) | **0.620 / +0.282 / +11.8** | **0.626 / +0.293 / +11.9** |
+| (`zero2-dst2` step 5000, round 1) | 0.607 / +0.259 / +10.0 | 0.610 / +0.266 / +10.8 |
+
+**Round 2's gain holds.** Pooled over the milestones, distillation leads
+plain PPO by +0.012 +/- 0.007 win, +0.034 +/- 0.013 levels and +1.45 +/-
+0.46 points, every milestone's difference positive; round 1's pooled
+milestones read +0.001 +/- 0.007 win and +0.75 +/- 0.43 points. With
+search on top the gap is +0.011 +/- 0.010 win and +1.25 +/- 0.66 points
+over both seeds, about round 1's +0.014 +/- 0.010 and +0.99 +/- 0.65.
+From random declarations and burials the two arms play alike (-0.003 +/-
+0.009 win, +0.76 +/- 0.78 points): the gain shows in the positions the
+agent's own pre-play leads to, not as stronger play from any start.
+`zero2-dst3` step 6000 + search is the best bot measured, 0.620 / +11.8
+and 0.626 / +11.9 on the two seeds. Records:
+`evals/2026-11-19/zero2-{d2c,dst3}-6000-policy*.jsonl` (step 6000, first
+pass) and `evals/2026-11-21/zero2-{d2c,dst3}-*.jsonl` (all sixteen).
 
 ### smart-v35, a harder fair benchmark (2026-11-19)
 
