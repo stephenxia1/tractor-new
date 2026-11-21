@@ -17,10 +17,19 @@
 #   research/ycrc/round3.sh --gpu <gpu partition> --cpu <cpu partition> [--submit]
 # Without --submit it prints the sbatch commands and submits nothing.
 # Options: --worlds/--top-k for the labels (default 8 x 3, as zero2-dst3's;
-# 12 x 4 measured no better at ~1.45x the cost), --account to charge.
-# Job ids go to $TRACTOR_ROOT/round3-jobs.txt.
+# 12 x 4 measured no better at ~1.45x the cost), --account to charge,
+# --resume CK and --name RUN to start the in-run arm elsewhere (default
+# zero2-dst2 step 5000 and zero2-live; pair with --fresh-control).
+# --seed N for both trainers and the followers (default: TrainConfig's,
+# and follow's 7); --agree for labels two searches agree on (about twice
+# the follower cost per label, so with more --followers N, default 2).
+# --control NAME --no-control pairs against a control trained and
+# measured by another submission, and submits none.
+# Job ids go to $TRACTOR_ROOT/round3-jobs.txt (round3-<name>-jobs.txt
+# with --name).
 set -euo pipefail
 GPU="" CPU="" WORLDS=8 TOPK=3 ACCOUNT="" CONTROL=zero2-d2c FRESH=0 DRY=1
+RESUME="" RUN=zero2-live SEED="" AGREE=0 NFOLLOW=2 NOCTL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --gpu) GPU="$2"; shift 2 ;;
@@ -29,23 +38,40 @@ while [ $# -gt 0 ]; do
     --top-k) TOPK="$2"; shift 2 ;;
     --account) ACCOUNT="$2"; shift 2 ;;
     --fresh-control) CONTROL="$2"; FRESH=1; shift 2 ;;
+    --control) CONTROL="$2"; FRESH=0; shift 2 ;;
+    --no-control) NOCTL=1; shift ;;
+    --resume) RESUME="$2"; shift 2 ;;
+    --name) RUN="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    --agree) AGREE=1; shift ;;
+    --followers) NFOLLOW="$2"; shift 2 ;;
     --submit) DRY=0; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$GPU" ] && [ -n "$CPU" ] || { echo "need --gpu and --cpu partitions" >&2; exit 2; }
 [ -f research/ycrc/train.sbatch ] || { echo "run from the repository root" >&2; exit 2; }
+if [ "$NOCTL" = 1 ] && [ "$FRESH" = 1 ]; then
+  echo "--no-control and --fresh-control together" >&2; exit 2
+fi
 ACCT=(); [ -n "$ACCOUNT" ] && ACCT=(-A "$ACCOUNT")
+SEEDA=(); [ -n "$SEED" ] && SEEDA=(--seed "$SEED")
+AGREEA=(); [ "$AGREE" = 1 ] && AGREEA=(--agree)
 
 : "${TRACTOR_ROOT:=$HOME/project/tractor-runs}"
-CK=$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt
-RUN=zero2-live
+CK=${RESUME:-$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt}
 LABELS=$TRACTOR_ROOT/distill/$RUN
 EVALS=$TRACTOR_ROOT/evals
+JOBS=$TRACTOR_ROOT/round3-jobs.txt
+[ "$RUN" = zero2-live ] || JOBS=$TRACTOR_ROOT/round3-$RUN-jobs.txt
 if [ "$DRY" = 0 ]; then
   [ -f "$CK" ] || { echo "missing $CK (README.md §2)" >&2; exit 1; }
   [ -e "$TRACTOR_ROOT/$RUN" ] && { echo "$TRACTOR_ROOT/$RUN exists; not training over it" >&2; exit 1; }
-  if [ "$FRESH" = 0 ]; then
+  if [ "$FRESH" = 1 ]; then
+    if [ -e "$TRACTOR_ROOT/$CONTROL" ]; then
+      echo "$TRACTOR_ROOT/$CONTROL exists; not training over it" >&2; exit 1
+    fi
+  elif [ "$NOCTL" = 0 ]; then
     for s in 5250 5500 5750 6000; do
       f=$TRACTOR_ROOT/$CONTROL/milestones/$(printf 'step_%07d.pt' "$s")
       [ -f "$f" ] || { echo "missing control milestone $f" >&2; exit 1; }
@@ -80,18 +106,20 @@ DISTILL="--distill-coef 1.0 --distill-lr 1e-4 --distill-steps 8 --distill-miniba
 submit LIVE -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 research/ycrc/train.sbatch \
   --name "$RUN" --resume "$CK" --steps 6000 $COMMON $DISTILL \
   --distill-paths "$LABELS/s*.npz" --distill-reload-every 25 \
-  --distill-window-rows 200000 --distill-max-age 150
-# Two tasks of 32 cores, from when the trainer starts (it writes launch.json,
-# which --initial-checkpoint auto reads); each exits once final.pt exists.
-submit FOLLOW -p "$CPU" ${ACCT[@]+"${ACCT[@]}"} --array=0-1 --dependency="after:$LIVE" \
-  research/ycrc/follow.sbatch \
+  --distill-window-rows 200000 --distill-max-age 150 ${SEEDA[@]+"${SEEDA[@]}"}
+# Tasks of 32 cores (two by default), from when the trainer starts (it writes
+# launch.json, which --initial-checkpoint auto reads); each exits once
+# final.pt exists.
+submit FOLLOW -p "$CPU" ${ACCT[@]+"${ACCT[@]}"} --array=0-$((NFOLLOW - 1)) \
+  --dependency="after:$LIVE" research/ycrc/follow.sbatch \
   --run-dir "$TRACTOR_ROOT/$RUN" --out-dir "$LABELS" --hands 16 \
-  --worlds "$WORLDS" --top-k "$TOPK" --confident 0.99 --keep 100 --initial-checkpoint auto
+  --worlds "$WORLDS" --top-k "$TOPK" --confident 0.99 --keep 100 --initial-checkpoint auto \
+  ${SEEDA[@]+"${SEEDA[@]}"} ${AGREEA[@]+"${AGREEA[@]}"}
 CTL=""
 if [ "$FRESH" = 1 ]; then
   # shellcheck disable=SC2086
   submit CTL -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 research/ycrc/train.sbatch \
-    --name "$CONTROL" --resume "$CK" --steps 6000 $COMMON
+    --name "$CONTROL" --resume "$CK" --steps 6000 $COMMON ${SEEDA[@]+"${SEEDA[@]}"}
 fi
 
 EVAL_IDS=()
@@ -105,14 +133,18 @@ evaluate() {  # run after-job(or "") step out-name
 }
 for step in 5250 5500 5750 6000; do
   evaluate "$RUN" "$LIVE" "$step" "$RUN-$step-policy"
-  evaluate "$CONTROL" "$CTL" "$step" "$CONTROL-$step-policy-r3"
+  if [ "$NOCTL" = 0 ]; then
+    evaluate "$CONTROL" "$CTL" "$step" "$CONTROL-$step-policy-r3"
+  fi
 done
 
+if [ "$NOCTL" = 1 ]; then CTL_NOTE="(trained and measured elsewhere)"
+else CTL_NOTE=${CTL:-(already trained)}; fi
 {
-  echo "# round 3, $( [ "$DRY" = 1 ] && echo "dry run" || echo "submitted") $(date -u +%FT%TZ); labels ${WORLDS}x${TOPK} in $LABELS"
+  echo "# round 3, $( [ "$DRY" = 1 ] && echo "dry run" || echo "submitted") $(date -u +%FT%TZ); from $CK; labels ${WORLDS}x${TOPK}$( [ "$AGREE" = 1 ] && echo ", agreed" || true)${SEED:+, seed $SEED} in $LABELS"
   echo "$RUN $LIVE"
   echo "followers $FOLLOW"
-  echo "control $CONTROL ${CTL:-(already trained)}"
+  echo "control $CONTROL $CTL_NOTE"
   echo "evals ${EVAL_IDS[*]}"
   echo "# report, once every record exists (B - A per milestone, then pooled):"
   printf 'python research/scripts/tab_evals.py --paired'
@@ -120,4 +152,4 @@ done
     printf ' \\\n  %s %s' "$EVALS/$CONTROL-$step-policy-r3.jsonl" "$EVALS/$RUN-$step-policy.jsonl"
   done
   echo
-} | if [ "$DRY" = 1 ]; then cat; else tee "$TRACTOR_ROOT/round3-jobs.txt"; fi
+} | if [ "$DRY" = 1 ]; then cat; else tee "$JOBS"; fi

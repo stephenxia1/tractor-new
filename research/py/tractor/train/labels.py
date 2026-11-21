@@ -70,9 +70,10 @@ def load_agent(checkpoint: str | Path, device: Any = "cpu"):
 
 
 def label_hands(agent: tuple, hands: int, search: Any, rng: np.random.Generator,
-                device: Any = "cpu", cache: Any = None):
+                device: Any = "cpu", cache: Any = None, agree: bool = False):
     """``(DistillRows, stats)`` for ``hands`` hands from ``agent`` (as
-    ``load_agent`` returns it)."""
+    ``load_agent`` returns it); ``agree`` keeps only labels two searches
+    agree on (``distill.generate``)."""
     from ..nn.features import Cache
     from . import starts as S
     from .distill import generate
@@ -82,7 +83,7 @@ def label_hands(agent: tuple, hands: int, search: Any, rng: np.random.Generator,
     pre = S.PrePlayConfig(random_burial_frac=0.0, burial="policy")
     starts, _rows, _st = S.make_starts(rng, hands, net, declare_net, device, pre=pre,
                                        cache=cache, bury_net=bury_net)
-    return generate(net, starts, search, rng, device, cfg, cache)
+    return generate(net, starts, search, rng, device, cfg, cache, agree=agree)
 
 
 def _save(rows: Any, out: Path) -> None:
@@ -196,7 +197,7 @@ def _run_finished(run_dir: Path, step: int) -> bool:
 def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
            seed: int, task: int = 0, worker: int = 0, keep: int = 50,
            poll_s: float = 60.0, max_shards: int | None = None,
-           log: Any = print, initial: str = "") -> int:
+           log: Any = print, initial: str = "", agree: bool = False) -> int:
     """Label shards from ``run_dir``'s newest checkpoint until the run
     finishes (or ``max_shards``). -> shards written.
 
@@ -204,7 +205,8 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
     it starts. This worker's own shards beyond the newest ``keep`` are
     deleted, so several workers and array tasks share one directory
     without racing. Until the run has a checkpoint, ``initial``
-    (``initial_checkpoint``) stands in for it; "" waits.
+    (``initial_checkpoint``) stands in for it; "" waits. ``agree`` keeps
+    only labels two searches agree on.
     """
     run_dir, out_dir = Path(run_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -234,14 +236,24 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
             loaded_step = step
         t0 = time.perf_counter()
         rng = np.random.default_rng([seed, task, worker, n])
-        rows, stats = label_hands(agent, hands, search, rng)
+        try:
+            rows, stats = label_hands(agent, hands, search, rng, agree=agree)
+        except RuntimeError:
+            if not agree:
+                raise
+            # Agreement left no label in these few hands: the next shard.
+            n += 1
+            if _run_finished(run_dir, loaded_step):
+                return written
+            continue
         out = out_dir / shard_name(loaded_step, task, worker, n)
         _save(rows, out)
         n += 1
         written += 1
+        kept = f", {stats['search_agreed']:.0f} agreed" if agree else ""
         log(f"[t{task} w{worker}] {out.name}: {len(rows)} rows from step {loaded_step} "
             f"in {time.perf_counter() - t0:.0f} s "
-            f"({stats['searched']:.0f} searched of {stats['decisions']:.0f})")
+            f"({stats['searched']:.0f} searched of {stats['decisions']:.0f}{kept})")
         mine = sorted(out_dir.glob(f"s*-t{task:03d}-w{worker:02d}-*.npz"),
                       key=lambda p: (shard_step(p), p.name))
         for old in mine[: max(0, len(mine) - keep)]:

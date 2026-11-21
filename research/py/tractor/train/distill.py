@@ -83,14 +83,22 @@ def generate(
     cfg: ModelConfig,
     cache: Cache | None = None,
     max_rows: int | None = None,
+    agree: bool = False,
 ) -> tuple[DistillRows, dict[str, float]]:
     """Play ``starts`` to the end with the policy; label the positions
-    where search acts with search's choice. -> (rows, stats)."""
+    where search acts with search's choice. -> (rows, stats).
+
+    ``agree``: search each such position a second time, on worlds of its
+    own, and keep the label only where both searches choose the same
+    move. Two searches of one position agree on ~72% of them (README,
+    "Distillation flattened the policy"); the rest are search choosing
+    between moves its few worlds cannot tell apart. Costs a second search
+    per label."""
     from ..eval.search import CandidatePolicy
 
     cache = cache or Cache()
     keep: dict[str, list] = {f.name: [] for f in fields(DistillRows)}
-    decisions = searched = changed = 0
+    decisions = searched = changed = agreed = 0
     net.eval()
     # Search's forward (eval/fastnet.py): the policy's logits computed as
     # the training forward computes them, without the work not read.
@@ -124,6 +132,12 @@ def generate(
                 if did:
                     searched += 1
                     changed += int(index != top)
+                if did and agree:
+                    again, _ = search_move(net, state, list(moves.moves[:n]), logp, search,
+                                           rng, cache, cfg, device, policy=policy)
+                    did = again == index
+                    agreed += int(did)
+                if did:
                     for name in ("history", "context", "unseen", "planes", "cards",
                                  "candidates", "candidate_mask", "privileged"):
                         keep[name].append(getattr(packed, name))
@@ -133,9 +147,9 @@ def generate(
             # The learner's own move, sampled as the rollout samples it.
             p = np.exp(logp - logp.max())
             state.step(moves.moves[int(rng.choice(n, p=p / p.sum()))])
-            if max_rows is not None and searched >= max_rows:
+            if max_rows is not None and len(keep["target"]) >= max_rows:
                 break
-        if max_rows is not None and searched >= max_rows:
+        if max_rows is not None and len(keep["target"]) >= max_rows:
             break
     if not keep["target"]:
         raise RuntimeError("search acted on no decision")
@@ -146,6 +160,8 @@ def generate(
              "search_changed": float(changed),
              "searched_frac": searched / max(decisions, 1),
              "changed_frac": changed / max(searched, 1)}
+    if agree:
+        stats.update(search_agreed=float(agreed), agree_frac=agreed / max(searched, 1))
     return rows, stats
 
 

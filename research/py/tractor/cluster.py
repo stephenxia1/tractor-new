@@ -112,6 +112,9 @@ def _train_parser(sub: Any) -> None:
     p.add_argument("--distill-max-age", type=int, default=0)
     p.add_argument("--declare-reward", default="critic")
     p.add_argument("--action-space", default="", choices=("", "candidates", "cards"))
+    # TrainConfig.seed (torch and numpy); unset keeps its default, which
+    # every run before 2026-11-21 trained with.
+    p.add_argument("--seed", type=int, default=None)
 
 
 def _bot_list(spec: str) -> tuple[str, ...]:
@@ -180,6 +183,7 @@ def train_overrides(a: argparse.Namespace) -> dict:
                      "window_rows": a.distill_window_rows,
                      **({"max_age": a.distill_max_age} if a.distill_max_age else {})}
                     if a.distill_paths else {}),
+        **({"seed": a.seed} if a.seed is not None else {}),
     }
 
 
@@ -502,6 +506,8 @@ def _follow_parser(sub: Any) -> None:
     p.add_argument("--initial-checkpoint", default="",
                    help="label from this checkpoint until the run writes one of its own; "
                         "'auto': the one it resumed from (launch.json). '' waits")
+    p.add_argument("--agree", action="store_true",
+                   help="search each labelled position twice; keep it only where both agree")
 
 
 def run_follow(a: argparse.Namespace) -> int:
@@ -512,7 +518,7 @@ def run_follow(a: argparse.Namespace) -> int:
                           extra_tricks=a.extra_tricks)
     written = follow_pool(a.workers, run_dir=a.run_dir, out_dir=a.out_dir, hands=a.hands,
                           search=search, seed=a.seed, task=a.task, keep=a.keep,
-                          poll_s=a.poll_s, initial=a.initial_checkpoint)
+                          poll_s=a.poll_s, initial=a.initial_checkpoint, agree=a.agree)
     print(json.dumps({"run_dir": a.run_dir, "task": a.task, "workers": a.workers,
                       "shards": written}), flush=True)
     return 0

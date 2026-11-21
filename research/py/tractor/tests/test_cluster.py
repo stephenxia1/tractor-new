@@ -49,6 +49,13 @@ def test_follow_initial_checkpoint_flag():
     base = ["follow", "--run-dir", "r", "--out-dir", "o"]
     assert ap.parse_args(base).initial_checkpoint == ""
     assert ap.parse_args([*base, "--initial-checkpoint", "auto"]).initial_checkpoint == "auto"
+    assert not ap.parse_args(base).agree and ap.parse_args([*base, "--agree"]).agree
+
+
+def test_seed_flag():
+    # Unset, the key is absent and TrainConfig keeps the seed every run used.
+    assert "seed" not in cluster.train_overrides(_parse([]))
+    assert cluster.train_overrides(_parse(["--seed", "2"]))["seed"] == 2
 
 
 def test_defaults_and_v6():

@@ -16,8 +16,8 @@ import torch
 from ..eval.search import SearchConfig
 from ..nn.model import ActorCritic, ModelConfig
 from ..train.distill import Distiller, DistillRows
-from ..train.labels import (FreshRows, follow, initial_checkpoint, newest_checkpoint,
-                            shard_name, shard_step)
+from ..train.labels import (FreshRows, follow, initial_checkpoint, label_hands, load_agent,
+                            newest_checkpoint, shard_name, shard_step)
 from ..train.loop import TrainConfig, train
 
 SMALL = ModelConfig(d_model=48, n_layers_history=1, n_layers_query=1, n_heads=4, d_ff=96,
@@ -134,6 +134,21 @@ def test_a_requeued_distiller_rereads_the_same_window_and_drops_stale_labels() -
 
 def _ckpt(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def test_agreement_keeps_only_labels_two_searches_agree_on() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ck = Path(tmp) / "checkpoints"
+        train(_cfg(ck))
+        agent = load_agent(ck / "step_0000002.pt")
+        rows, stats = label_hands(agent, 4, SEARCH, np.random.default_rng(3))
+        assert "search_agreed" not in stats and len(rows) == stats["searched"]
+        try:
+            rows, stats = label_hands(agent, 4, SEARCH, np.random.default_rng(3), agree=True)
+        except RuntimeError:  # no two searches agreed in four hands of a tiny net
+            return
+        assert len(rows) == stats["search_agreed"] <= stats["searched"]
+        assert stats["agree_frac"] == stats["search_agreed"] / stats["searched"]
 
 
 def test_follow_starts_from_the_resume_checkpoint_and_live_distill_resumes_its_optimiser() -> None:
