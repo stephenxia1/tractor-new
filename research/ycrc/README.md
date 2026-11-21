@@ -225,16 +225,29 @@ shards exist the run trains without distilling.
 
 ```bash
 RUN=zero2-live
+LABELS=/nfs/roberts/scratch/<group>/<netid>/distill/$RUN   # scratch, not project storage
 sbatch -p <gpu partition> --gpus=1 research/ycrc/train.sbatch \
   --name $RUN --resume $CK --steps 6000 $COMMON \
-  --distill-paths "$TRACTOR_ROOT/distill/$RUN/s*.npz" --distill-reload-every 25 \
+  --distill-paths "$LABELS/s*.npz" --distill-reload-every 25 \
   --distill-window-rows 200000 --distill-max-age 150 \
   --distill-coef 1.0 --distill-lr 1e-4 --distill-steps 8 --distill-minibatch 512
 sbatch -p <cpu partition> --array=0-1 research/ycrc/follow.sbatch \
-  --run-dir $TRACTOR_ROOT/$RUN --out-dir $TRACTOR_ROOT/distill/$RUN \
-  --hands 16 --worlds 12 --top-k 4 --confident 0.99 --keep 100 \
+  --run-dir $TRACTOR_ROOT/$RUN --out-dir $LABELS \
+  --hands 16 --worlds 12 --top-k 4 --confident 0.99 --keep 20 --cleanup \
   --initial-checkpoint auto
 ```
+
+`research/ycrc/round3.sh` submits the arm, its followers, a control and
+the milestone evaluations in one go (`--labels-root` for the shards).
+
+**Label storage.** The shards are a cache, and a big one: a 16-hand shard
+is 5-20 MB, and each follower process keeps its own newest `--keep`.
+`--keep 100` over 64 processes held 124 GB for round 3 and, with three
+more runs started, filled the class's shared project quota on
+2026-11-21, failing every job. Keep them on scratch (purged after 30
+days, a separate quota), size `--keep` to about 1.5x the window (20 at 64
+processes), and let `--cleanup` delete each process's shards once the run
+has finished.
 
 `--initial-checkpoint auto` labels from the checkpoint the run resumed
 from (its `launch.json`) until the run writes one of its own, a

@@ -54,6 +54,11 @@ def test_follow_labels_the_newest_checkpoint_and_a_live_distiller_reads_it() -> 
                          log=lambda *_: None)
         shards = sorted(out.glob("s*.npz"))
         assert written == 1 and len(shards) == 1 and shard_step(shards[0]) == 2
+        # With cleanup a worker deletes its own shards once the run is
+        # done, and leaves the other workers' alone.
+        written = follow(run, out, hands=2, search=SEARCH, seed=1, worker=1, keep=5,
+                         poll_s=0.1, log=lambda *_: None, cleanup=True)
+        assert written == 1 and sorted(out.glob("s*.npz")) == shards
 
         summary = train(_cfg(
             Path(tmp) / "b" / "checkpoints", total_steps=2, warmup_steps=2,

@@ -50,6 +50,7 @@ def test_follow_initial_checkpoint_flag():
     assert ap.parse_args(base).initial_checkpoint == ""
     assert ap.parse_args([*base, "--initial-checkpoint", "auto"]).initial_checkpoint == "auto"
     assert not ap.parse_args(base).agree and ap.parse_args([*base, "--agree"]).agree
+    assert not ap.parse_args(base).cleanup and ap.parse_args([*base, "--cleanup"]).cleanup
 
 
 def test_seed_flag():

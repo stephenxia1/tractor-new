@@ -508,6 +508,8 @@ def _follow_parser(sub: Any) -> None:
                         "'auto': the one it resumed from (launch.json). '' waits")
     p.add_argument("--agree", action="store_true",
                    help="search each labelled position twice; keep it only where both agree")
+    p.add_argument("--cleanup", action="store_true",
+                   help="once the run has finished, delete this follower's shards")
 
 
 def run_follow(a: argparse.Namespace) -> int:
@@ -518,7 +520,8 @@ def run_follow(a: argparse.Namespace) -> int:
                           extra_tricks=a.extra_tricks)
     written = follow_pool(a.workers, run_dir=a.run_dir, out_dir=a.out_dir, hands=a.hands,
                           search=search, seed=a.seed, task=a.task, keep=a.keep,
-                          poll_s=a.poll_s, initial=a.initial_checkpoint, agree=a.agree)
+                          poll_s=a.poll_s, initial=a.initial_checkpoint, agree=a.agree,
+                          cleanup=a.cleanup)
     print(json.dumps({"run_dir": a.run_dir, "task": a.task, "workers": a.workers,
                       "shards": written}), flush=True)
     return 0

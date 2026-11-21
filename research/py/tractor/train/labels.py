@@ -197,7 +197,8 @@ def _run_finished(run_dir: Path, step: int) -> bool:
 def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
            seed: int, task: int = 0, worker: int = 0, keep: int = 50,
            poll_s: float = 60.0, max_shards: int | None = None,
-           log: Any = print, initial: str = "", agree: bool = False) -> int:
+           log: Any = print, initial: str = "", agree: bool = False,
+           cleanup: bool = False) -> int:
     """Label shards from ``run_dir``'s newest checkpoint until the run
     finishes (or ``max_shards``). -> shards written.
 
@@ -206,10 +207,19 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
     deleted, so several workers and array tasks share one directory
     without racing. Until the run has a checkpoint, ``initial``
     (``initial_checkpoint``) stands in for it; "" waits. ``agree`` keeps
-    only labels two searches agree on.
+    only labels two searches agree on. ``cleanup``: once the run has
+    finished, delete this worker's shards on the way out -- they are a
+    cache for the trainer, and a run's worth of them is gigabytes.
     """
     run_dir, out_dir = Path(run_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    def finished() -> int:
+        if cleanup:
+            for old in out_dir.glob(f"s*-t{task:03d}-w{worker:02d}-*.npz"):
+                old.unlink(missing_ok=True)
+        return written
+
     mine = sorted(out_dir.glob(f"s*-t{task:03d}-w{worker:02d}-*.npz"))
     n = max((int(_SHARD.search(p.name).group(4)) + 1 for p in mine), default=0)
     agent = None
@@ -220,7 +230,7 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
         found = newest_checkpoint(run_dir)
         if found is None:
             if (run_dir / "checkpoints" / "final.pt").exists():
-                return written
+                return finished()
             if initial and first is None:
                 first = initial_checkpoint(run_dir, initial)
             if first is None:
@@ -244,7 +254,7 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
             # Agreement left no label in these few hands: the next shard.
             n += 1
             if _run_finished(run_dir, loaded_step):
-                return written
+                return finished()
             continue
         out = out_dir / shard_name(loaded_step, task, worker, n)
         _save(rows, out)
@@ -259,7 +269,7 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
         for old in mine[: max(0, len(mine) - keep)]:
             old.unlink(missing_ok=True)
         if _run_finished(run_dir, loaded_step):
-            return written
+            return finished()
     return written
 
 

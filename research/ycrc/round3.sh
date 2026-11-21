@@ -25,11 +25,17 @@
 # the follower cost per label, so with more --followers N, default 2).
 # --control NAME --no-control pairs against a control trained and
 # measured by another submission, and submits none.
+# --labels-root DIR puts the rolling label shards there (default
+# $TRACTOR_ROOT/distill; scratch is the place for them). Each follower
+# process keeps its newest --keep N shards (default 20: with 64 processes
+# ~1,300, about 1.5x a 200,000-row window) and deletes them once the run
+# has finished. (Keeping 100 each filled the class's project quota on
+# 2026-11-21: round 3's cache alone was 124 GB.)
 # Job ids go to $TRACTOR_ROOT/round3-jobs.txt (round3-<name>-jobs.txt
 # with --name).
 set -euo pipefail
 GPU="" CPU="" WORLDS=8 TOPK=3 ACCOUNT="" CONTROL=zero2-d2c FRESH=0 DRY=1
-RESUME="" RUN=zero2-live SEED="" AGREE=0 NFOLLOW=2 NOCTL=0
+RESUME="" RUN=zero2-live SEED="" AGREE=0 NFOLLOW=2 NOCTL=0 LROOT="" KEEP=20
 while [ $# -gt 0 ]; do
   case "$1" in
     --gpu) GPU="$2"; shift 2 ;;
@@ -45,6 +51,8 @@ while [ $# -gt 0 ]; do
     --seed) SEED="$2"; shift 2 ;;
     --agree) AGREE=1; shift ;;
     --followers) NFOLLOW="$2"; shift 2 ;;
+    --labels-root) LROOT="$2"; shift 2 ;;
+    --keep) KEEP="$2"; shift 2 ;;
     --submit) DRY=0; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -60,7 +68,7 @@ AGREEA=(); [ "$AGREE" = 1 ] && AGREEA=(--agree)
 
 : "${TRACTOR_ROOT:=$HOME/project/tractor-runs}"
 CK=${RESUME:-$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt}
-LABELS=$TRACTOR_ROOT/distill/$RUN
+LABELS=${LROOT:-$TRACTOR_ROOT/distill}/$RUN
 EVALS=$TRACTOR_ROOT/evals
 JOBS=$TRACTOR_ROOT/round3-jobs.txt
 [ "$RUN" = zero2-live ] || JOBS=$TRACTOR_ROOT/round3-$RUN-jobs.txt
@@ -113,8 +121,8 @@ submit LIVE -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 research/ycrc/train.sbatc
 submit FOLLOW -p "$CPU" ${ACCT[@]+"${ACCT[@]}"} --array=0-$((NFOLLOW - 1)) \
   --dependency="after:$LIVE" research/ycrc/follow.sbatch \
   --run-dir "$TRACTOR_ROOT/$RUN" --out-dir "$LABELS" --hands 16 \
-  --worlds "$WORLDS" --top-k "$TOPK" --confident 0.99 --keep 100 --initial-checkpoint auto \
-  ${SEEDA[@]+"${SEEDA[@]}"} ${AGREEA[@]+"${AGREEA[@]}"}
+  --worlds "$WORLDS" --top-k "$TOPK" --confident 0.99 --keep "$KEEP" --cleanup \
+  --initial-checkpoint auto ${SEEDA[@]+"${SEEDA[@]}"} ${AGREEA[@]+"${AGREEA[@]}"}
 CTL=""
 if [ "$FRESH" = 1 ]; then
   # shellcheck disable=SC2086
