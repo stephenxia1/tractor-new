@@ -1739,6 +1739,36 @@ buries eight random cards, which leaves the play much more lopsided:
 v35 won 0.85 of its hands as attacker and 0.37 as defender there, and
 0.65 / 0.53 with its own pre-play.
 
+**At benchmark size (2026-11-21, Bouchet).** 770 deals on both usual
+seeds, each pre-play mode, 32 processes a match (about 5 minutes each):
+
+| pre-play | seed | v35 win | levels | points | v35 / v34 time |
+| --- | --- | --- | --- | --- | --- |
+| random | 20260923 | **0.601 ± 0.018** | **+0.345 ± 0.040** | **+13.7 ± 1.7** | 1.32 / 4.47 s a hand (0.29x) |
+| random | 20261114 | **0.619 ± 0.018** | **+0.356 ± 0.041** | **+14.3 ± 1.8** | 1.32 / 4.50 s a hand (0.29x) |
+| each team its own bot | 20260923 | **0.599 ± 0.020** | **+0.247 ± 0.041** | **+10.1 ± 1.6** | 1.23 / 4.19 s a hand (0.29x) |
+| each team its own bot | 20261114 | **0.605 ± 0.020** | **+0.266 ± 0.040** | **+10.6 ± 1.5** | 1.20 / 4.10 s a hand (0.29x) |
+
+The laptop rows above hold up: v35 beats v34 by about 0.60 win on every
+seed and in both modes. Records: `evals/2026-11-21/v35-vs-v34-*-2026*.jsonl`,
+each with its summary as `.txt`.
+
+**The zero agents against it.** Their own pre-play, 770 deals, seed
+20260923 (records `evals/2026-11-19/zero2-dst3-6000-policy-v35.jsonl` and
+`evals/2026-11-21/*-policy-v35.jsonl`):
+
+| checkpoint | win vs smart-v35 | levels | points | (win vs v18 / v28 / v34) |
+| --- | --- | --- | --- | --- |
+| `zero2-lr1e4` step 4000 | 0.499 ± 0.025 | -0.016 | -0.6 | 0.562 |
+| `zero2-c1e4` step 5000 | 0.497 ± 0.025 | -0.023 | +0.1 | 0.571 |
+| `zero2-d2c` step 6000 | 0.502 ± 0.025 | +0.023 | +1.0 | 0.578 |
+| `zero2-live` step 6000 | 0.490 ± 0.025 | -0.005 | +0.0 | 0.563 |
+| `zero2-dst3` step 6000 | **0.531 ± 0.025** | **+0.045** | **+1.7** | 0.595 |
+
+Every agent but `zero2-dst3` is level with v35. The spread between them
+(0.49-0.53) is about what it is against the fair bots (0.56-0.60), now
+centred on an even game rather than near 0.58, which leaves room above.
+
 Time is each bot's own decisions for its two seats over a hand, measured
 in the same processes on the same deals (v34's includes the engine's own
 small share). At 770 deals a benchmark against v35 costs about a third
@@ -1776,6 +1806,101 @@ npx tsx research/src/botMatch.ts --summary v35-v34.jsonl
 # a checkpoint against it (from research/py)
 python -m tractor.cluster eval --checkpoint CKPT --bots smart-v35 --out RECORDS.jsonl
 ```
+
+### Expert iteration in the run, and a clean round (2026-11-20 to 22, Bouchet)
+
+**Labels must be made in the run (the user's rule, 2026-11-20).**
+Distillation labels have to come from the run's own current network and
+search while it trains (`cluster follow` beside the trainer,
+`--distill-reload-every`, `ycrc/README.md` §5b), so that their compute is
+part of the run's: labels generated beforehand from a frozen checkpoint
+(rounds 1 and 2) put that compute outside it. `zero2-dst2` was distilled
+on such labels, so it and everything resumed from it (`zero2-d2c`,
+`zero2-dst3`, `zero2-live`) do not qualify. The clean lineage is `zero2`
+-> `zero2-lr1e4` (resumed at 3000) -> `zero2-c1e4` (plain PPO to 5000).
+
+All runs below use `zero2-dst2`'s `COMMON` settings and its distillation
+(coef 1.0, lr 1e-4, 8 minibatches of 512 a step), labels at 8 worlds x
+top 3, confidence 0.99, from CPU followers on the run's newest checkpoint:
+a 200,000-row window reread every 25 steps, none older than 150 steps.
+Evaluation is the standing benchmark: their own pre-play, 770 deals per
+fair bot, seed 20260923, levels paired deal by deal. Differences are the
+distilled arm minus a plain-PPO control from the same checkpoint.
+
+**From `zero2-dst2` step 5000 (`zero2-live`, not clean): nothing.**
+Against `zero2-d2c`:
+
+| | win | levels | points |
+| --- | --- | --- | --- |
+| step 5250 | +0.020 +/- 0.014 | +0.047 +/- 0.026 | +1.19 +/- 0.91 |
+| step 5500 | -0.014 +/- 0.014 | +0.003 +/- 0.025 | +0.59 +/- 0.94 |
+| step 5750 | +0.007 +/- 0.015 | +0.011 +/- 0.027 | +0.10 +/- 0.98 |
+| step 6000 | -0.014 +/- 0.015 | -0.020 +/- 0.026 | -1.12 +/- 0.94 |
+| the four milestones | -0.000 +/- 0.007 | +0.010 +/- 0.013 | +0.19 +/- 0.47 |
+
+At step 6000 it trails round 2's `zero2-dst3` by -0.032 +/- 0.015 win and
+-3.07 +/- 0.97 points (levels -0.068 +/- 0.032 u). The machinery worked
+(labels from step 5000 at the first refresh, a full window from step
+5025, labels 25-50 steps old), and search's share of decisions rose from
+0.647 to 0.72 within 100 steps and held: the policy, already flattened by
+round 1, flattened further.
+
+**From `zero2-c1e4` step 5000 (clean).** Three arms against
+`zero2-c1e4-ppo`: in-run labels (`zero2-c1e4-live`), the same with only
+the labels two independent searches agree on (`zero2-c1e4-agree`,
+`follow --agree`, which kept 0.74 of them), and a second training seed
+of both the distilled arm and the control (`--seed 2`; every earlier run
+trained with TrainConfig's 20260921):
+
+| live - ppo | win | levels | points |
+| --- | --- | --- | --- |
+| step 5250 | +0.008 +/- 0.015 | +0.021 +/- 0.026 | +0.69 +/- 0.96 |
+| step 5500 | +0.011 +/- 0.015 | +0.059 +/- 0.025 | +2.28 +/- 0.91 |
+| step 5750 | +0.011 +/- 0.015 | +0.016 +/- 0.026 | +0.50 +/- 0.93 |
+| step 6000 | -0.010 +/- 0.015 | -0.004 +/- 0.027 | -0.25 +/- 0.97 |
+| the four milestones | +0.005 +/- 0.007 | **+0.023 +/- 0.013** | **+0.80 +/- 0.47** |
+| seed 2, the four milestones | +0.009 +/- 0.007 | +0.011 +/- 0.013 | +0.35 +/- 0.48 |
+| **both seeds, 36,960 hands** | **+0.007 +/- 0.005** | **+0.017 +/- 0.009** | **+0.58 +/- 0.34** |
+| agreed labels - ppo, the four milestones | +0.006 +/- 0.007 | +0.026 +/- 0.013 | +1.19 +/- 0.48 |
+| agreed labels - live | +0.001 +/- 0.007 | +0.003 +/- 0.013 | +0.38 +/- 0.45 |
+
+| win / levels / points | step 5250 | step 5500 | step 5750 | step 6000 |
+| --- | --- | --- | --- | --- |
+| `zero2-c1e4-ppo` | 0.566 / +0.165 / +6.7 | 0.568 / +0.146 / +6.2 | 0.570 / +0.184 / +7.5 | 0.563 / +0.163 / +7.0 |
+| `zero2-c1e4-live` | 0.574 / +0.186 / +7.4 | 0.579 / +0.205 / +8.5 | 0.582 / +0.200 / +8.0 | 0.553 / +0.159 / +6.7 |
+| `zero2-c1e4-agree` | 0.568 / +0.171 / +6.8 | **0.584 / +0.207 / +8.5** | 0.582 / +0.211 / +8.8 | 0.559 / +0.175 / +8.1 |
+| `zero2-c1e4-ppo-s2` | 0.570 / +0.182 / +7.7 | 0.581 / +0.203 / +8.1 | 0.575 / +0.183 / +7.8 | 0.563 / +0.162 / +6.4 |
+| `zero2-c1e4-live-s2` | **0.594 / +0.194 / +7.8** | 0.573 / +0.196 / +8.0 | 0.582 / +0.195 / +8.0 | 0.579 / +0.190 / +7.7 |
+
+(`zero2-c1e4` step 5000 itself: 0.571 / +0.196 / +7.8.)
+
+- **A small gain, on both seeds.** Pooled over both seeds the distilled
+  arm leads by +0.007 +/- 0.005 win, +0.017 +/- 0.009 levels and +0.58
+  +/- 0.34 points, about round 1's size (+0.001 win, +0.75 points) and
+  below round 2's fixed labels (+0.012 win, +1.45 points). It peaks
+  around step 5500 and is gone in win rate by 6000 on seed 1.
+- **A second seed moves a run as much.** Seed 2 - seed 1 of the same
+  configuration: plain PPO +0.006 +/- 0.007 win, +0.018 +/- 0.012
+  levels, **+0.65 +/- 0.44 points**; distilled +0.010 +/- 0.007, +0.006
+  +/- 0.013, +0.20 +/- 0.46. The intervals in this README cover the
+  deals, not the training run, and a run-to-run difference is the size of
+  the distillation effect: every single-run comparison here (rounds 1-3
+  included) is less certain than its interval says.
+- **Agreement filtering changes nothing measurable.** The policy fits the
+  agreed labels better (agreement with search 0.54-0.56 against 0.50,
+  cross-entropy 1.13 against 1.25) and plays the same.
+- **The policy still flattens.** Search acted on about a quarter of
+  `zero2-c1e4`'s decisions (0.255 in its evaluation records) and on
+  0.72-0.74 of the distilled arms' by mid-run, with or without filtering,
+  which points at the one-hot targets rather than their noise or their
+  age.
+
+Cost: 9.1-9.4 hours a distilled arm on an A5000, with 580-600 core-hours
+of followers (two 32-core tasks on `day`; 1,183 for the four tasks the
+agreement filter used), and 8.4 hours a control (5.9 on an RTX 5000 Ada).
+In round 3 the followers wrote ~2.6x the rows the trainer read; one task
+would have done. Records: `evals/2026-11-20/zero2-{live,d2c}-*-policy*.jsonl` and
+`evals/2026-11-22/zero2-c1e4-*.jsonl`.
 
 ## Next steps
 
