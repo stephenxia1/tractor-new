@@ -1669,7 +1669,13 @@ From random declarations and burials the two arms play alike (-0.003 +/-
 0.009 win, +0.76 +/- 0.78 points): the gain shows in the positions the
 agent's own pre-play leads to, not as stronger play from any start.
 `zero2-dst3` step 6000 + search is the best bot measured, 0.620 / +11.8
-and 0.626 / +11.9 on the two seeds. Records:
+and 0.626 / +11.9 on the two seeds; against `zero2-dst2` step 5000 +
+search on the same deals it gains +0.014 +/- 0.010 win and +1.44 +/- 0.65
+points (levels unpaired, the round-1 records keeping none per deal). The
+flattening of the section above went on: search acts on 72% of
+`zero2-dst3`'s decisions, against 64.5% for `zero2-dst2` and 29% for the
+plain-PPO `zero2-d2c`, so a third round from it would label still more
+positions per hand. Records:
 `evals/2026-11-19/zero2-{d2c,dst3}-6000-policy*.jsonl` (step 6000, first
 pass) and `evals/2026-11-21/zero2-{d2c,dst3}-*.jsonl` (all sixteen).
 
