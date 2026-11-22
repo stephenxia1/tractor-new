@@ -31,11 +31,16 @@
 # ~1,300, about 1.5x a 200,000-row window) and deletes them once the run
 # has finished. (Keeping 100 each filled the class's project quota on
 # 2026-11-21: round 3's cache alone was 124 GB.)
+# --to STEP trains to that step instead of 6000 and measures the four
+# milestones up to it (STEP-750 ... STEP, every 250). --after JOB holds
+# both trainers until that job has succeeded (the one writing --resume),
+# so the round can be queued before its starting checkpoint exists.
 # Job ids go to $TRACTOR_ROOT/round3-jobs.txt (round3-<name>-jobs.txt
 # with --name).
 set -euo pipefail
 GPU="" CPU="" WORLDS=8 TOPK=3 ACCOUNT="" CONTROL=zero2-d2c FRESH=0 DRY=1
 RESUME="" RUN=zero2-live SEED="" AGREE=0 NFOLLOW=2 NOCTL=0 LROOT="" KEEP=20
+TO=6000 AFTER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --gpu) GPU="$2"; shift 2 ;;
@@ -53,6 +58,8 @@ while [ $# -gt 0 ]; do
     --followers) NFOLLOW="$2"; shift 2 ;;
     --labels-root) LROOT="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
+    --to) TO="$2"; shift 2 ;;
+    --after) AFTER="$2"; shift 2 ;;
     --submit) DRY=0; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -65,6 +72,8 @@ fi
 ACCT=(); [ -n "$ACCOUNT" ] && ACCT=(-A "$ACCOUNT")
 SEEDA=(); [ -n "$SEED" ] && SEEDA=(--seed "$SEED")
 AGREEA=(); [ "$AGREE" = 1 ] && AGREEA=(--agree)
+AFTERA=(); [ -n "$AFTER" ] && AFTERA=(--dependency="afterok:$AFTER")
+MILESTONES="$((TO - 750)) $((TO - 500)) $((TO - 250)) $TO"
 
 : "${TRACTOR_ROOT:=$HOME/project/tractor-runs}"
 CK=${RESUME:-$TRACTOR_ROOT/ckpt/zero2-dst2-5000.pt}
@@ -73,14 +82,16 @@ EVALS=$TRACTOR_ROOT/evals
 JOBS=$TRACTOR_ROOT/round3-jobs.txt
 [ "$RUN" = zero2-live ] || JOBS=$TRACTOR_ROOT/round3-$RUN-jobs.txt
 if [ "$DRY" = 0 ]; then
-  [ -f "$CK" ] || { echo "missing $CK (README.md §2)" >&2; exit 1; }
+  if [ -z "$AFTER" ] && [ ! -f "$CK" ]; then
+    echo "missing $CK (README.md §2)" >&2; exit 1
+  fi
   [ -e "$TRACTOR_ROOT/$RUN" ] && { echo "$TRACTOR_ROOT/$RUN exists; not training over it" >&2; exit 1; }
   if [ "$FRESH" = 1 ]; then
     if [ -e "$TRACTOR_ROOT/$CONTROL" ]; then
       echo "$TRACTOR_ROOT/$CONTROL exists; not training over it" >&2; exit 1
     fi
   elif [ "$NOCTL" = 0 ]; then
-    for s in 5250 5500 5750 6000; do
+    for s in $MILESTONES; do
       f=$TRACTOR_ROOT/$CONTROL/milestones/$(printf 'step_%07d.pt' "$s")
       [ -f "$f" ] || { echo "missing control milestone $f" >&2; exit 1; }
     done
@@ -111,8 +122,8 @@ COMMON="--arch v5 --hands 1024 --lr 1e-4 --length-buckets 4 --checkpoint-every 5
 DISTILL="--distill-coef 1.0 --distill-lr 1e-4 --distill-steps 8 --distill-minibatch 512"
 
 # shellcheck disable=SC2086
-submit LIVE -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 research/ycrc/train.sbatch \
-  --name "$RUN" --resume "$CK" --steps 6000 $COMMON $DISTILL \
+submit LIVE -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 ${AFTERA[@]+"${AFTERA[@]}"} \
+  research/ycrc/train.sbatch --name "$RUN" --resume "$CK" --steps "$TO" $COMMON $DISTILL \
   --distill-paths "$LABELS/s*.npz" --distill-reload-every 25 \
   --distill-window-rows 200000 --distill-max-age 150 ${SEEDA[@]+"${SEEDA[@]}"}
 # Tasks of 32 cores (two by default), from when the trainer starts (it writes
@@ -126,8 +137,9 @@ submit FOLLOW -p "$CPU" ${ACCT[@]+"${ACCT[@]}"} --array=0-$((NFOLLOW - 1)) \
 CTL=""
 if [ "$FRESH" = 1 ]; then
   # shellcheck disable=SC2086
-  submit CTL -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 research/ycrc/train.sbatch \
-    --name "$CONTROL" --resume "$CK" --steps 6000 $COMMON ${SEEDA[@]+"${SEEDA[@]}"}
+  submit CTL -p "$GPU" ${ACCT[@]+"${ACCT[@]}"} --gpus=1 ${AFTERA[@]+"${AFTERA[@]}"} \
+    research/ycrc/train.sbatch --name "$CONTROL" --resume "$CK" --steps "$TO" $COMMON \
+    ${SEEDA[@]+"${SEEDA[@]}"}
 fi
 
 EVAL_IDS=()
@@ -139,7 +151,7 @@ evaluate() {  # run after-job(or "") step out-name
     research/ycrc/eval.sbatch --checkpoint "$ck" --out "$EVALS/$name.jsonl"
   EVAL_IDS+=("$id")
 }
-for step in 5250 5500 5750 6000; do
+for step in $MILESTONES; do
   evaluate "$RUN" "$LIVE" "$step" "$RUN-$step-policy"
   if [ "$NOCTL" = 0 ]; then
     evaluate "$CONTROL" "$CTL" "$step" "$CONTROL-$step-policy-r3"
@@ -149,14 +161,14 @@ done
 if [ "$NOCTL" = 1 ]; then CTL_NOTE="(trained and measured elsewhere)"
 else CTL_NOTE=${CTL:-(already trained)}; fi
 {
-  echo "# round 3, $( [ "$DRY" = 1 ] && echo "dry run" || echo "submitted") $(date -u +%FT%TZ); from $CK; labels ${WORLDS}x${TOPK}$( [ "$AGREE" = 1 ] && echo ", agreed" || true)${SEED:+, seed $SEED} in $LABELS"
+  echo "# round 3, $( [ "$DRY" = 1 ] && echo "dry run" || echo "submitted") $(date -u +%FT%TZ); from $CK${AFTER:+ (after job $AFTER)} to step $TO; labels ${WORLDS}x${TOPK}$( [ "$AGREE" = 1 ] && echo ", agreed" || true)${SEED:+, seed $SEED} in $LABELS"
   echo "$RUN $LIVE"
   echo "followers $FOLLOW"
   echo "control $CONTROL $CTL_NOTE"
   echo "evals ${EVAL_IDS[*]}"
   echo "# report, once every record exists (B - A per milestone, then pooled):"
   printf 'python research/scripts/tab_evals.py --paired'
-  for step in 5250 5500 5750 6000; do
+  for step in $MILESTONES; do
     printf ' \\\n  %s %s' "$EVALS/$CONTROL-$step-policy-r3.jsonl" "$EVALS/$RUN-$step-policy.jsonl"
   done
   echo
