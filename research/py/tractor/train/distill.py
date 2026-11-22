@@ -33,7 +33,12 @@ from ..nn.model import ModelConfig
 from .buffer import obs_batch_from_arrays
 from .rollout import _InFlight, _evaluate, _pack
 
-__all__ = ["DistillRows", "generate", "load_rows", "Distiller"]
+__all__ = ["DistillRows", "NoLabels", "generate", "load_rows", "Distiller"]
+
+
+class NoLabels(RuntimeError):
+    """``generate`` kept no label: search acted on no decision, or with
+    ``agree`` no two searches agreed. Still a ``RuntimeError``, as before."""
 
 
 @dataclass
@@ -152,7 +157,7 @@ def generate(
         if max_rows is not None and len(keep["target"]) >= max_rows:
             break
     if not keep["target"]:
-        raise RuntimeError("search acted on no decision")
+        raise NoLabels("search acted on no decision" + (" both searches agreed on" if agree else ""))
     rows = DistillRows(**{
         name: np.asarray(v, dtype=np.int64) if name in ("history_len", "target", "prior_top")
         else np.stack(v) for name, v in keep.items()})

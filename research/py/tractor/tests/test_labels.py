@@ -192,3 +192,35 @@ def test_follow_starts_from_the_resume_checkpoint_and_live_distill_resumes_its_o
         assert adam(live / "step_0000002.pt") == 2.0
         train(_cfg(live, total_steps=3, **live_kw), resume=str(live / "step_0000002.pt"))
         assert adam(live / "step_0000003.pt") == 3.0
+
+
+def test_follow_skips_hands_without_an_agreed_label_but_stops_on_other_errors(monkeypatch) -> None:
+    """With ``agree``, hands that leave no label (``NoLabels``) move on to
+    the next shard; any other error, including another ``RuntimeError``
+    (how torch reports a shape mismatch or running out of memory), still
+    stops the follower instead of looping without writing."""
+    import pytest
+
+    from ..train import labels as L
+    from ..train.distill import NoLabels
+
+    calls: list[bool] = []
+
+    def label(agent, hands, search, rng, agree=False):
+        calls.append(agree)
+        if len(calls) == 1:
+            raise NoLabels("no two searches agreed")
+        if len(calls) == 2:
+            raise RuntimeError("mat1 and mat2 shapes cannot be multiplied")
+        raise ValueError("kept looping past a real error")  # ends a loop that swallows it
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        (run / "checkpoints").mkdir(parents=True)
+        monkeypatch.setattr(L, "newest_checkpoint",
+                            lambda d: (run / "checkpoints" / "step_0000004.pt", 4))
+        monkeypatch.setattr(L, "load_agent", lambda path, device="cpu": object())
+        monkeypatch.setattr(L, "label_hands", label)
+        with pytest.raises(RuntimeError, match="shapes"):
+            L.follow(run, Path(tmp) / "labels", 2, SEARCH, seed=0, agree=True, poll_s=0)
+    assert calls == [True, True]

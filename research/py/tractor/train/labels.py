@@ -211,6 +211,8 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
     finished, delete this worker's shards on the way out -- they are a
     cache for the trainer, and a run's worth of them is gigabytes.
     """
+    from .distill import NoLabels
+
     run_dir, out_dir = Path(run_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -248,10 +250,12 @@ def follow(run_dir: str | Path, out_dir: str | Path, hands: int, search: Any,
         rng = np.random.default_rng([seed, task, worker, n])
         try:
             rows, stats = label_hands(agent, hands, search, rng, agree=agree)
-        except RuntimeError:
+        except NoLabels:
             if not agree:
                 raise
             # Agreement left no label in these few hands: the next shard.
+            # Any other error (a bad checkpoint, say) still stops the
+            # follower rather than looping without a shard.
             n += 1
             if _run_finished(run_dir, loaded_step):
                 return finished()

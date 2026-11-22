@@ -1606,7 +1606,9 @@ rather than on another candidate.
 
 `zero2-dst3` resumed `zero2-dst2` step 5000 with distillation (coef 1.0,
 lr 1e-4, 8 minibatches of 512 a step) on fresh labels from that
-checkpoint, 290,357 positions searched at 8 worlds x top 3; `zero2-d2c`
+checkpoint, 290,357 positions searched at 8 worlds x top 3 (the plan said
+12 x 4; the user approved 8 x 3 on 2026-11-22, 12 x 4 having shown no gain
+in play or in label agreement, above); `zero2-d2c`
 resumed the same checkpoint on plain PPO. Both trained to step 6000 on
 YCRC Bouchet. Step 6000, its own pre-play, 770 deals per fair bot, seed
 20260923 (the records predate per-deal levels, so levels are unpaired, `u`):
