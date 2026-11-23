@@ -24,6 +24,12 @@ const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ||
   'ws://localhost:8787/ws';
 
+// The ws server's cumulative results, GET /stats on the same host:
+// ws(s)://host/ws -> http(s)://host/stats.
+export function statsUrl(): string {
+  return `${WS_URL.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws\/?$/, '')}/stats`;
+}
+
 const SESSION_KEY = 'tractor:session';
 
 export function getOrCreateSessionToken(): string {

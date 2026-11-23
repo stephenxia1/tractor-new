@@ -42,7 +42,20 @@ export type Room = {
   // Timestamp until which bots should NOT act — used to keep them from
   // declaring before the client-side deal animation has revealed all cards.
   dealingEndsAt?: number;
+  // Who sat where when the current hand was dealt (results.ts's
+  // seatingKey), so a hand whose seating changed midway is marked.
+  handStartSeating?: string;
 };
+
+// Called after every event the engine accepts, with the room before and
+// after it (the after-room is the one the caller stores). index.ts uses it
+// to record finished hands.
+type ApplyObserver = (before: Room, after: Room) => void;
+let applyObserver: ApplyObserver | null = null;
+
+export function setApplyObserver(fn: ApplyObserver | null): void {
+  applyObserver = fn;
+}
 
 export function newRoom(code: string): Room {
   const game = createGame({ ...defaultV1Config(), incrementalDeal: true });
@@ -175,6 +188,13 @@ export function applyToRoom(
     room: { ...room, game: res.state },
   };
   if (res.notice !== undefined) out.notice = res.notice;
+  if (applyObserver !== null) {
+    try {
+      applyObserver(room, out.room);
+    } catch (e) {
+      console.error('[applyObserver]', e);
+    }
+  }
   return out;
 }
 

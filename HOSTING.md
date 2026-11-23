@@ -67,6 +67,31 @@ fly scale memory 512           # bump memory if needed
 fly machine list               # see all machines
 ```
 
+### 1.5 The results volume
+
+The server appends one JSON line per finished hand at a table with a
+human to `RESULTS_PATH` (`/data/results.jsonl`, `fly.toml`), on a Fly
+volume so it survives redeploys; `GET /stats` serves the per-matchup
+summary the web app's `/stats` page shows. Create the volume once,
+before the first deploy that mounts it:
+
+```bash
+fly volumes create tractor_data --region sjc --size 1 -a tractor-ws-stephenxia
+fly deploy
+```
+
+A volume belongs to one machine, so keep the app at one machine
+(`min_machines_running = 1`, no `fly scale count 2`). To take a copy of
+the raw records for analysis:
+
+```bash
+fly ssh sftp get /data/results.jsonl results.jsonl -a tractor-ws-stephenxia
+```
+
+Each line holds the seats (a human as a hash of their browser's session
+token, a bot as its type), the landlord, the attackers' final points,
+the engine's hand result and levels, and whether the game ended.
+
 ---
 
 ## 2. Deploy the web app to Vercel
@@ -114,6 +139,7 @@ WS, and confirm a connection to `wss://tractor-ws-yourname.fly.dev/ws`.
 | Web     | `NEXT_PUBLIC_WS_URL` | Vercel Project → Env Variables     | Must be `wss://`, must include `/ws` path        |
 | WS      | `PORT`               | `fly.toml` (already 8787)          | Fly maps :80/:443 → internal_port for you        |
 | WS      | `ALLOWED_ORIGINS`    | `fly secrets set ALLOWED_ORIGINS`  | Comma-separated list of allowed browser origins  |
+| WS      | `RESULTS_PATH`       | `fly.toml` (`/data/results.jsonl`) | Results file on the volume; unset keeps them in memory |
 
 ---
 
@@ -138,6 +164,7 @@ The web client falls back to `ws://localhost:8787/ws` when
 
 - **State is in memory.** Rooms, sessions, and active games live in the
   WS server process. A Fly redeploy or crash drops every active room.
+  Only the hand results persist, on the volume (§1.5).
   This is fine for a small project; if you want persistence, the
   natural step is to add Redis (Fly has a managed addon).
 - **Single-region by default.** Fly can scale to multiple regions, but

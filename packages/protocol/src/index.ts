@@ -121,6 +121,60 @@ export type ServerMessage =
   | { kind: 'error'; error: string };
 
 // ---------------------------------------------------------------------------
+// Cumulative results (GET /stats on the ws server, shown at /stats)
+// ---------------------------------------------------------------------------
+
+// Every finished hand at a table with a human is recorded. A matchup is
+// one human team against one all-bot team, keyed by who sat where: for
+// example "human + smart-v35" against "smart-v35". Figures are from the
+// human team's side.
+export type MatchupStats = {
+  readonly key: string;
+  // "2 humans", or "human + <partner bot type>".
+  readonly humanSide: string;
+  // The opposing bots: "<type>" when both are the same, else "<a> + <b>".
+  readonly botSide: string;
+  readonly hands: number;
+  // Distinct human players (by browser) who played these hands.
+  readonly players: number;
+  // Hands the human team won: held the attackers under 80 as defenders,
+  // or reached 80 as attackers.
+  readonly wins: number;
+  readonly winRate: number;
+  // 95% Wilson interval on the win rate.
+  readonly winRateLow: number;
+  readonly winRateHigh: number;
+  // Mean point margin a hand: attacker points - 80 when the human team
+  // attacks, 80 - attacker points when it defends (the research
+  // evaluations' points margin when attack and defence are balanced).
+  readonly pointMargin: number;
+  // Half-width of its 95% interval; null below two hands.
+  readonly pointMarginHalfWidth: number | null;
+  // Mean levels a hand: the bracket's levels, + when the human team wins
+  // the hand, - when the bots do.
+  readonly levels: number;
+  readonly levelsHalfWidth: number | null;
+  readonly defending: { readonly hands: number; readonly wins: number };
+  readonly attacking: { readonly hands: number; readonly wins: number };
+  // Games played to the end (a team defended at A) and won by the humans.
+  readonly games: number;
+  readonly gamesWon: number;
+};
+
+export type StatsSummary = {
+  readonly generatedAt: number;
+  // Time of the first recorded hand, null before any.
+  readonly since: number | null;
+  // Every recorded hand (any table with a human).
+  readonly totalHands: number;
+  // Hands counted in a matchup: one team all human or human + bot, the
+  // other all bots, seating unchanged through the hand.
+  readonly matchupHands: number;
+  readonly players: number;
+  readonly matchups: ReadonlyArray<MatchupStats>;
+};
+
+// ---------------------------------------------------------------------------
 // Wire helpers
 // ---------------------------------------------------------------------------
 export function encode(msg: ClientMessage | ServerMessage): string {

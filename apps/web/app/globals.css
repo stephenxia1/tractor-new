@@ -853,3 +853,46 @@ button:disabled {
   padding: 8px 12px;
   border-radius: 6px;
 }
+
+/* /stats: cumulative results against the bots */
+.stats-page {
+  max-width: 1280px;
+  margin: 40px auto;
+  padding: 0 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.stats-scroll {
+  overflow-x: auto;
+  border: 1px solid #2f4233;
+  border-radius: 8px;
+}
+.stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.stats-table th,
+.stats-table td {
+  padding: 8px 10px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid #2f4233;
+}
+.stats-table th {
+  color: #94a89a;
+  font-weight: 500;
+  background: #1d2a21;
+}
+.stats-table tr:last-child td { border-bottom: none; }
+.stats-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.stats-table .muted { font-size: 13px; }
+.verdict-humans { color: #9adfb4; }
+.verdict-bots { color: #e8a0a0; }
+.verdict-open { color: #94a89a; }
+.stats-notes { font-size: 14px; max-width: 760px; }
+.stats-notes p { margin: 0 0 8px; }

@@ -13,6 +13,16 @@ primary_region = "sjc"
   # Comma-separated list of allowed browser origins. Leave unset during
   # local testing; set to your Vercel domain(s) in production.
   # ALLOWED_ORIGINS = "https://your-app.vercel.app"
+  # Cumulative results (apps/ws/src/results.ts): one JSON line per
+  # finished hand at a table with a human, on the volume below.
+  RESULTS_PATH = "/data/results.jsonl"
+
+# A persistent disk for the results file, made once with
+#   fly volumes create tractor_data --region sjc --size 1
+# (HOSTING.md §1.5).
+[mounts]
+  source = "tractor_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 8787

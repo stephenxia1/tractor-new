@@ -1,4 +1,5 @@
 'use client';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
@@ -68,6 +69,10 @@ export default function HomePage() {
       <button onClick={joinRoom} disabled={nick.trim() === '' || code.trim() === ''}>
         Join room
       </button>
+
+      <p className="muted">
+        <Link href="/stats">Results vs bots →</Link>
+      </p>
     </div>
   );
 }

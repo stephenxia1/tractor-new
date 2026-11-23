@@ -30,9 +30,11 @@ import {
   newRoom,
   privateStateFor,
   roomView,
+  setApplyObserver,
   type Client,
   type Room,
 } from './rooms';
+import { ResultsStore, handRecorder, playerId, type SeatRecord } from './results';
 import {
   applyEvent,
   createGame,
@@ -59,6 +61,32 @@ const ALL_BOT_TRICK_REVIEW_MS = 1200;
 function nextSeed(): number {
   return Math.floor(Math.random() * 0x7fffffff);
 }
+
+// Cumulative results (results.ts). RESULTS_PATH is a file on the Fly
+// volume in production; unset (local dev), records are kept in memory.
+const results = new ResultsStore(process.env.RESULTS_PATH || null);
+console.log(
+  `[results] ${process.env.RESULTS_PATH || '(memory only)'}: ${results.size} hands recorded so far`,
+);
+
+function seatRecords(room: Room): Array<SeatRecord | null> {
+  const out: Array<SeatRecord | null> = [];
+  for (let s = 0; s < room.game.config.numPlayers; s++) {
+    const occ = room.seating[s];
+    if (occ === null || occ === undefined) {
+      out.push(null);
+    } else if (occ.kind === 'bot') {
+      out.push({ kind: 'bot', botType: occ.botType });
+    } else {
+      const token = clients.get(occ.clientId)?.sessionToken;
+      out.push({ kind: 'human', player: playerId(token ?? occ.clientId) });
+    }
+  }
+  return out;
+}
+
+// Records each finished hand at a table with a human.
+setApplyObserver(handRecorder(results, seatRecords));
 
 const SUIT_SYMBOL: Record<string, string> = {
   spades: '♠',
@@ -766,6 +794,17 @@ const http = createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('ok');
+    return;
+  }
+  // Public aggregate results for the web app's /stats page. Readable from
+  // any origin: it holds only per-matchup totals.
+  if (req.method === 'GET' && (req.url === '/stats' || req.url?.startsWith('/stats?'))) {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*',
+    });
+    res.end(JSON.stringify(results.summary()));
     return;
   }
   res.writeHead(404);
