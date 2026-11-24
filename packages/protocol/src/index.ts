@@ -124,6 +124,40 @@ export type ServerMessage =
 // Cumulative results (GET /stats on the ws server, shown at /stats)
 // ---------------------------------------------------------------------------
 
+// One role's hands in a matchup (the human team defending, or attacking),
+// from the human team's side. The two roles have different baselines --
+// equal teams need not win half their hands in either -- so a role's
+// figures say how the humans fare in it, not who is better.
+export type RoleStats = {
+  readonly hands: number;
+  readonly wins: number;
+  readonly winRate: number;
+  // 95% Wilson interval on the win rate.
+  readonly winRateLow: number;
+  readonly winRateHigh: number;
+  // Mean point margin a hand (80 - attacker points defending, attacker
+  // points - 80 attacking) and the half-width of its 95% interval, null
+  // below two hands.
+  readonly pointMargin: number;
+  readonly pointMarginHalfWidth: number | null;
+  readonly levels: number;
+  readonly levelsHalfWidth: number | null;
+};
+
+// The defending and attacking figures averaged with equal weight, so the
+// share of hands a team spent defending (the winners keep the deal) does
+// not move them: the research evaluations' points margin, (points taken -
+// points conceded) / 2. Equal teams score 50% and 0 here. Half-widths are
+// 95%, from the two roles' standard errors.
+export type BalancedStats = {
+  readonly winRate: number;
+  readonly winRateHalfWidth: number;
+  readonly pointMargin: number;
+  readonly pointMarginHalfWidth: number;
+  readonly levels: number;
+  readonly levelsHalfWidth: number;
+};
+
 // Every finished hand at a table with a human is recorded. A matchup is
 // one human team against one all-bot team, keyed by who sat where: for
 // example "human + smart-v35" against "smart-v35". Figures are from the
@@ -144,9 +178,9 @@ export type MatchupStats = {
   // 95% Wilson interval on the win rate.
   readonly winRateLow: number;
   readonly winRateHigh: number;
-  // Mean point margin a hand: attacker points - 80 when the human team
-  // attacks, 80 - attacker points when it defends (the research
-  // evaluations' points margin when attack and defence are balanced).
+  // Mean point margin a hand over all hands: attacker points - 80 when the
+  // human team attacks, 80 - attacker points when it defends. It depends
+  // on the share of hands spent defending; `balanced` does not.
   readonly pointMargin: number;
   // Half-width of its 95% interval; null below two hands.
   readonly pointMarginHalfWidth: number | null;
@@ -154,8 +188,11 @@ export type MatchupStats = {
   // the hand, - when the bots do.
   readonly levels: number;
   readonly levelsHalfWidth: number | null;
-  readonly defending: { readonly hands: number; readonly wins: number };
-  readonly attacking: { readonly hands: number; readonly wins: number };
+  // The same, split by the human team's role in the hand.
+  readonly defending: RoleStats;
+  readonly attacking: RoleStats;
+  // Both roles weighted equally; null until each role has two hands.
+  readonly balanced: BalancedStats | null;
   // Games played to the end (a team defended at A) and won by the humans.
   readonly games: number;
   readonly gamesWon: number;

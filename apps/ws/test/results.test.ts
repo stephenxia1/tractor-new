@@ -166,10 +166,44 @@ describe('summarize', () => {
     expect(m.pointMargin).toBeCloseTo((20 + 45 - 60 - 80) / 4);
     expect(m.levels).toBeCloseTo((1 + 1 - 1 - 3) / 4);
     expect(m.pointMarginHalfWidth).not.toBeNull();
-    expect(m.defending).toEqual({ hands: 2, wins: 1 });
-    expect(m.attacking).toEqual({ hands: 2, wins: 1 });
+    // Defending: margins 20 and -60, levels +1 and -1.
+    expect(m.defending).toMatchObject({ hands: 2, wins: 1, winRate: 0.5 });
+    expect(m.defending.pointMargin).toBeCloseTo(-20);
+    expect(m.defending.levels).toBeCloseTo(0);
+    // Attacking: margins 45 and -80, levels +1 and -3.
+    expect(m.attacking).toMatchObject({ hands: 2, wins: 1, winRate: 0.5 });
+    expect(m.attacking.pointMargin).toBeCloseTo(-17.5);
+    expect(m.attacking.levels).toBeCloseTo(-1);
+    expect(m.balanced).not.toBeNull();
+    expect(m.balanced!.winRate).toBeCloseTo(0.5);
+    expect(m.balanced!.pointMargin).toBeCloseTo(-18.75);
+    expect(m.balanced!.levels).toBeCloseTo(-0.5);
+    // A mean of two means: half the root sum of the roles' half-widths.
+    expect(m.balanced!.pointMarginHalfWidth).toBeCloseTo(
+      Math.hypot(m.defending.pointMarginHalfWidth!, m.attacking.pointMarginHalfWidth!) / 2,
+    );
     expect(m.games).toBe(1);
     expect(m.gamesWon).toBe(0);
+  });
+
+  it('weights the roles equally in the balanced figures, whatever the mix', () => {
+    // Equal teams: humans hold attackers to 70 when defending, and score 70
+    // when attacking (so lose). They defend four hands for each attacked.
+    const defend = rec({ attackerPoints: 70, winner: 'defenders', levelDelta: 1 });
+    const attack = rec({ landlord: 1, defenders: 'B', attackerPoints: 70, winner: 'defenders', levelDelta: 1 });
+    const records = [defend, defend, defend, defend, defend, defend, defend, defend, attack, attack];
+    const m = summarize(records, 0).matchups[0]!;
+    expect(m.winRate).toBeCloseTo(0.8); // the raw rate is flattered by the mix
+    expect(m.pointMargin).toBeCloseTo((8 * 10 - 2 * 10) / 10);
+    expect(m.balanced!.winRate).toBeCloseTo(0.5);
+    expect(m.balanced!.pointMargin).toBeCloseTo(0);
+    expect(m.balanced!.levels).toBeCloseTo(0);
+  });
+
+  it('gives no balanced figures until each role has two hands', () => {
+    const attack = rec({ landlord: 1, defenders: 'B', attackerPoints: 90, winner: 'attackers', levelDelta: 0 });
+    expect(summarize([rec({}), rec({}), attack], 0).matchups[0]!.balanced).toBeNull();
+    expect(summarize([rec({}), rec({}), attack, attack], 0).matchups[0]!.balanced).not.toBeNull();
   });
 
   it('gives a Wilson interval that stays inside [0, 1] and no half-width for one hand', () => {

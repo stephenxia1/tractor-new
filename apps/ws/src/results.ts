@@ -10,7 +10,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 import { computeHandResult, type GameState, type Seat, type TeamId } from '@tractor/engine';
-import type { MatchupStats, StatsSummary } from '@tractor/protocol';
+import type { BalancedStats, MatchupStats, RoleStats, StatsSummary } from '@tractor/protocol';
 import type { Room } from './rooms';
 
 export type SeatRecord =
@@ -205,18 +205,52 @@ function meanAndHalfWidth(xs: ReadonlyArray<number>): [number, number | null] {
   return [mean, Z * Math.sqrt(variance / n)];
 }
 
+type RoleAcc = { wins: number; margins: number[]; levels: number[] };
+
 type Acc = {
   humanSide: string;
   botSide: string;
   players: Set<string>;
-  wins: number;
-  margins: number[];
-  levels: number[];
-  defending: { hands: number; wins: number };
-  attacking: { hands: number; wins: number };
+  defending: RoleAcc;
+  attacking: RoleAcc;
   games: number;
   gamesWon: number;
 };
+
+function roleStats(r: RoleAcc): RoleStats {
+  const hands = r.margins.length;
+  const [winRateLow, winRateHigh] = wilson(r.wins, hands);
+  const [pointMargin, pointMarginHalfWidth] = meanAndHalfWidth(r.margins);
+  const [levels, levelsHalfWidth] = meanAndHalfWidth(r.levels);
+  return {
+    hands,
+    wins: r.wins,
+    winRate: hands === 0 ? 0 : r.wins / hands,
+    winRateLow,
+    winRateHigh,
+    pointMargin,
+    pointMarginHalfWidth,
+    levels,
+    levelsHalfWidth,
+  };
+}
+
+// The two roles weighted equally: a mean of the two means, its standard
+// error from theirs (the roles' hands are separate samples).
+function balancedStats(d: RoleStats, a: RoleStats): BalancedStats | null {
+  if (d.hands < 2 || a.hands < 2) return null;
+  const halfOfMean = (hd: number | null, ha: number | null): number =>
+    Math.sqrt((hd ?? 0) ** 2 + (ha ?? 0) ** 2) / 2;
+  const winSe = (s: RoleStats): number => Math.sqrt((s.winRate * (1 - s.winRate)) / s.hands);
+  return {
+    winRate: (d.winRate + a.winRate) / 2,
+    winRateHalfWidth: (Z * Math.sqrt(winSe(d) ** 2 + winSe(a) ** 2)) / 2,
+    pointMargin: (d.pointMargin + a.pointMargin) / 2,
+    pointMarginHalfWidth: halfOfMean(d.pointMarginHalfWidth, a.pointMarginHalfWidth),
+    levels: (d.levels + a.levels) / 2,
+    levelsHalfWidth: halfOfMean(d.levelsHalfWidth, a.levelsHalfWidth),
+  };
+}
 
 export function summarize(records: ReadonlyArray<HandRecord>, now: number): StatsSummary {
   const acc = new Map<string, Acc>();
@@ -233,11 +267,8 @@ export function summarize(records: ReadonlyArray<HandRecord>, now: number): Stat
         humanSide: m.humanSide,
         botSide: m.botSide,
         players: new Set(),
-        wins: 0,
-        margins: [],
-        levels: [],
-        defending: { hands: 0, wins: 0 },
-        attacking: { hands: 0, wins: 0 },
+        defending: { wins: 0, margins: [], levels: [] },
+        attacking: { wins: 0, margins: [], levels: [] },
         games: 0,
         gamesWon: 0,
       };
@@ -248,38 +279,40 @@ export function summarize(records: ReadonlyArray<HandRecord>, now: number): Stat
     });
     const defending = r.defenders === m.humanTeam;
     const winningTeam = r.winner === 'defenders' ? defending : !defending;
-    if (winningTeam) a.wins++;
     const role = defending ? a.defending : a.attacking;
-    role.hands++;
     if (winningTeam) role.wins++;
-    a.margins.push(defending ? THRESHOLD - r.attackerPoints : r.attackerPoints - THRESHOLD);
-    a.levels.push(winningTeam ? r.levelDelta : -r.levelDelta);
+    role.margins.push(defending ? THRESHOLD - r.attackerPoints : r.attackerPoints - THRESHOLD);
+    role.levels.push(winningTeam ? r.levelDelta : -r.levelDelta);
     if (r.gameOver) {
       a.games++;
       if (r.gameWinner === m.humanTeam) a.gamesWon++;
     }
   }
   const matchups: MatchupStats[] = [...acc.entries()].map(([key, a]) => {
-    const hands = a.margins.length;
-    const [low, high] = wilson(a.wins, hands);
-    const [pointMargin, pointMarginHalfWidth] = meanAndHalfWidth(a.margins);
-    const [levels, levelsHalfWidth] = meanAndHalfWidth(a.levels);
+    const all = roleStats({
+      wins: a.defending.wins + a.attacking.wins,
+      margins: [...a.defending.margins, ...a.attacking.margins],
+      levels: [...a.defending.levels, ...a.attacking.levels],
+    });
+    const defending = roleStats(a.defending);
+    const attacking = roleStats(a.attacking);
     return {
       key,
       humanSide: a.humanSide,
       botSide: a.botSide,
-      hands,
+      hands: all.hands,
       players: a.players.size,
-      wins: a.wins,
-      winRate: hands === 0 ? 0 : a.wins / hands,
-      winRateLow: low,
-      winRateHigh: high,
-      pointMargin,
-      pointMarginHalfWidth,
-      levels,
-      levelsHalfWidth,
-      defending: a.defending,
-      attacking: a.attacking,
+      wins: all.wins,
+      winRate: all.winRate,
+      winRateLow: all.winRateLow,
+      winRateHigh: all.winRateHigh,
+      pointMargin: all.pointMargin,
+      pointMarginHalfWidth: all.pointMarginHalfWidth,
+      levels: all.levels,
+      levelsHalfWidth: all.levelsHalfWidth,
+      defending,
+      attacking,
+      balanced: balancedStats(defending, attacking),
       games: a.games,
       gamesWon: a.gamesWon,
     };

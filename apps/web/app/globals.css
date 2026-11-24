@@ -896,3 +896,6 @@ button:disabled {
 .verdict-open { color: #94a89a; }
 .stats-notes { font-size: 14px; max-width: 760px; }
 .stats-notes p { margin: 0 0 8px; }
+.stats-table td[rowspan] { vertical-align: top; }
+.stats-table tbody tr.group-start:not(:first-child) td { border-top: 2px solid #3c5142; }
+.stats-table tr.role-row td:first-child { padding-left: 22px; color: #94a89a; }
