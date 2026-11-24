@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BOT_TYPES,
   VISIBLE_BOT_TYPES,
+  botTypeLabel,
   makeSmartV35Agent,
   pickBotAction,
   smartV35Worlds,
@@ -79,9 +80,10 @@ function shownVoids(state: GameState, ctx: TrumpContext): Array<Set<EffectiveSui
 }
 
 describe('smart-v35', () => {
-  it('is registered for evaluation but not offered in the lobby', () => {
+  it('is registered, and offered in the lobby as Hard', () => {
     expect(BOT_TYPES).toContain('smart-v35');
-    expect(VISIBLE_BOT_TYPES).not.toContain('smart-v35');
+    expect(VISIBLE_BOT_TYPES).toContain('smart-v35');
+    expect(botTypeLabel('smart-v35')).toBe('Hard');
   });
 
   it('plays whole hands with every move accepted by the engine', () => {

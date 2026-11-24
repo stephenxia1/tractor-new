@@ -152,6 +152,9 @@ export const VISIBLE_BOT_TYPES: ReadonlyArray<BotType> = [
   'random',
   'smart-v18',
   'smart-v34',
+  // The research benchmark (rl-research), offered once the server had it
+  // (2026-11-24). About a quarter of smart-v34's thinking time a move.
+  'smart-v35',
   // Safe to offer only because the ws server ships it too. The lobby and
   // the game server deploy separately, so adding a bot here before the
   // server knows it hands the server an unknown type, which it resolves
@@ -229,7 +232,7 @@ export function botTypeLabel(t: BotType): string {
     case 'smart-v34':
       return 'Medium';
     case 'smart-v35':
-      return 'v35: Hard (benchmark)';
+      return 'Hard';
     case 'rl-mlp':
       return 'RL (MLP, REINFORCE self-play)';
     case 'rl-dmc':
