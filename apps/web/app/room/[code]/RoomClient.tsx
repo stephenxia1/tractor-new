@@ -20,6 +20,7 @@ import {
   type TrumpContext,
 } from '@tractor/engine';
 import { cardId } from '../../../lib/cards';
+import { onlyLegalPlay } from '../../../lib/forcedPlay';
 import { getOrCreateSessionToken, useTractorSocket } from '../../../lib/ws';
 import { CardSvg } from '../../../components/Cards';
 import {
@@ -29,12 +30,19 @@ import {
   type AvailableDeclaration,
 } from '../../../lib/declarations';
 
+// Fast mode waits this long after the turn arrives before playing the only
+// legal play, so the table shows the turn passing through.
+const FAST_MODE_DELAY_MS = 500;
+
 export default function RoomClient({ code }: { code: string }) {
   const router = useRouter();
   const { state, send } = useTractorSocket();
   const [nick, setNick] = useState('');
   const [selected, setSelected] = useState<ReadonlyArray<string>>([]);
   const [autoAdvance, setAutoAdvance] = useState(false);
+  // Fast mode: when only one play is legal, play it without waiting for a
+  // click. On unless the player has turned it off.
+  const [fastMode, setFastMode] = useState(true);
   // Pre-play: when armed and it becomes my turn, the currently-selected
   // cards get sent automatically.
   const [autoPlayArmed, setAutoPlayArmed] = useState(false);
@@ -51,6 +59,12 @@ export default function RoomClient({ code }: { code: string }) {
   useEffect(() => {
     localStorage.setItem('tractor:autoAdvance', autoAdvance ? '1' : '0');
   }, [autoAdvance]);
+  useEffect(() => {
+    if (localStorage.getItem('tractor:fastMode') === '0') setFastMode(false);
+  }, []);
+  useEffect(() => {
+    localStorage.setItem('tractor:fastMode', fastMode ? '1' : '0');
+  }, [fastMode]);
 
   useEffect(() => {
     const saved = localStorage.getItem('tractor:nickname');
@@ -204,17 +218,51 @@ export default function RoomClient({ code }: { code: string }) {
     game?.phase === 'trick_review' ||
     isLandlordBurying;
 
-  // Play a short beep when it becomes our turn (false → true edge).
-  // We initialize the ref to true so the very first turn doesn't beep
-  // before the user has interacted with the page (browsers block audio
-  // until a gesture anyway, but this also avoids a stale-fire on join).
+  // Fast mode: the cards of the only legal play when it is my turn and
+  // there is exactly one (lib/forcedPlay.ts), else null.
+  const forcedPlay: Card[] | null = useMemo(() => {
+    if (!fastMode || !myTurn || game === null || ch === null) return null;
+    if (game.phase !== 'play' || ch.trumpRank === null) return null;
+    const ctx: TrumpContext = {
+      trumpRank: ch.trumpRank as NaturalRank,
+      trumpSuit: ch.trumpSuit,
+    };
+    const trick = ch.currentTrick;
+    const lead = trick !== null && trick.plays.length > 0 ? trick.plays[0]!.cards : null;
+    return onlyLegalPlay(myCards, lead, ctx, game.config.numDecks);
+  }, [fastMode, myTurn, game, ch, myCards]);
+
+  // A turn is a hand, a trick and a place in it. Every play the client
+  // sends goes through `playCards`, which records the turn it was sent
+  // in; an automatic play (an armed auto-play, fast mode) is not sent for
+  // a turn that already has one, so a click and fast mode cannot both
+  // play. A click always sends, so a play the server refused can be made
+  // again by hand.
+  const turnKey =
+    ch !== null
+      ? `${ch.handNumber}:${ch.tricks.length}:${ch.currentTrick?.plays.length ?? 0}`
+      : null;
+  const playedTurnRef = useRef<string | null>(null);
+  function playCards(cards: ReadonlyArray<Card>, automatic: boolean): void {
+    if (automatic && turnKey !== null && playedTurnRef.current === turnKey) return;
+    playedTurnRef.current = turnKey;
+    send({ kind: 'play_cards', cards });
+    setSelected([]);
+  }
+
+  // Play a short beep when it becomes our turn (false → true edge) --
+  // unless fast mode is about to play for us. We initialize the ref to
+  // true so the very first turn doesn't beep before the user has
+  // interacted with the page (browsers block audio until a gesture anyway,
+  // but this also avoids a stale-fire on join).
   const prevTurnRef = useRef<boolean>(true);
   useEffect(() => {
     const wasTurn = prevTurnRef.current;
     prevTurnRef.current = myTurn;
-    if (myTurn && !wasTurn) {
+    if (myTurn && !wasTurn && forcedPlay === null) {
       playTurnBeep();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myTurn]);
 
   // Seat with the currently-winning combo in the active/just-finished
@@ -285,11 +333,21 @@ export default function RoomClient({ code }: { code: string }) {
       setAutoPlayArmed(false);
       return;
     }
-    send({ kind: 'play_cards', cards });
-    clearSelection();
+    playCards(cards, true);
     setAutoPlayArmed(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoPlayArmed, myTurn]);
+
+  // Fast mode fires a moment after the turn arrives, so the table shows
+  // whose turn it was. An armed auto-play goes first: it plays its
+  // selection, or disarms, and then this runs if the turn is still mine.
+  useEffect(() => {
+    if (forcedPlay === null || turnKey === null || autoPlayArmed) return;
+    if (playedTurnRef.current === turnKey) return;
+    const t = setTimeout(() => playCards(forcedPlay, true), FAST_MODE_DELAY_MS);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [forcedPlay, turnKey, autoPlayArmed]);
 
   function armAutoPlay(): void {
     armedWinningSeatRef.current = winningSeat;
@@ -363,8 +421,11 @@ export default function RoomClient({ code }: { code: string }) {
                     selected={selectedCards()}
                     clearSelection={clearSelection}
                     send={send}
+                    playCards={(cards) => playCards(cards, false)}
                     autoAdvance={autoAdvance}
                     setAutoAdvance={setAutoAdvance}
+                    fastMode={fastMode}
+                    setFastMode={setFastMode}
                     autoPlayArmed={autoPlayArmed}
                     armAutoPlay={armAutoPlay}
                     disarmAutoPlay={disarmAutoPlay}
@@ -1210,8 +1271,11 @@ function ActionsBar({
   selected,
   clearSelection,
   send,
+  playCards,
   autoAdvance,
   setAutoAdvance,
+  fastMode,
+  setFastMode,
   autoPlayArmed,
   armAutoPlay,
   disarmAutoPlay,
@@ -1223,8 +1287,11 @@ function ActionsBar({
   selected: ReadonlyArray<Card>;
   clearSelection: () => void;
   send: (msg: import('@tractor/protocol').ClientMessage) => void;
+  playCards: (cards: ReadonlyArray<Card>) => void;
   autoAdvance: boolean;
   setAutoAdvance: (v: boolean) => void;
+  fastMode: boolean;
+  setFastMode: (v: boolean) => void;
   autoPlayArmed: boolean;
   armAutoPlay: () => void;
   disarmAutoPlay: () => void;
@@ -1337,6 +1404,7 @@ function ActionsBar({
           Next trick →
         </button>
         <AutoAdvanceToggle value={autoAdvance} onChange={setAutoAdvance} />
+        <FastModeToggle value={fastMode} onChange={setFastMode} />
       </div>
     );
   }
@@ -1349,10 +1417,7 @@ function ActionsBar({
         <div className="actions">
           <button
             disabled={!valid}
-            onClick={() => {
-              send({ kind: 'play_cards', cards: selected });
-              clearSelection();
-            }}
+            onClick={() => playCards(selected)}
             title={
               selected.length === 0
                 ? 'Select cards to play'
@@ -1364,6 +1429,7 @@ function ActionsBar({
             Play
           </button>
           <AutoAdvanceToggle value={autoAdvance} onChange={setAutoAdvance} />
+          <FastModeToggle value={fastMode} onChange={setFastMode} />
         </div>
       );
     }
@@ -1378,6 +1444,7 @@ function ActionsBar({
           Auto-play
         </button>
         <AutoAdvanceToggle value={autoAdvance} onChange={setAutoAdvance} />
+        <FastModeToggle value={fastMode} onChange={setFastMode} />
         <span className="muted">
           Waiting for seat {computeNextSeatToPlay(game)}…
         </span>
@@ -1452,6 +1519,28 @@ function AutoAdvanceToggle({
         onChange={(e) => onChange(e.target.checked)}
       />
       <span>Auto-advance tricks</span>
+    </label>
+  );
+}
+
+function FastModeToggle({
+  value,
+  onChange,
+}: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+}): JSX.Element {
+  return (
+    <label
+      className="auto-advance"
+      title="When only one play is legal, play it for me"
+    >
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span>Fast mode</span>
     </label>
   );
 }
