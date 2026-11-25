@@ -40,9 +40,16 @@ primary_region = "sjc"
     path = "/health"
 
 [[vm]]
-  cpu_kind = "shared"
+  # A dedicated CPU since 2026-11-25. On shared-cpu-1x the rl-zero bots
+  # ran out of the shared CPU's burst credit in play, and the host held the
+  # machine to its baseline (steal ~48% of user time). /health then missed
+  # its 5 s timeout for minutes at a time, and Fly's proxy turned /ws and
+  # /stats away ("could not find a good candidate"). performance-1x has no
+  # credit to run out of. This block wins over `fly scale vm` at the next
+  # deploy, so change the size here.
+  cpu_kind = "performance"
   cpus = 1
-  # 512 since rl-zero: its play network holds 44 MB of float32 weights,
-  # and a local all-Zero table took the server process from 116 MB idle
-  # to 193 MB, beside npm's own ~58 MB -- too close to 256.
-  memory_mb = 512
+  # performance-1x comes with 2 GB, its smallest size. 512 MB was enough:
+  # rl-zero's play network holds 44 MB of float32 weights, and a local
+  # all-Zero table took the server process from 116 MB idle to 193 MB.
+  memory_mb = 2048
